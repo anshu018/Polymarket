@@ -1,0 +1,101 @@
+# Polymarket — .gitignore
+
+# Secrets & Credentials
+
+.env
+.env.*
+.env.local
+.env.production
+.env.staging
+*.env
+secrets.py
+secrets.json
+secrets.yaml
+secrets.toml
+**/config/secrets.*
+
+# Polymarket & Wallet
+
+*.pem
+*.key
+*.p12
+*.pfx
+wallet.json
+keystore/
+private_key*
+
+# Oracle Cloud
+
+*.pub
+oci_config
+oracle_config*
+
+# Python Runtime
+
+**pycache**/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtual Environments
+
+venv/
+env/
+ENV/
+.venv/
+
+# Logs & Runtime State
+
+logs/
+*.log
+*.log.*
+idempotency_log/
+idempotency_log.db
+trade_archive/
+data/snapshots/
+data/live/
+data/raw/
+
+# Database
+
+*.db
+*.sqlite
+*.sqlite3
+supabase/.temp/
+
+# IDEs & OS
+
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Docker overrides
+
+docker-compose.override.yml
+docker-compose.prod.yml
+
+# Jupyter
+
+.ipynb_checkpoints/
+*.ipynb
+
+# Misc
+
+*.bak
+*.tmp
+*.temp

@@ -1,0 +1,215 @@
+import asyncio
+import logging
+from datetime import datetime, timezone
+import json
+from typing import Optional
+import httpx
+import config
+
+logger = logging.getLogger(__name__)
+
+class MarketPriceUnavailableError(Exception):
+    """Raised when CLOB midpoint price or order book is unavailable/invalid."""
+    pass
+
+class MarketDiscoveryTimeoutError(Exception):
+    """Raised when price or metadata queries exceed timeout limit."""
+    pass
+
+# Global module-level cache
+_MARKET_CACHE: list[dict] = []
+_CACHE_UPDATED_AT: Optional[datetime] = None
+
+async def refresh_market_cache() -> None:
+    """
+    Fetches all active, non-resolved markets from Polymarket Gamma API.
+    Filters out markets below MIN_MARKET_VOLUME_USD and updates the global cache.
+    Must complete under 6 seconds, otherwise log warning and retain existing cache.
+    """
+    global _MARKET_CACHE, _CACHE_UPDATED_AT
+    url = f"{config.GAMMA_API_BASE}/markets?active=true&closed=false"
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, timeout=6.0)
+            
+            if response.status_code != 200:
+                logger.warning(f"[MARKET_DISCOVERY] Gamma API returned HTTP {response.status_code}")
+                return
+                
+            data = response.json()
+            if not isinstance(data, list):
+                logger.warning("[MARKET_DISCOVERY] Gamma API returned invalid format (expected list)")
+                return
+                
+            parsed_markets = []
+            for market in data:
+                market_id = market.get("id")
+                if not market_id:
+                    continue
+                    
+                # Parse clobTokenIds (YES token is index 0)
+                try:
+                    clob_ids_str = market.get("clobTokenIds", "[]")
+                    clob_ids = json.loads(clob_ids_str)
+                    if not clob_ids or not isinstance(clob_ids, list):
+                        logger.warning(f"[MARKET_DISCOVERY] clobTokenIds is empty or invalid for market {market_id}")
+                        continue
+                    token_id = clob_ids[0]
+                except Exception as e:
+                    logger.warning(f"[MARKET_DISCOVERY] Failed to parse clobTokenIds for market {market_id}: {e}")
+                    continue
+                    
+                question = market.get("question", "")
+                end_date = market.get("endDate") or market.get("resolveBy")
+                
+                # Parse volume
+                try:
+                    volume_usd = float(market.get("volume") or 0)
+                except ValueError:
+                    volume_usd = 0.0
+                    
+                if volume_usd < config.MIN_MARKET_VOLUME_USD:
+                    continue
+                    
+                parsed_markets.append({
+                    "market_id": market_id,
+                    "question": question,
+                    "token_id": token_id,
+                    "end_date_iso": end_date,
+                    "volume_usd": volume_usd
+                })
+                
+            _MARKET_CACHE = parsed_markets
+            _CACHE_UPDATED_AT = datetime.now(timezone.utc)
+            logger.info(f"[MARKET_DISCOVERY] Cache refreshed: {len(_MARKET_CACHE)} active markets.")
+            
+    except (httpx.HTTPError, httpx.TimeoutException) as e:
+        logger.warning(f"[MARKET_DISCOVERY] Connection/timeout exception during cache refresh: {e}")
+    except asyncio.TimeoutError:
+        logger.warning("[MARKET_DISCOVERY] Cache refresh timed out (>6s)")
+    except Exception as e:
+        logger.warning(f"[MARKET_DISCOVERY] Unexpected exception refreshing market cache: {e}")
+
+def find_matching_markets(signal_entities: dict) -> list[dict]:
+    """
+    Score each cached market against signal entities using overlap.
+    Returns sorted list of markets with score >= MARKET_MATCH_THRESHOLD.
+    Runs against in-memory cache, zero HTTP calls.
+    """
+    entities = signal_entities.get("entities", [])
+    if not entities:
+        return []
+        
+    if not _MARKET_CACHE or _CACHE_UPDATED_AT is None:
+        return []
+        
+    # Cache freshness check (stale if > 10 minutes)
+    age = (datetime.now(timezone.utc) - _CACHE_UPDATED_AT).total_seconds()
+    if age > 600:
+        logger.warning(f"[MARKET_DISCOVERY] Cache is stale ({age:.1f}s old). Returning empty.")
+        return []
+        
+    matched_markets = []
+    total_entities = len(entities)
+    
+    for market in _MARKET_CACHE:
+        question_lower = market["question"].lower()
+        matched_count = 0
+        for entity in entities:
+            if entity.lower() in question_lower:
+                matched_count += 1
+                
+        score = matched_count / total_entities
+        
+        if score >= config.MARKET_MATCH_THRESHOLD:
+            # Create a copy with score included
+            entry = market.copy()
+            entry["score"] = score
+            matched_markets.append(entry)
+            
+    # Sort descending by score
+    matched_markets.sort(key=lambda x: x["score"], reverse=True)
+    return matched_markets
+
+async def get_market_price(token_id: str) -> float:
+    """
+    Queries Polymarket CLOB midpoint for the token.
+    Raises MarketPriceUnavailableError if spread > MAX_SPREAD_THRESHOLD or order book is empty.
+    Raises MarketDiscoveryTimeoutError if the request exceeds a 4-second timeout.
+    """
+    async def _fetch() -> float:
+        url = f"https://clob.polymarket.com/book?token_id={token_id}"
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(url, timeout=4.0)
+            except Exception as e:
+                raise MarketPriceUnavailableError(f"HTTP request failed: {e}") from e
+                
+            if response.status_code != 200:
+                raise MarketPriceUnavailableError(f"CLOB book returned HTTP {response.status_code}")
+                
+            data = response.json()
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+            
+            if not bids:
+                raise MarketPriceUnavailableError("Order book has no bids")
+            if not asks:
+                raise MarketPriceUnavailableError("Order book has no asks")
+                
+            try:
+                best_bid = max(float(b["price"]) for b in bids)
+                best_ask = min(float(a["price"]) for a in asks)
+            except (ValueError, KeyError) as e:
+                raise MarketPriceUnavailableError(f"Failed to parse orderbook prices: {e}") from e
+                
+            spread = best_ask - best_bid
+            if spread > config.MAX_SPREAD_THRESHOLD:
+                raise MarketPriceUnavailableError(f"Spread {spread:.3f} exceeds threshold")
+                
+            return (best_bid + best_ask) / 2.0
+
+    try:
+        return await asyncio.wait_for(_fetch(), timeout=4.0)
+    except asyncio.TimeoutError as e:
+        raise MarketDiscoveryTimeoutError("get_market_price timed out") from e
+    except MarketPriceUnavailableError:
+        raise
+    except Exception as e:
+        raise MarketPriceUnavailableError(f"Unexpected pricing error: {e}") from e
+
+async def get_market_metadata(market_id: str) -> dict:
+    """
+    Fetches question, description, and resolution criteria from Gamma API.
+    Raises MarketDiscoveryTimeoutError if the request exceeds a 4-second timeout.
+    """
+    async def _fetch() -> dict:
+        url = f"{config.GAMMA_API_BASE}/markets/{market_id}"
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(url, timeout=4.0)
+            except Exception as e:
+                raise MarketPriceUnavailableError(f"HTTP request failed: {e}") from e
+                
+            if response.status_code != 200:
+                raise MarketPriceUnavailableError(f"Gamma API returned HTTP {response.status_code}")
+                
+            market = response.json()
+            if isinstance(market, list):
+                if not market:
+                    raise MarketPriceUnavailableError(f"Gamma API returned empty list for market {market_id}")
+                market = market[0]
+                
+            return {
+                "question": market.get("question", ""),
+                "description": market.get("description", ""),
+                "resolution_criteria": market.get("resolutionCriteria") or market.get("description", "")
+            }
+
+    try:
+        return await asyncio.wait_for(_fetch(), timeout=4.0)
+    except asyncio.TimeoutError as e:
+        raise MarketDiscoveryTimeoutError("get_market_metadata timed out") from e
+    except Exception as e:
+        raise MarketPriceUnavailableError(f"Unexpected metadata error: {e}") from e

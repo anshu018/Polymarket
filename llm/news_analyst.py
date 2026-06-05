@@ -1,0 +1,187 @@
+import os
+import json
+import logging
+import asyncio
+import aiohttp
+from typing import Literal, Optional
+from pydantic import BaseModel, ValidationError, Field, field_validator
+import config
+from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
+
+class NewsAnalystOutput(BaseModel):
+    event_category: Literal[
+        "politics", "crypto", "sports",
+        "legal", "economics", "science",
+        "other"
+    ]
+    affected_market_ids: list[str] = Field(default_factory=list)
+    confidence_score: float = Field(ge=0.0)
+    direction: Literal["YES", "NO", "ABSTAIN"]
+    reasoning: str = Field(max_length=300)
+
+    @field_validator('confidence_score')
+    @classmethod
+    def clamp_confidence(cls, v: float) -> float:
+        return min(v, 0.88)
+
+async def _execute_news_call(url: str, api_key: str, model: str, system_content: str, prompt: str, is_fallback: bool) -> Optional[str]:
+    import aiohttp
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": prompt}
+        ],
+        "response_format": {"type": "json_object"}
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if not is_fallback:
+        headers["HTTP-Referer"] = "https://github.com/zeroalpha"
+        headers["X-Title"] = "Zero Alpha Agent"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers) as response:
+                if response.status != 200:
+                    text = await response.text()
+                    provider_name = "NVIDIA" if is_fallback else "OpenRouter"
+                    logger.error(f"[NEWS_ANALYST] {provider_name} returned {response.status}: {text}")
+                    return None
+                data = await response.json()
+                usage = data.get("usage", {})
+                logger.info(f"[NEWS_ANALYST] Token usage: {usage} | Fallback: {is_fallback}")
+                return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    except Exception as e:
+        provider_name = "NVIDIA" if is_fallback else "OpenRouter"
+        logger.error(f"[NEWS_ANALYST] {provider_name} request failed: {e}")
+        return None
+
+async def classify_signal(headline: str, source: str) -> Optional[NewsAnalystOutput]:
+    """
+    Classify a news headline into a trading action.
+    Returns None on timeout or failure.
+    """
+    try:
+        system_content = """You are a prediction market signal classifier.
+Classify news headlines for relevance to open
+prediction markets.
+Respond ONLY in valid JSON. No preamble.
+No explanation. No markdown. JSON only.
+Exact schema required:
+{
+  "event_category": "politics|crypto|sports|legal|economics|science|other",
+  "affected_market_ids": [],
+  "confidence_score": 0.0,
+  "direction": "YES|NO|ABSTAIN",
+  "reasoning": "max 50 words"
+}
+Rules:
+- confidence_score: 0.0 to 0.88 maximum
+- direction YES: event makes something more likely to happen on prediction markets
+- direction NO: event makes something less likely to happen
+- direction ABSTAIN: genuinely uncertain
+- affected_market_ids: always empty list []
+  Market matching happens in a later layer.
+- Be conservative. Wrong signals cost money. Missed signals cost nothing.
+"""
+
+        prompt = f"Headline: {headline}\nSource: {source}"
+        choice_content = None
+
+        # 1. Attempt Primary: OpenRouter (Gemma 4 12B free)
+        or_key = os.environ.get("OPENROUTER_API_KEY")
+        if or_key and or_key != "placeholder":
+            url = f"{config.PROVIDER_OPENROUTER}/chat/completions"
+            model = getattr(config, "MODEL_NEWS_ANALYST", "google/gemma-4-12b-it:free")
+            try:
+                logger.info(f"[NEWS_ANALYST] Calling primary OpenRouter ({model})...")
+                choice_content = await asyncio.wait_for(
+                    _execute_news_call(url, or_key, model, system_content, prompt, is_fallback=False),
+                    timeout=6.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[NEWS_ANALYST] Primary OpenRouter call timed out (limit=6s).")
+
+        # 2. Attempt Fallback: NVIDIA NIM (Qwen3-32B)
+        if not choice_content:
+            nv_key = os.environ.get("NVIDIA_API_KEY")
+            if nv_key and nv_key != "placeholder":
+                url = f"{config.PROVIDER_NVIDIA}/chat/completions"
+                model = getattr(config, "MODEL_NEWS_ANALYST_FALLBACK", "qwen/qwen3-32b")
+                try:
+                    logger.info(f"[NEWS_ANALYST] Calling fallback NVIDIA NIM ({model})...")
+                    choice_content = await asyncio.wait_for(
+                        _execute_news_call(url, nv_key, model, system_content, prompt, is_fallback=True),
+                        timeout=4.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("[NEWS_ANALYST] Fallback NVIDIA NIM call timed out (limit=4s).")
+            else:
+                logger.error("[NEWS_ANALYST] NVIDIA API key missing, fallback unavailable.")
+
+        if not choice_content:
+            logger.error("[NEWS_ANALYST] Empty response from both primary and fallback providers")
+            return None
+                        
+        try:
+            # Clean up markdown wrapping if OpenRouter model insists on adding it
+            cleaned = choice_content.strip()
+            if cleaned.startswith("```json"):
+                cleaned = cleaned[7:]
+            if cleaned.startswith("```"):
+                cleaned = cleaned[3:]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+                
+            parsed_json = json.loads(cleaned.strip())
+            if isinstance(parsed_json, list) and len(parsed_json) > 0:
+                parsed_json = parsed_json[0]
+        except json.JSONDecodeError as e:
+            logger.error(f"[NEWS_ANALYST] JSON decode failed: {e} | Content: {choice_content}")
+            return None
+            
+        try:
+            validated = NewsAnalystOutput(**parsed_json)
+            
+            # Database logging
+            try:
+                from memory.supabase_client import get_client
+                
+                async def _log_to_supabase():
+                    client = await get_client()
+                    client.table('market_signals').insert({
+                        'raw_headline': headline,
+                        'source_name': source,
+                        'source_url': source,
+                        'category': validated.event_category,
+                        'event_type': validated.event_category,
+                        'passed_fast_path': False,
+                        'confidence_score': validated.confidence_score,
+                        'affected_market_ids': validated.affected_market_ids,
+                        'action_taken': 'pending' if validated.confidence_score >= 0.75 else 'discarded',
+                        'discard_reason': 'low confidence' if validated.confidence_score < 0.75 else None,
+                        'detected_at': datetime.now(timezone.utc).isoformat(),
+                        'processed_at': datetime.now(timezone.utc).isoformat()
+                    }).execute()
+
+                db_timeout = getattr(config, "SUPABASE_TIMEOUT_SECONDS", 2)
+                await asyncio.wait_for(_log_to_supabase(), timeout=db_timeout)
+            except asyncio.TimeoutError:
+                logger.error(f"[NEWS_ANALYST] Failed to log signal to Supabase: timed out after {db_timeout}s")
+            except Exception as db_err:
+                logger.error(f"[NEWS_ANALYST] Failed to log signal to Supabase: {db_err}")
+                
+            return validated
+        except ValidationError as e:
+            logger.error(f"[NEWS_ANALYST] Pydantic validation failed: {e} | Content: {choice_content}")
+            return None
+
+    except Exception as e:
+        logger.error(f"[NEWS_ANALYST] Unexpected error: {e}")
+        return None

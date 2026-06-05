@@ -1,0 +1,28 @@
+[Unit]
+Description=Polymarket Autonomous Trading Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=appuser
+Group=appuser
+WorkingDirectory=/app
+# EnvironmentFile securely stores Hetzner secrets and is read at startup
+EnvironmentFile=/etc/polymarket-agent/env
+
+# Executing Docker via systemd since the user provided a Dockerfile.
+# This approach leverages docker's isolation but ties lifecycle management to systemd for reliability on Hetzner execution.
+ExecStart=/usr/bin/docker run --rm --env-file /etc/polymarket-agent/env --name polymarket-agent-container polymarket-agent:latest
+ExecStop=/usr/bin/docker stop polymarket-agent-container
+
+Restart=always
+# 10 seconds between restart attempts per instructions
+RestartSec=10
+TimeoutStartSec=30
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
