@@ -18,7 +18,7 @@ FEEDS = {
     "WSJ World":            "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
 
     # ── TIER 2: CRYPTO — high-frequency Polymarket market coverage ─────────────
-    "CoinDesk":             "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "CoinDesk":             "https://feeds.feedburner.com/CoinDesk",
     "CoinTelegraph":        "https://cointelegraph.com/rss",
 
     # ── TIER 3: SPORTS — election/championship markets ─────────────────────────

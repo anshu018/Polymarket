@@ -169,7 +169,9 @@ def mock_supabase_client(db_state: dict[str, list[dict[str, Any]]]) -> Generator
 
     with patch("coordinator.pipeline.get_client", fake_get_client), \
          patch("llm.contract_parser.get_client", fake_get_client), \
-         patch("llm.trade_decision.get_client", fake_get_client):
+         patch("llm.trade_decision.get_client", fake_get_client), \
+         patch("strategies.calibration.get_client", fake_get_client), \
+         patch("memory.supabase_client.get_client", fake_get_client):
         yield client
 
 
@@ -648,7 +650,7 @@ async def test_6_9_cache_timeout_fallback_to_full_pipeline(
     mock_supabase_client.db_state["resolution_keyword_cache"].append({
         "market_id": "P1",
         "market_question": "Question?",
-        "resolution_keywords": ["impeachment"],
+        "resolution_keywords": ["impeachment", "trump", "house"],
         "resolution_conditions": {},
         "resolution_type": "binary",
         "ambiguity_score": 0.10,
@@ -659,8 +661,8 @@ async def test_6_9_cache_timeout_fallback_to_full_pipeline(
     mock_llm_apis["news_analyst_confidence"] = 0.95
     mock_llm_apis["sf_calls"] = 0
 
-    # Call #1: get_cached_keywords will time out!
-    mock_supabase_client.timeout_on_calls = {1}
+    # Call #2: get_cached_keywords will time out!
+    mock_supabase_client.timeout_on_calls = {2}
 
     res = await run_pipeline(
         headline="Donald Trump impeachment",
@@ -689,10 +691,11 @@ async def test_6_9_memory_timeout_proceeds_memoryless(
     # Full pipeline
     mock_llm_apis["news_analyst_confidence"] = 0.80
     
-    # Call 1: get_cached_keywords (no hit)
-    # Call 2: _check_cache (no hit)
-    # Call 3: fetch_relevant_lessons (times out)
-    mock_supabase_client.timeout_on_calls = {3}
+    # Call 1: _log_to_supabase in news_analyst (succeeds)
+    # Call 2: _read in contract_parser (no hit)
+    # Call 3: _write in contract_parser (succeeds)
+    # Call 4: fetch_relevant_lessons (times out)
+    mock_supabase_client.timeout_on_calls = {4}
 
     res = await run_pipeline(
         headline="Donald Trump impeachment",
