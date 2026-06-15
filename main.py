@@ -83,9 +83,25 @@ async def main():
         logger.info("Startup alert dispatched to Telegram.")
 
         # Populate market cache once on startup
-        from data.market_discovery import refresh_market_cache
+        from data.market_discovery import refresh_market_cache, _MARKET_CACHE
         logger.info("Performing initial market cache refresh...")
         await refresh_market_cache()
+
+        # Guard: if cache is still empty after refresh, alert and log — never silent
+        from data.market_discovery import _MARKET_CACHE as _cache_check
+        if not _cache_check:
+            logger.critical(
+                "[MARKET_CACHE] STARTUP: Market cache is empty after initial refresh. "
+                "No markets available for signal matching. Coordinator will abstain on all signals."
+            )
+            from monitoring.telegram_alerts import alert_pipeline_component_crash
+            await alert_pipeline_component_crash(
+                component="main.startup.market_cache",
+                error_type="EmptyCacheAtStartup",
+                error_detail="Market cache is 0 after initial refresh. Check Gamma API connectivity."
+            )
+        else:
+            logger.info(f"[MARKET_CACHE] Startup cache populated with {len(_cache_check)} markets.")
 
         # Start background market cache loop
         cache_loop_task = asyncio.create_task(_market_cache_loop(), name="market_cache_loop")

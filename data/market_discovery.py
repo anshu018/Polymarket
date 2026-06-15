@@ -20,76 +20,139 @@ class MarketDiscoveryTimeoutError(Exception):
 _MARKET_CACHE: list[dict] = []
 _CACHE_UPDATED_AT: Optional[datetime] = None
 
+def _parse_markets_page(data: list) -> list[dict]:
+    """Parse a single page of Gamma API market responses into cache entries."""
+    parsed = []
+    for market in data:
+        market_id = market.get("id")
+        if not market_id:
+            continue
+
+        # Parse clobTokenIds (YES token is index 0)
+        try:
+            clob_ids_str = market.get("clobTokenIds", "[]")
+            clob_ids = json.loads(clob_ids_str)
+            if not clob_ids or not isinstance(clob_ids, list):
+                logger.warning(f"[MARKET_DISCOVERY] clobTokenIds is empty or invalid for market {market_id}")
+                continue
+            token_id = clob_ids[0]
+        except Exception as e:
+            logger.warning(f"[MARKET_DISCOVERY] Failed to parse clobTokenIds for market {market_id}: {e}")
+            continue
+
+        question = market.get("question", "")
+        end_date = market.get("endDate") or market.get("resolveBy")
+
+        # Parse volume
+        try:
+            volume_usd = float(market.get("volume") or 0)
+        except ValueError:
+            volume_usd = 0.0
+
+        if volume_usd < config.MIN_MARKET_VOLUME_USD:
+            continue
+
+        parsed.append({
+            "market_id": market_id,
+            "question": question,
+            "token_id": token_id,
+            "end_date_iso": end_date,
+            "volume_usd": volume_usd
+        })
+    return parsed
+
+
 async def refresh_market_cache() -> None:
     """
-    Fetches all active, non-resolved markets from Polymarket Gamma API.
+    Fetches all active, non-resolved markets from Polymarket Gamma API using
+    offset-based pagination (API hard cap: 100 results per request).
     Filters out markets below MIN_MARKET_VOLUME_USD and updates the global cache.
-    Must complete under 6 seconds, otherwise log warning and retain existing cache.
+    Wrapped in a 60-second total timeout. On failure, logs CRITICAL and sends
+    a Telegram alert — never fails silently.
     """
     global _MARKET_CACHE, _CACHE_UPDATED_AT
-    url = f"{config.GAMMA_API_BASE}/markets?active=true&closed=false"
-    
-    try:
+
+    PAGE_LIMIT = 100      # API hard cap per request
+    MAX_PAGES = 50        # Safety cap: 5,000 markets maximum
+    PER_REQUEST_TIMEOUT = 8.0
+    TOTAL_TIMEOUT = 60.0
+
+    async def _fetch_all_pages() -> list[dict]:
+        """Paginate through all market pages using offset."""
+        all_markets: list[dict] = []
+        base_url = f"{config.GAMMA_API_BASE}/markets?active=true&closed=false&limit={PAGE_LIMIT}"
+
         async with httpx.AsyncClient() as client:
-            response = await client.get(url, timeout=6.0)
-            
-            if response.status_code != 200:
-                logger.warning(f"[MARKET_DISCOVERY] Gamma API returned HTTP {response.status_code}")
-                return
-                
-            data = response.json()
-            if not isinstance(data, list):
-                logger.warning("[MARKET_DISCOVERY] Gamma API returned invalid format (expected list)")
-                return
-                
-            parsed_markets = []
-            for market in data:
-                market_id = market.get("id")
-                if not market_id:
-                    continue
-                    
-                # Parse clobTokenIds (YES token is index 0)
-                try:
-                    clob_ids_str = market.get("clobTokenIds", "[]")
-                    clob_ids = json.loads(clob_ids_str)
-                    if not clob_ids or not isinstance(clob_ids, list):
-                        logger.warning(f"[MARKET_DISCOVERY] clobTokenIds is empty or invalid for market {market_id}")
-                        continue
-                    token_id = clob_ids[0]
-                except Exception as e:
-                    logger.warning(f"[MARKET_DISCOVERY] Failed to parse clobTokenIds for market {market_id}: {e}")
-                    continue
-                    
-                question = market.get("question", "")
-                end_date = market.get("endDate") or market.get("resolveBy")
-                
-                # Parse volume
-                try:
-                    volume_usd = float(market.get("volume") or 0)
-                except ValueError:
-                    volume_usd = 0.0
-                    
-                if volume_usd < config.MIN_MARKET_VOLUME_USD:
-                    continue
-                    
-                parsed_markets.append({
-                    "market_id": market_id,
-                    "question": question,
-                    "token_id": token_id,
-                    "end_date_iso": end_date,
-                    "volume_usd": volume_usd
-                })
-                
-            _MARKET_CACHE = parsed_markets
-            _CACHE_UPDATED_AT = datetime.now(timezone.utc)
-            logger.info(f"[MARKET_DISCOVERY] Cache refreshed: {len(_MARKET_CACHE)} active markets.")
-            
+            for page in range(MAX_PAGES):
+                offset = page * PAGE_LIMIT
+                url = f"{base_url}&offset={offset}"
+                response = await client.get(url, timeout=PER_REQUEST_TIMEOUT)
+
+                if response.status_code != 200:
+                    logger.critical(
+                        f"[MARKET_DISCOVERY] Gamma API returned HTTP {response.status_code} "
+                        f"on page {page} (offset={offset})"
+                    )
+                    break
+
+                data = response.json()
+                if not isinstance(data, list):
+                    logger.critical(
+                        "[MARKET_DISCOVERY] Gamma API returned invalid format (expected list)"
+                    )
+                    break
+
+                if not data:
+                    # Empty page — end of results
+                    logger.debug(f"[MARKET_DISCOVERY] Empty page at offset={offset}, stopping.")
+                    break
+
+                parsed = _parse_markets_page(data)
+                all_markets.extend(parsed)
+                logger.debug(
+                    f"[MARKET_DISCOVERY] Page {page}: fetched {len(data)}, "
+                    f"kept {len(parsed)} (volume filter), running total={len(all_markets)}"
+                )
+
+                if len(data) < PAGE_LIMIT:
+                    # Last page (partial) — no more results
+                    break
+
+        return all_markets
+
+    try:
+        all_markets = await asyncio.wait_for(_fetch_all_pages(), timeout=TOTAL_TIMEOUT)
+        _MARKET_CACHE = all_markets
+        _CACHE_UPDATED_AT = datetime.now(timezone.utc)
+        logger.info(f"[MARKET_DISCOVERY] Cache refreshed: {len(_MARKET_CACHE)} active markets.")
+
     except (httpx.HTTPError, httpx.TimeoutException) as e:
-        logger.warning(f"[MARKET_DISCOVERY] Connection/timeout exception during cache refresh: {e}")
+        logger.critical(f"[MARKET_DISCOVERY] Connection/timeout exception during cache refresh: {e}")
+        _send_cache_failure_alert(str(e))
     except asyncio.TimeoutError:
-        logger.warning("[MARKET_DISCOVERY] Cache refresh timed out (>6s)")
+        logger.critical(f"[MARKET_DISCOVERY] Cache refresh timed out (>{TOTAL_TIMEOUT}s)")
+        _send_cache_failure_alert(f"Total refresh timeout exceeded {TOTAL_TIMEOUT}s")
     except Exception as e:
-        logger.warning(f"[MARKET_DISCOVERY] Unexpected exception refreshing market cache: {e}")
+        logger.critical(f"[MARKET_DISCOVERY] Unexpected exception refreshing market cache: {e}")
+        _send_cache_failure_alert(str(e))
+
+
+def _send_cache_failure_alert(error_detail: str) -> None:
+    """Fire-and-forget Telegram CRITICAL alert on market cache refresh failure."""
+    try:
+        import asyncio as _asyncio
+        from monitoring.telegram_alerts import alert_pipeline_component_crash
+        loop = _asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(
+                alert_pipeline_component_crash(
+                    component="market_discovery.refresh_market_cache",
+                    error_type="CacheRefreshFailure",
+                    error_detail=error_detail[:200]
+                )
+            )
+    except Exception as alert_err:
+        logger.error(f"[MARKET_DISCOVERY] Failed to send cache failure alert: {alert_err}")
 
 def find_matching_markets(signal_entities: dict) -> list[dict]:
     """
@@ -107,7 +170,10 @@ def find_matching_markets(signal_entities: dict) -> list[dict]:
     # Cache freshness check (stale if > 10 minutes)
     age = (datetime.now(timezone.utc) - _CACHE_UPDATED_AT).total_seconds()
     if age > 600:
-        logger.warning(f"[MARKET_DISCOVERY] Cache is stale ({age:.1f}s old). Returning empty.")
+        logger.critical(
+            f"[MARKET_DISCOVERY] Cache is stale ({age:.1f}s old). "
+            f"Market matching disabled until refresh succeeds."
+        )
         return []
         
     matched_markets = []

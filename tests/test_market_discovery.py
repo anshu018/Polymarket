@@ -45,13 +45,21 @@ async def test_refresh_market_cache_filters_low_volume() -> None:
         }
     ]
 
+    call_count = 0
+
     async def mock_get(url: str, **kwargs):
-        return MockResponse(200, mock_data)
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First page: return data (less than PAGE_LIMIT=100, so loop stops after 1 page)
+            return MockResponse(200, mock_data)
+        # Subsequent calls: empty (end of results)
+        return MockResponse(200, [])
 
     with patch("httpx.AsyncClient.get", side_effect=mock_get):
         await refresh_market_cache()
-        
-        # Verify cache contains only m1
+
+        # Verify cache contains only m1 (m2 filtered by volume)
         assert len(md._MARKET_CACHE) == 1
         assert md._MARKET_CACHE[0]["market_id"] == "m1"
         assert md._MARKET_CACHE[0]["volume_usd"] == 1000.0
