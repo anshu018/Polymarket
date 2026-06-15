@@ -12,7 +12,7 @@ PROVIDER_DEEPSEEK = "https://api.deepseek.com/v1"
 
 # News Analyst
 MODEL_NEWS_ANALYST = "google/gemma-4-31b-it:free"
-MODEL_NEWS_ANALYST_FALLBACK = "qwen/qwen3-next-80b-a3b-instruct"
+MODEL_NEWS_ANALYST_FALLBACK = "meta/llama-3.3-70b-instruct"
 
 
 # Contract Parser

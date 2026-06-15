@@ -249,7 +249,7 @@ def mock_llm_apis() -> Generator[dict[str, Any], None, None]:
         # Handle News Analyst startup validation probe ("Reply OK")
         if user_content == "Reply OK":
             if (model == "google/gemma-4-31b-it:free" and "openrouter.ai" in url) or \
-               (model == "qwen/qwen3-next-80b-a3b-instruct" and ("integrate.api.nvidia.com" in url or "nvidia" in url)):
+               (model == "meta/llama-3.3-70b-instruct" and ("integrate.api.nvidia.com" in url or "nvidia" in url)):
                 response_json = {
                     "choices": [{"message": {"role": "assistant", "content": "OK"}}],
                     "usage": {"total_tokens": 10}
@@ -261,7 +261,7 @@ def mock_llm_apis() -> Generator[dict[str, Any], None, None]:
         # Handle News Analyst
         if "prediction market signal classifier" in sys_prompt:
             if (model == "google/gemma-4-31b-it:free" and "openrouter.ai" in url) or \
-               (model == "qwen/qwen3-next-80b-a3b-instruct" and ("integrate.api.nvidia.com" in url or "nvidia" in url)):
+               (model == "meta/llama-3.3-70b-instruct" and ("integrate.api.nvidia.com" in url or "nvidia" in url)):
                 choice_content = {
                     "event_category": "politics",
                     "affected_market_ids": [],

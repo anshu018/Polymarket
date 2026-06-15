@@ -246,7 +246,7 @@ async def validate_models() -> None:
     nv_key = os.environ.get("NVIDIA_API_KEY")
     fallback_ok = False
     fallback_err = "API Key Missing"
-    fallback_model = getattr(config, "MODEL_NEWS_ANALYST_FALLBACK", "qwen/qwen3-next-80b-a3b-instruct")
+    fallback_model = getattr(config, "MODEL_NEWS_ANALYST_FALLBACK", "meta/llama-3.3-70b-instruct")
 
     if nv_key and nv_key != "placeholder":
         url = f"{config.PROVIDER_NVIDIA}/chat/completions"
