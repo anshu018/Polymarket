@@ -66,7 +66,7 @@ Recent decisions affecting current work:
 - [Phase 4]: risk_engine.py implemented as deterministic pure-Python with 100% unit test coverage.
 - [Phase 5]: Local project isolated GSD commands copies chosen over Windows junctions to prevent accidental global data loss and clean git trees.
 - [Phase 8]: Cache-based market discovery module implemented to map signals using in-memory entity overlap scoring and real-time CLOB midpoint pricing checks.
-- [Phase 9]: Wired ingestion pipeline to coordination/trading pipeline. Resolved pipeline disconnect bug, end-to-end routing now active.
+- [Phase 9]: Wired ingestion pipeline to coordination/trading pipeline. Resolved pipeline disconnect bug, end-to-end routing active, model IDs corrected, and startup validation added.
 
 ### Pending Todos
 
@@ -78,6 +78,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-15 13:32
-Stopped at: Pipeline disconnect bug resolved, end-to-end routing wired and verified.
+Last session: 2026-06-15 15:00
+Stopped at: Pipeline disconnect bug resolved, model IDs corrected, startup validation added and verified.
 Resume file: None
+

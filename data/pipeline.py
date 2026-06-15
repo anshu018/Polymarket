@@ -85,10 +85,17 @@ async def _process_loop(queue: asyncio.Queue) -> None:
                     outcome = "abstain"
                     detail = "abstain or news analyst timeout/error"
                 
-                logger.info("[PIPELINE] Coordinator execution completed | Outcome: %s | Headline: '%s'", outcome, snippet)
+                log_outcome = "skipped"
+                if outcome == "traded":
+                    log_outcome = "traded"
+                elif outcome in ("risk-blocked", "exit-triggered"):
+                    log_outcome = "risk-blocked"
+                
+                logger.info("[PIPELINE] Coordinator execution completed | Outcome: %s | Headline: '%s'", log_outcome, snippet)
                 
                 # Ensure market_signals is written to / updated with the final outcome
                 await log_final_signal_status(headline, source, outcome, detail)
+
 
         except Exception as exc:
             # Log but never propagate — a single bad article must not kill

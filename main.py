@@ -90,8 +90,15 @@ async def main():
         # Start background market cache loop
         cache_loop_task = asyncio.create_task(_market_cache_loop(), name="market_cache_loop")
 
+        # Validate News Analyst models before starting signal processing
+        from llm.news_analyst import validate_models
+        logger.info("Validating news analyst models...")
+        await validate_models()
+        logger.info("News analyst models validated successfully.")
+
         # 7. Expected log sequence: "[AGENT] Beginning signal processing."
         logger.info("[AGENT] Beginning signal processing.")
+
 
         # 8. Start signal pipeline task
         from data.pipeline import run_pipeline

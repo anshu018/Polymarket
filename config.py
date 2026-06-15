@@ -11,8 +11,9 @@ PROVIDER_NVIDIA = "https://integrate.api.nvidia.com/v1"
 PROVIDER_DEEPSEEK = "https://api.deepseek.com/v1"
 
 # News Analyst
-MODEL_NEWS_ANALYST = "google/gemma-4-12b-it:free"
-MODEL_NEWS_ANALYST_FALLBACK = "qwen/qwen3-32b"
+MODEL_NEWS_ANALYST = "google/gemma-4-31b-it:free"
+MODEL_NEWS_ANALYST_FALLBACK = "qwen/qwen3-next-80b-a3b-instruct"
+
 
 # Contract Parser
 MODEL_CONTRACT_PARSER = "moonshotai/kimi-k2.6:free"

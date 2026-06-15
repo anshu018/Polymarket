@@ -244,10 +244,22 @@ def mock_llm_apis() -> Generator[dict[str, Any], None, None]:
         else:
             raise ValueError(f"Unknown API provider URL: {url}")
         
+        # Handle News Analyst startup validation probe ("Reply OK")
+        if user_content == "Reply OK":
+            if (model == "google/gemma-4-31b-it:free" and "openrouter.ai" in url) or \
+               (model == "qwen/qwen3-next-80b-a3b-instruct" and ("integrate.api.nvidia.com" in url or "nvidia" in url)):
+                response_json = {
+                    "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+                    "usage": {"total_tokens": 10}
+                }
+                return MockResponse(200, response_json, delay=delay)
+            else:
+                return MockResponse(404, {"error": "Model not found"}, delay=delay)
+
         # Handle News Analyst
         if "prediction market signal classifier" in sys_prompt:
-            if (model == "google/gemma-4-12b-it:free" and "openrouter.ai" in url) or \
-               (model == "qwen/qwen3-32b" and ("integrate.api.nvidia.com" in url or "nvidia" in url)):
+            if (model == "google/gemma-4-31b-it:free" and "openrouter.ai" in url) or \
+               (model == "qwen/qwen3-next-80b-a3b-instruct" and ("integrate.api.nvidia.com" in url or "nvidia" in url)):
                 choice_content = {
                     "event_category": "politics",
                     "affected_market_ids": [],
@@ -257,6 +269,7 @@ def mock_llm_apis() -> Generator[dict[str, Any], None, None]:
                 }
             else:
                 raise ValueError(f"Mocked News Analyst endpoint not mapped for {url} model {model}")
+
             
         # Handle Contract Parser
         elif "resolution criteria parser" in sys_prompt:

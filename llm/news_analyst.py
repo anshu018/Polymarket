@@ -185,3 +185,94 @@ Rules:
     except Exception as e:
         logger.error(f"[NEWS_ANALYST] Unexpected error: {e}")
         return None
+
+_models_validated = False
+
+async def validate_models() -> None:
+    """
+    Validate that the primary or fallback News Analyst model is reachable and working.
+    Runs once at startup only. Raises RuntimeError if both fail.
+    """
+    global _models_validated
+    if _models_validated:
+        return
+
+    logger.info("[NEWS_ANALYST] Running startup model validation probe...")
+    
+    # 1. Probe Primary: OpenRouter
+    or_key = os.environ.get("OPENROUTER_API_KEY")
+    primary_ok = False
+    primary_err = "API Key Missing"
+    primary_model = getattr(config, "MODEL_NEWS_ANALYST", "google/gemma-4-31b-it:free")
+    
+    if or_key and or_key != "placeholder":
+        url = f"{config.PROVIDER_OPENROUTER}/chat/completions"
+        try:
+            payload = {
+                "model": primary_model,
+                "messages": [{"role": "user", "content": "Reply OK"}],
+                "max_tokens": 5
+            }
+            headers = {
+                "Authorization": f"Bearer {or_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/zeroalpha",
+                "X-Title": "Zero Alpha Agent"
+            }
+            async with asyncio.timeout(5.0):
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload, headers=headers) as response:
+                        if response.status == 200:
+                            primary_ok = True
+                            logger.info(f"[NEWS_ANALYST] Model validated: {primary_model}")
+                            _models_validated = True
+                            return
+                        else:
+                            primary_err = f"Status {response.status}: {await response.text()}"
+        except asyncio.TimeoutError:
+            primary_err = "Timeout after 5 seconds"
+        except Exception as e:
+            primary_err = f"Exception: {type(e).__name__}: {e}"
+
+    logger.warning(f"[NEWS_ANALYST] Primary model validation failed: {primary_err}")
+
+    # 2. Probe Fallback: NVIDIA NIM
+    nv_key = os.environ.get("NVIDIA_API_KEY")
+    fallback_ok = False
+    fallback_err = "API Key Missing"
+    fallback_model = getattr(config, "MODEL_NEWS_ANALYST_FALLBACK", "qwen/qwen3-next-80b-a3b-instruct")
+
+    if nv_key and nv_key != "placeholder":
+        url = f"{config.PROVIDER_NVIDIA}/chat/completions"
+        try:
+            payload = {
+                "model": fallback_model,
+                "messages": [{"role": "user", "content": "Reply OK"}],
+                "max_tokens": 5
+            }
+            headers = {
+                "Authorization": f"Bearer {nv_key}",
+                "Content-Type": "application/json",
+            }
+            async with asyncio.timeout(5.0):
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload, headers=headers) as response:
+                        if response.status == 200:
+                            fallback_ok = True
+                            logger.info(f"[NEWS_ANALYST] Model validated: {fallback_model}")
+                            _models_validated = True
+                            return
+                        else:
+                            fallback_err = f"Status {response.status}: {await response.text()}"
+        except asyncio.TimeoutError:
+            fallback_err = "Timeout after 5 seconds"
+        except Exception as e:
+            fallback_err = f"Exception: {type(e).__name__}: {e}"
+
+    logger.warning(f"[NEWS_ANALYST] Fallback model validation failed: {fallback_err}")
+    
+    # Both failed
+    raise RuntimeError(
+        f"Model validation failed. Primary ({primary_model}): {primary_err}. Fallback ({fallback_model}): {fallback_err}."
+    )
+
