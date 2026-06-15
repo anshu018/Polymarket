@@ -3,7 +3,7 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: active
-last_updated: "2026-06-15T13:32:00.000Z"
+last_updated: "2026-06-15T16:35:00.000Z"
 progress:
   total_phases: 9
   completed_phases: 8
@@ -75,11 +75,15 @@ None yet.
 
 ### Blockers/Concerns
 
-None yet.
+- **Market discovery gap — FIXED (2026-06-15)**: Root cause was Gamma API returning only 20 markets by default (API hard limit: 100/page, no pagination in original code). Fixed by adding offset-based pagination loop in `refresh_market_cache()`. EU-West confirmed working: `[MARKET_DISCOVERY] Cache refreshed: 4642 active markets.`
+
+- **Entity matching fix — DEPLOYED (2026-06-15)**: Generic stop words (price, surges, court, gas, execution, nitrogen, etc.) were diluting match scores below 0.30 threshold. Added `_ENTITY_STOP_WORDS` frozenset in `coordinator/pipeline.py`. Verified: Alabama/Bitcoin/Trump headlines now score >0.30, fisheries noise still scores 0.00. No new dependencies.
+
+- **News analyst timeout — FIXED (2026-06-15)**: 52% of signals timing out with `conf=None`. Root cause: hardcoded 6s timeout vs. free-tier Gemma 4 31B taking 8-12s. Changed `NEWS_ANALYST_TIMEOUT_SECONDS = 15` in config.py. Both primary and fallback calls now use config value. Awaiting first `idempotency_log` entry to confirm full trade path is live.
 
 ## Session Continuity
 
-Last session: 2026-06-15 15:00
-Stopped at: Pipeline disconnect bug resolved, model IDs corrected, startup validation added and verified.
+Last session: 2026-06-16 01:48
+Stopped at: Entity matching + news analyst timeout fixes deployed. Awaiting idempotency_log > 0.
 Resume file: None
 

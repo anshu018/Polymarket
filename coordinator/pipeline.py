@@ -33,10 +33,45 @@ from monitoring.telegram_alerts import (
 logger = logging.getLogger(__name__)
 
 
+
+# Stop words filtered from entity extraction before market matching.
+# Generic tokens that appear in thousands of headlines but never in
+# Polymarket market questions — keeping them dilutes match scores below threshold.
+_ENTITY_STOP_WORDS: frozenset[str] = frozenset({
+    # Articles / prepositions / conjunctions
+    "the", "and", "for", "with", "from", "that", "this", "into", "over",
+    "amid", "after", "about", "their", "there", "would", "could", "should",
+    "before", "during", "while", "since", "until", "between", "among",
+    # Generic verbs / aux verbs
+    "is", "are", "was", "will", "can", "has", "have", "had", "been",
+    "get", "got", "use", "say", "said", "says", "sign", "signs", "signed",
+    "allow", "allows", "using", "request", "requests", "deny", "denies", "denied",
+    "calls", "wants", "seeks", "pushes", "push", "face", "faces",
+    "surge", "surges", "surged", "drop", "drops", "fell", "rise", "rises",
+    "reach", "reaches", "hit", "hits", "set", "sets",
+    "warn", "warns", "warns", "claim", "claims", "says", "report", "reports",
+    # Generic adjectives and adverbs
+    "high", "low", "new", "old", "big", "major", "key", "top", "first",
+    "last", "next", "more", "less", "most", "least", "very", "some",
+    "alltime", "longtime", "record",
+    # Generic nouns ubiquitous in news but absent from prediction markets
+    "court", "deal", "gas", "law", "bill", "plan", "talks",
+    "vote", "move", "case", "rule", "order", "news", "report",
+    "year", "years", "week", "weeks", "month", "months", "day", "days",
+    "time", "back", "price", "prices", "rate", "rates", "market", "markets",
+    "official", "officials", "government", "minister", "ministers",
+    "party", "parties", "state", "states", "united", "america",
+    "percent", "billion", "million", "trillion",
+    "execution", "nitrogen",  # too specific to crime/chemistry, not in market questions
+})
+
+
 def extract_entities(headline: str) -> list[str]:
     """
     Extracts named entities from the headline for market discovery.
     Uses spaCy if loaded, otherwise falls back to capitalized words and long terms.
+    Generic stop words are filtered out before returning so they don't dilute
+    the overlap score against market questions.
     """
     try:
         from data.spacy_filter import nlp
@@ -45,10 +80,12 @@ def extract_entities(headline: str) -> list[str]:
             valid_types = {"ORG", "PERSON", "GPE", "LAW", "DATE", "MONEY", "PERCENT", "EVENT"}
             ents = [e.text for e in doc.ents if e.label_ in valid_types]
             if ents:
-                return ents
+                # Apply stop word filter even to spaCy results
+                filtered = [e for e in ents if e.lower() not in _ENTITY_STOP_WORDS]
+                return filtered if filtered else ents  # fall through if all filtered
     except Exception as e:
         logger.warning(f"Error using spaCy for entity extraction: {e}")
-        
+
     # Simple fallback: extract capitalized words/phrases and words of length > 4
     matches = re.findall(r'\b[A-Z][a-zA-Z0-9]*\b(?:\s+\b[A-Z][a-zA-Z0-9]*\b)*', headline)
     words = headline.split()
@@ -59,7 +96,13 @@ def extract_entities(headline: str) -> list[str]:
             "faces", "about", "their", "there", "would", "could", "should", "house", "votes", "before"
         }:
             fallback_ents.append(clean_w)
-    return list(set(fallback_ents))
+
+    # Apply stop word filter — remove single chars and generic tokens
+    filtered = [
+        e for e in set(fallback_ents)
+        if len(e) > 1 and e.lower() not in _ENTITY_STOP_WORDS
+    ]
+    return filtered
 
 
 # ─────────────────────────────────────────────

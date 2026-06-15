@@ -103,10 +103,10 @@ Rules:
                 logger.info(f"[NEWS_ANALYST] Calling primary OpenRouter ({model})...")
                 choice_content = await asyncio.wait_for(
                     _execute_news_call(url, or_key, model, system_content, prompt, is_fallback=False),
-                    timeout=6.0
+                    timeout=config.NEWS_ANALYST_TIMEOUT_SECONDS
                 )
             except asyncio.TimeoutError:
-                logger.warning("[NEWS_ANALYST] Primary OpenRouter call timed out (limit=6s).")
+                logger.warning(f"[NEWS_ANALYST] Primary OpenRouter call timed out (limit={config.NEWS_ANALYST_TIMEOUT_SECONDS}s).")
 
         # 2. Attempt Fallback: NVIDIA NIM (Qwen3-32B)
         if not choice_content:
@@ -118,10 +118,10 @@ Rules:
                     logger.info(f"[NEWS_ANALYST] Calling fallback NVIDIA NIM ({model})...")
                     choice_content = await asyncio.wait_for(
                         _execute_news_call(url, nv_key, model, system_content, prompt, is_fallback=True),
-                        timeout=4.0
+                        timeout=config.NEWS_ANALYST_TIMEOUT_SECONDS / 2
                     )
                 except asyncio.TimeoutError:
-                    logger.error("[NEWS_ANALYST] Fallback NVIDIA NIM call timed out (limit=4s).")
+                    logger.error(f"[NEWS_ANALYST] Fallback NVIDIA NIM call timed out (limit={config.NEWS_ANALYST_TIMEOUT_SECONDS / 2:.0f}s).")
             else:
                 logger.error("[NEWS_ANALYST] NVIDIA API key missing, fallback unavailable.")
 
