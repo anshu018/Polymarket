@@ -9,41 +9,41 @@ logger = logging.getLogger(__name__)
 
 FEEDS = {
     # ── TIER 1: HIGHEST SIGNAL — directly produces Polymarket headlines ────────
-    "NPR News":         "https://feeds.npr.org/1001/rss.xml",
-    "NPR World":        "https://feeds.npr.org/1004/rss.xml",
-    "NPR Politics":     "https://feeds.npr.org/1014/rss.xml",
-    "BBC News":         "https://feeds.bbci.co.uk/news/rss.xml",
-    "Politico":         "https://rss.politico.com/politics-news.xml",
+    "NPR News":             "https://feeds.npr.org/1001/rss.xml",
+    "NPR World":            "https://feeds.npr.org/1004/rss.xml",
+    "NPR Politics":         "https://feeds.npr.org/1014/rss.xml",
+    "BBC News World":       "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "Politico":             "https://rss.politico.com/politics-news.xml",
+    "NYT World":            "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+    "WSJ World":            "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
 
     # ── TIER 2: CRYPTO — high-frequency Polymarket market coverage ─────────────
-    "CoinDesk":         "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "CoinTelegraph":    "https://cointelegraph.com/rss",
+    "CoinDesk":             "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "CoinTelegraph":        "https://cointelegraph.com/rss",
 
     # ── TIER 3: SPORTS — election/championship markets ─────────────────────────
-    "ESPN":             "https://www.espn.com/espn/rss/news",
+    "ESPN":                 "https://www.espn.com/espn/rss/news",
 
     # ── TIER 4: POLITICS / POLICY ─────────────────────────────────────────────
-    "The Hill":         "https://thehill.com/feed/",
-    "Guardian World":   "https://www.theguardian.com/world/rss",
-    "Al Jazeera":       "https://www.aljazeera.com/xml/rss/all.xml",
+    "The Hill":             "https://thehill.com/feed/",
+    "Guardian World":       "https://www.theguardian.com/world/rss",
+    "Al Jazeera":           "https://www.aljazeera.com/xml/rss/all.xml",
 
     # ── TIER 5: ECONOMICS / MARKETS ───────────────────────────────────────────
-    "Federal Reserve":  "https://www.federalreserve.gov/feeds/press_all.xml",
-    "Financial Times":  "https://www.ft.com/rss/home",
-    "Bloomberg":        "https://feeds.bloomberg.com/markets/news.rss",
+    "Federal Reserve FOMC": "https://www.federalreserve.gov/feeds/press_monetary.xml",
+    "Financial Times":      "https://www.ft.com/rss/home",
+    "Bloomberg Markets":    "https://feeds.bloomberg.com/markets/news.rss",
 
     # ── TIER 6: LEGAL / GOVERNMENT (SCOTUS markets, White House policy) ─────────
-    "SCOTUSblog":       "https://www.scotusblog.com/feed/",
-    "White House":      "https://www.whitehouse.gov/news/feed/",
-    "Fox News":         "https://moxie.foxnews.com/google-publisher/latest.xml",
+    "SCOTUSblog":           "https://www.scotusblog.com/feed/",
+    "White House":          "https://www.whitehouse.gov/news/feed/",
+    "Fox News":             "https://moxie.foxnews.com/google-publisher/latest.xml",
 
-    # ── REMOVED (LOW VALUE — never produce Polymarket-relevant headlines) ──────
-    # "Federal Register": regulatory filings, fisheries notices, privacy acts
-    # "PACER":            DC court dockets (filings, not verdicts)
-    # "ClinicalTrials":   clinical trial listings (no Polymarket markets)
-    # "Congress":         most-viewed bills text (not breaking news)
-    # "DOJ":              DOJ press releases (prosecutions, procedural)
-    # "UN News":          UN procedural notices
+    # ── TIER 7: PLATFORM NEWS / SOURCE SEARCH (Google News Search queries) ──────
+    "AP News (via Google)": "https://news.google.com/rss/search?q=source:%22Associated+Press%22&hl=en-US&gl=US&ceid=US:en",
+    "Metaculus (via Google)": "https://news.google.com/rss/search?q=%22Metaculus%22&hl=en-US&gl=US&ceid=US:en",
+    "Polymarket (via Google)": "https://news.google.com/rss/search?q=%22Polymarket%22&hl=en-US&gl=US&ceid=US:en",
+    "Kalshi (via Google)":  "https://news.google.com/rss/search?q=%22Kalshi%22&hl=en-US&gl=US&ceid=US:en",
 }
 
 _seen_urls = set()
