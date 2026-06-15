@@ -225,7 +225,7 @@ async def validate_models() -> None:
                 "HTTP-Referer": "https://github.com/zeroalpha",
                 "X-Title": "Zero Alpha Agent"
             }
-            async with asyncio.timeout(12.0):
+            async with asyncio.timeout(25.0):
                 async with aiohttp.ClientSession() as session:
                     async with session.post(url, json=payload, headers=headers) as response:
                         if response.status == 200:
@@ -236,7 +236,7 @@ async def validate_models() -> None:
                         else:
                             primary_err = f"Status {response.status}: {await response.text()}"
         except asyncio.TimeoutError:
-            primary_err = "Timeout after 12 seconds"
+            primary_err = "Timeout after 25 seconds"
         except Exception as e:
             primary_err = f"Exception: {type(e).__name__}: {e}"
 
@@ -260,7 +260,7 @@ async def validate_models() -> None:
                 "Authorization": f"Bearer {nv_key}",
                 "Content-Type": "application/json",
             }
-            async with asyncio.timeout(12.0):
+            async with asyncio.timeout(25.0):
                 async with aiohttp.ClientSession() as session:
                     async with session.post(url, json=payload, headers=headers) as response:
                         if response.status == 200:
@@ -271,7 +271,7 @@ async def validate_models() -> None:
                         else:
                             fallback_err = f"Status {response.status}: {await response.text()}"
         except asyncio.TimeoutError:
-            fallback_err = "Timeout after 12 seconds"
+            fallback_err = "Timeout after 25 seconds"
         except Exception as e:
             fallback_err = f"Exception: {type(e).__name__}: {e}"
 
