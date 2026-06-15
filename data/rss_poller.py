@@ -8,25 +8,42 @@ import config
 logger = logging.getLogger(__name__)
 
 FEEDS = {
-    # "AP News": "https://apnews.com/hub/rss",
-    "BBC News": "https://feeds.bbci.co.uk/news/rss.xml",
-    "Federal Reserve": "https://www.federalreserve.gov/feeds/press_all.xml",
-    "Supreme Court": "https://www.supremecourt.gov/rss/opinions.aspx",
-    # "SEC EDGAR": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&CIK=&type=8-k&company=&dateb=&owner=include&start=0&count=40&output=atom",
-    "Congress": "https://www.congress.gov/rss/most-viewed-bills.xml",
-    "SCOTUSblog": "https://www.scotusblog.com/feed/",
-    "DOJ": "https://www.justice.gov/news/rss",
-    # "FDA": "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/fda-news-releases/rss.xml",
-    "Federal Register": "https://www.federalregister.gov/api/v1/articles.rss",
-    # "Treasury": "https://home.treasury.gov/news/press-releases.xml",
-    "White House": "https://www.whitehouse.gov/news/feed/",
-    "NATO": "https://www.nato.int/cps/en/natohq/news.htm?selectedLocale=en&type=news&format=rss",
-    "UN News": "https://news.un.org/feed/subscribe/en/news/all/rss.xml",
-    "Politico": "https://rss.politico.com/politics-news.xml",
-    # "Metaculus": "https://www.metaculus.com/questions/rss/",
-    "ClinicalTrials": "https://clinicaltrials.gov/ct2/rss/feed?rcv_d=14&lup_d=14&sel_rss=new14",
-    "PACER": "https://ecf.dcd.uscourts.gov/cgi-bin/rss_outside.pl",
-    # "Kalshi": "https://kalshi.com/feed"
+    # ── TIER 1: HIGHEST SIGNAL — directly produces Polymarket headlines ────────
+    "NPR News":         "https://feeds.npr.org/1001/rss.xml",
+    "NPR World":        "https://feeds.npr.org/1004/rss.xml",
+    "NPR Politics":     "https://feeds.npr.org/1014/rss.xml",
+    "BBC News":         "https://feeds.bbci.co.uk/news/rss.xml",
+    "Politico":         "https://rss.politico.com/politics-news.xml",
+
+    # ── TIER 2: CRYPTO — high-frequency Polymarket market coverage ─────────────
+    "CoinDesk":         "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "CoinTelegraph":    "https://cointelegraph.com/rss",
+
+    # ── TIER 3: SPORTS — election/championship markets ─────────────────────────
+    "ESPN":             "https://www.espn.com/espn/rss/news",
+
+    # ── TIER 4: POLITICS / POLICY ─────────────────────────────────────────────
+    "The Hill":         "https://thehill.com/feed/",
+    "Guardian World":   "https://www.theguardian.com/world/rss",
+    "Al Jazeera":       "https://www.aljazeera.com/xml/rss/all.xml",
+
+    # ── TIER 5: ECONOMICS / MARKETS ───────────────────────────────────────────
+    "Federal Reserve":  "https://www.federalreserve.gov/feeds/press_all.xml",
+    "Financial Times":  "https://www.ft.com/rss/home",
+    "Bloomberg":        "https://feeds.bloomberg.com/markets/news.rss",
+
+    # ── TIER 6: LEGAL / GOVERNMENT (SCOTUS markets, White House policy) ─────────
+    "SCOTUSblog":       "https://www.scotusblog.com/feed/",
+    "White House":      "https://www.whitehouse.gov/news/feed/",
+    "Fox News":         "https://moxie.foxnews.com/google-publisher/latest.xml",
+
+    # ── REMOVED (LOW VALUE — never produce Polymarket-relevant headlines) ──────
+    # "Federal Register": regulatory filings, fisheries notices, privacy acts
+    # "PACER":            DC court dockets (filings, not verdicts)
+    # "ClinicalTrials":   clinical trial listings (no Polymarket markets)
+    # "Congress":         most-viewed bills text (not breaking news)
+    # "DOJ":              DOJ press releases (prosecutions, procedural)
+    # "UN News":          UN procedural notices
 }
 
 _seen_urls = set()

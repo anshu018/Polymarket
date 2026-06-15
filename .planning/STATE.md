@@ -81,9 +81,11 @@ None yet.
 
 - **News analyst timeout — FIXED (2026-06-15)**: 52% of signals timing out with `conf=None`. Root cause: hardcoded 6s timeout vs. free-tier Gemma 4 31B taking 8-12s. Changed `NEWS_ANALYST_TIMEOUT_SECONDS = 15` in config.py. Both primary and fallback calls now use config value. Awaiting first `idempotency_log` entry to confirm full trade path is live.
 
+- **RSS feed quality — FIXED (2026-06-16)**: 38% of active feeds were LOW VALUE (Federal Register, PACER dockets, ClinicalTrials, Congress bills, DOJ releases, UN notices) flooding pipeline with regulatory noise. Replaced with 17 verified high-signal feeds: NPR News/World/Politics, BBC, Politico, CoinDesk, CoinTelegraph, ESPN, The Hill, Guardian World, Al Jazeera, Federal Reserve, Financial Times, Bloomberg, SCOTUSblog, White House, Fox News. All 17 URLs verified live before commit. Target: >5% of signals at conf >= 0.75 (was ~0.5%).
+
 ## Session Continuity
 
-Last session: 2026-06-16 01:48
-Stopped at: Entity matching + news analyst timeout fixes deployed. Awaiting idempotency_log > 0.
+Last session: 2026-06-16 02:10
+Stopped at: RSS feed quality fix deployed. Waiting for 5-min post-deploy confidence score distribution check.
 Resume file: None
 
