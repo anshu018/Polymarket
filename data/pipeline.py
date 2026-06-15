@@ -25,7 +25,7 @@ import logging
 import config
 from data.rss_poller import start_poller
 from data.spacy_filter import filter_signal
-from llm.news_analyst import classify_signal
+from coordinator.pipeline import run_pipeline as run_trading_pipeline
 from monitoring.telegram_alerts import alert_pipeline_component_crash
 
 logger = logging.getLogger(__name__)
@@ -60,22 +60,35 @@ async def _process_loop(queue: asyncio.Queue) -> None:
                     headline,
                 )
             else:
-                # --- Stage 2: News Analyst -----------------------------------
-                result = await classify_signal(headline, source)
-                if result is None:
-                    logger.debug(
-                        "[PIPELINE] News Analyst dropped signal: %.60s",
-                        headline,
-                    )
+                # --- Stage 2: Coordinated Integration Pipeline ----------------
+                snippet = headline[:60]
+                logger.info("[PIPELINE] Routing signal to coordinator | Headline: '%s'", snippet)
+                
+                # Run the trading pipeline
+                result = await run_trading_pipeline(headline=headline, source=source)
+                
+                # Check outcome and log/update Supabase
+                outcome = "skipped"
+                detail = None
+                if result:
+                    status = result.get("status")
+                    if status == "success":
+                        outcome = "traded"
+                    elif status == "blocked":
+                        outcome = "risk-blocked"
+                        detail = f"risk-blocked: {result.get('reason')}"
+                    elif status == "exit_triggered":
+                        outcome = "exit-triggered"
+                        detail = f"exit-triggered: {result.get('reason')}"
                 else:
-                    logger.info(
-                        "[PIPELINE] Signal classified | category=%s "
-                        "confidence=%.3f direction=%s | %.60s",
-                        result.event_category,
-                        result.confidence_score,
-                        result.direction,
-                        headline,
-                    )
+                    # News Analyst failed, timed out, or Coordinator decided ABSTAIN
+                    outcome = "abstain"
+                    detail = "abstain or news analyst timeout/error"
+                
+                logger.info("[PIPELINE] Coordinator execution completed | Outcome: %s | Headline: '%s'", outcome, snippet)
+                
+                # Ensure market_signals is written to / updated with the final outcome
+                await log_final_signal_status(headline, source, outcome, detail)
 
         except Exception as exc:
             # Log but never propagate — a single bad article must not kill
@@ -87,6 +100,11 @@ async def _process_loop(queue: asyncio.Queue) -> None:
                 exc,
                 exc_info=True,
             )
+            # Record error in market_signals if it passed spaCy filter
+            try:
+                await log_final_signal_status(headline, source, "error", f"worker exception: {type(exc).__name__}")
+            except Exception:
+                pass
         finally:
             # Always signal completion so queue.join() (if used) works
             # correctly and the queue's internal counter never diverges.
@@ -214,3 +232,67 @@ async def run_pipeline() -> None:
                 alert_exc,
             )
         # Intentionally do NOT re-raise — caller (main.py) is never disturbed.
+
+
+async def log_final_signal_status(headline: str, source: str, outcome: str, detail: str = None) -> None:
+    """
+    Ensure market_signals is written/updated with the final pipeline outcome.
+    Per Rule 5: 2-second timeout wrapper.
+    """
+    from memory.supabase_client import get_client
+    import config
+    from datetime import datetime, timezone
+
+    async def _db_write():
+        client = await get_client()
+        # Find if a record already exists for this headline and source (inserted by classify_signal)
+        # We query the latest matching row
+        res = client.table("market_signals")\
+            .select("id,action_taken")\
+            .eq("raw_headline", headline)\
+            .eq("source_name", source)\
+            .order("detected_at", desc=True)\
+            .limit(1)\
+            .execute()
+            
+        if res.data:
+            row_id = res.data[0]["id"]
+            update_data = {
+                "processed_at": datetime.now(timezone.utc).isoformat()
+            }
+            if outcome == "traded":
+                update_data["action_taken"] = "traded"
+                update_data["discard_reason"] = None
+            elif outcome == "risk-blocked":
+                update_data["action_taken"] = "discarded"
+                update_data["discard_reason"] = detail or "risk-blocked"
+            elif outcome == "abstain":
+                update_data["action_taken"] = "discarded"
+                update_data["discard_reason"] = "abstain"
+            elif outcome == "error":
+                # Only overwrite if it was pending
+                if res.data[0]["action_taken"] == "pending":
+                    update_data["action_taken"] = "discarded"
+                    update_data["discard_reason"] = detail or "pipeline error"
+                    
+            client.table("market_signals").update(update_data).eq("id", row_id).execute()
+        else:
+            # No existing row (e.g., News Analyst failed/timed out before logging)
+            action_taken = "traded" if outcome == "traded" else "discarded"
+            insert_data = {
+                "raw_headline": headline,
+                "source_name": source,
+                "source_url": source,
+                "action_taken": action_taken,
+                "discard_reason": detail if outcome != "traded" else None,
+                "detected_at": datetime.now(timezone.utc).isoformat(),
+                "processed_at": datetime.now(timezone.utc).isoformat()
+            }
+            client.table("market_signals").insert(insert_data).execute()
+
+    try:
+        db_timeout = getattr(config, "SUPABASE_TIMEOUT_SECONDS", 2)
+        await asyncio.wait_for(_db_write(), timeout=db_timeout)
+    except Exception as e:
+        logger.error(f"[PIPELINE] Failed to update final signal status in Supabase: {e}")
+

@@ -8,25 +8,25 @@ import config
 logger = logging.getLogger(__name__)
 
 FEEDS = {
-    "AP News": "https://apnews.com/hub/rss",
+    # "AP News": "https://apnews.com/hub/rss",
     "BBC News": "https://feeds.bbci.co.uk/news/rss.xml",
     "Federal Reserve": "https://www.federalreserve.gov/feeds/press_all.xml",
     "Supreme Court": "https://www.supremecourt.gov/rss/opinions.aspx",
-    "SEC EDGAR": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&CIK=&type=8-k&company=&dateb=&owner=include&start=0&count=40&output=atom",
+    # "SEC EDGAR": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&CIK=&type=8-k&company=&dateb=&owner=include&start=0&count=40&output=atom",
     "Congress": "https://www.congress.gov/rss/most-viewed-bills.xml",
     "SCOTUSblog": "https://www.scotusblog.com/feed/",
     "DOJ": "https://www.justice.gov/news/rss",
-    "FDA": "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/fda-news-releases/rss.xml",
+    # "FDA": "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/fda-news-releases/rss.xml",
     "Federal Register": "https://www.federalregister.gov/api/v1/articles.rss",
-    "Treasury": "https://home.treasury.gov/news/press-releases.xml",
+    # "Treasury": "https://home.treasury.gov/news/press-releases.xml",
     "White House": "https://www.whitehouse.gov/news/feed/",
     "NATO": "https://www.nato.int/cps/en/natohq/news.htm?selectedLocale=en&type=news&format=rss",
     "UN News": "https://news.un.org/feed/subscribe/en/news/all/rss.xml",
     "Politico": "https://rss.politico.com/politics-news.xml",
-    "Metaculus": "https://www.metaculus.com/questions/rss/",
+    # "Metaculus": "https://www.metaculus.com/questions/rss/",
     "ClinicalTrials": "https://clinicaltrials.gov/ct2/rss/feed?rcv_d=14&lup_d=14&sel_rss=new14",
     "PACER": "https://ecf.dcd.uscourts.gov/cgi-bin/rss_outside.pl",
-    "Kalshi": "https://kalshi.com/feed"
+    # "Kalshi": "https://kalshi.com/feed"
 }
 
 _seen_urls = set()

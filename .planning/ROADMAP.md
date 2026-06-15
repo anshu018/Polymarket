@@ -112,6 +112,16 @@ A phased build of an autonomous prediction market trading agent, taking it from 
 **Plans**: 1 plan
 - [x] 08-01: Build market discovery cache, matching, and pipeline integration
 
+### Phase 9: Hermes-Adapted Self-Learning & Memory System
+
+**Goal:** [To be planned]
+**Requirements**: TBD
+**Depends on:** Phase 8
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd:plan-phase 9 to break down)
+
 ---
 
 ## Progress

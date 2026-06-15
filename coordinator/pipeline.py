@@ -320,6 +320,7 @@ async def run_pipeline(
     if not news_output:
         logger.warning("[PIPELINE] News Analyst returned None (timeout or error). Dropping signal.")
         return None
+    await asyncio.sleep(2)
 
     # Confidence check
     if news_output.confidence_score < config.MIN_CONFIDENCE_THRESHOLD:
@@ -409,6 +410,7 @@ async def run_pipeline(
         if not parser_output:
             logger.warning("[PIPELINE] Contract Parser failed. Dropping signal.")
             return None
+        await asyncio.sleep(2)
             
         time_to_res = 48.0  # Simulated time to resolution in hours
         
@@ -427,6 +429,7 @@ async def run_pipeline(
         if not trade_output:
             logger.warning("[PIPELINE] Trade Decision Agent returned None. Dropping signal.")
             return None
+        await asyncio.sleep(2)
 
         # C. Coordinator Layer (Python Weighted Aggregation / LLM escalation)
         coordinator_output = await coordinate_decision(
@@ -438,6 +441,7 @@ async def run_pipeline(
         if not coordinator_output:
             logger.warning("[PIPELINE] Coordinator returned None. Dropping signal.")
             return None
+        await asyncio.sleep(2)
 
         decision_direction = coordinator_output.direction
         decision_confidence = coordinator_output.confidence_score
