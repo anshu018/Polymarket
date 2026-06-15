@@ -62,7 +62,7 @@ async def _execute_news_call(url: str, api_key: str, model: str, system_content:
         logger.error(f"[NEWS_ANALYST] {provider_name} request failed: {e}")
         return None
 
-async def classify_signal(headline: str, source: str) -> Optional[NewsAnalystOutput]:
+async def classify_signal(headline: str, source: str, market_question: Optional[str] = None) -> Optional[NewsAnalystOutput]:
     """
     Classify a news headline into a trading action.
     Returns None on timeout or failure.
@@ -94,6 +94,8 @@ Rules:
         import time
         start_time = time.time()
         prompt = f"Headline: {headline}\nSource: {source}"
+        if market_question:
+            prompt += f"\nTarget Prediction Market Question: {market_question}"
         choice_content = None
 
         # 1. Attempt Primary: OpenRouter (Gemma 4 12B free)

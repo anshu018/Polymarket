@@ -289,8 +289,8 @@ def mock_llm_apis() -> Generator[dict[str, Any], None, None]:
                 raise ValueError(f"Mocked Contract Parser endpoint not mapped for {url} model {model}")
 
         # Handle Trade Decision
-        elif "prediction market trading agent" in sys_prompt or model == "qwen/qwen3-235b-a22b":
-            if (model in ("qwen/qwen3-235b-a22b", "qwen/qwen3-32b")) and (
+        elif "prediction market trading agent" in sys_prompt or model == config.MODEL_TRADE_DECISION:
+            if (model in (config.MODEL_TRADE_DECISION, config.MODEL_COORDINATOR)) and (
                 ("integrate.api.nvidia.com" in url or "nvidia" in url) or ("openrouter.ai" in url)
             ):
                 provider_name = "NVIDIA NIM" if ("integrate.api.nvidia.com" in url or "nvidia" in url) else "OpenRouter"
@@ -303,8 +303,8 @@ def mock_llm_apis() -> Generator[dict[str, Any], None, None]:
                 raise ValueError(f"Mocked Trade Decision endpoint not mapped for {url} model {model}")
 
         # Handle LLM Coordinator
-        elif "prediction market trading coordinator" in sys_prompt or model == "qwen/qwen3-32b":
-            if (model in ("qwen/qwen3-235b-a22b", "qwen/qwen3-32b")) and (
+        elif "prediction market trading coordinator" in sys_prompt or model == config.MODEL_COORDINATOR:
+            if (model in (config.MODEL_TRADE_DECISION, config.MODEL_COORDINATOR)) and (
                 ("integrate.api.nvidia.com" in url or "nvidia" in url) or ("openrouter.ai" in url)
             ):
                 provider_name = "NVIDIA NIM" if ("integrate.api.nvidia.com" in url or "nvidia" in url) else "OpenRouter"
@@ -475,7 +475,7 @@ async def test_6_4_memory_prepended(
     )
 
     # Find the Trade Decision agent prompt in mock logs
-    td_prompt = next((p for model, p in mock_llm_apis["prompts"] if model == "qwen/qwen3-235b-a22b"), "")
+    td_prompt = next((p for model, p in mock_llm_apis["prompts"] if model == config.MODEL_TRADE_DECISION), "")
     assert td_prompt != ""
     
     # Assert lessons are prepended as warning block at the top

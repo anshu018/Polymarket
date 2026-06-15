@@ -20,10 +20,10 @@ MODEL_CONTRACT_PARSER = "moonshotai/kimi-k2.6:free"
 MODEL_CONTRACT_PARSER_FALLBACK = "deepseek-ai/deepseek-v4-flash"
 
 # Trade Decision
-MODEL_TRADE_DECISION = "qwen/qwen3-235b-a22b"
+MODEL_TRADE_DECISION = "qwen/qwen3-next-80b-a3b-instruct"
 
 # Coordinator
-MODEL_COORDINATOR = "qwen/qwen3-32b"
+MODEL_COORDINATOR = "meta/llama-3.3-70b-instruct"
 
 # LLM HARD LIMITS
 MAX_TOKENS_TRADE_DECISION = 900

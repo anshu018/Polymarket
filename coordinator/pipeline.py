@@ -356,27 +356,7 @@ async def run_pipeline(
     if current_balances is None:
         current_balances = {"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0}
 
-    # 1. spaCy Pre-filter (Normally run before pipeline. In test, we assume passed.)
-    
-    # 2. News Analyst Agent
-    news_output = await classify_signal(headline, source)
-    if not news_output:
-        logger.warning("[PIPELINE] News Analyst returned None (timeout or error). Dropping signal.")
-        return None
-    await asyncio.sleep(2)
-
-    # Confidence check
-    if news_output.confidence_score < config.MIN_CONFIDENCE_THRESHOLD:
-        logger.info(
-            f"[PIPELINE] News Analyst confidence {news_output.confidence_score:.2f} < "
-            f"threshold {config.MIN_CONFIDENCE_THRESHOLD}. Discarding signal."
-        )
-        return None
-
-    # Update category based on analyst decision
-    category = news_output.event_category
-
-    # --- Market Discovery ---
+    # --- Market Discovery FIRST ---
     # Attempt to match headline entities against Gamma cached markets
     entities = extract_entities(headline)
     signal_entities = {"entities": entities}
@@ -395,10 +375,38 @@ async def run_pipeline(
     else:
         # If no match in cache and no market_id was explicitly provided, discard
         if not market_id:
-            logger.info(f"[PIPELINE] No matching markets found for headline: {headline}")
-            return None
+            logger.info("[PIPELINE] No matching markets found. Discarding before LLM News Analyst.")
+            return {"status": "blocked", "reason": "no_matching_markets"}
         # Backward compatibility fallback for tests
         token_id = f"mock-token-{market_id}"
+        if market_price is None and not token_id.startswith("mock-token-"):
+            try:
+                market_price = await get_market_price(token_id)
+            except Exception as e:
+                logger.warning(f"[PIPELINE] Failed to fetch price for explicit market {market_id}: {e}")
+                return None
+
+    # Ensure market_price is set
+    if market_price is None:
+        market_price = 0.50
+
+    # 2. News Analyst Agent (now passed market_question for context)
+    news_output = await classify_signal(headline, source, market_question=market_question)
+    if not news_output:
+        logger.warning("[PIPELINE] News Analyst returned None (timeout or error). Dropping signal.")
+        return None
+    await asyncio.sleep(2)
+
+    # Confidence check
+    if news_output.confidence_score < config.MIN_CONFIDENCE_THRESHOLD:
+        logger.info(
+            f"[PIPELINE] News Analyst confidence {news_output.confidence_score:.2f} < "
+            f"threshold {config.MIN_CONFIDENCE_THRESHOLD}. Discarding signal."
+        )
+        return {"status": "blocked", "reason": "low_confidence"}
+
+    # Update category based on analyst decision
+    category = news_output.event_category
 
     # 3. Cache check for Fast Path eligibility
     # Fast path: News Analyst confidence > 0.87 AND category pre-validated
