@@ -81,11 +81,13 @@ None yet.
 
 - **News analyst timeout — FIXED (2026-06-15)**: 52% of signals timing out with `conf=None`. Root cause: hardcoded 6s timeout vs. free-tier Gemma 4 31B taking 8-12s. Changed `NEWS_ANALYST_TIMEOUT_SECONDS = 15` in config.py. Both primary and fallback calls now use config value. Awaiting first `idempotency_log` entry to confirm full trade path is live.
 
-- **RSS feed quality — FIXED (2026-06-16)**: 38% of active feeds were LOW VALUE (Federal Register, PACER dockets, ClinicalTrials, Congress bills, DOJ releases, UN notices) flooding pipeline with regulatory noise. Replaced with 17 verified high-signal feeds: NPR News/World/Politics, BBC, Politico, CoinDesk, CoinTelegraph, ESPN, The Hill, Guardian World, Al Jazeera, Federal Reserve, Financial Times, Bloomberg, SCOTUSblog, White House, Fox News. All 17 URLs verified live before commit. Target: >5% of signals at conf >= 0.75 (was ~0.5%).
+- **RSS feed quality — FIXED (2026-06-16)**: 38% of active feeds were LOW VALUE (Federal Register, PACER dockets, ClinicalTrials, Congress bills, DOJ releases, UN notices) flooding pipeline with regulatory noise. Replaced with 17 verified high-signal feeds. All 17 URLs verified live before commit.
+
+- **News Analyst Fallback Timeout — FIXED (2026-06-16)**: High rate of `conf=None` (timeout/abstain) signals persisted even after increase of primary timeout. Discovered fallback NVIDIA NIM requests sometimes take 5-8 seconds. Since fallback timeout was hardcoded to `NEWS_ANALYST_TIMEOUT_SECONDS / 2` (7.5s), it frequently timed out when primary OpenRouter returned 429 immediately. Implemented dynamic fallback timeout using remaining budget (`max(10.0, limit - elapsed)`), and increased startup model validation probe timeout from 5.0s to 12.0s.
 
 ## Session Continuity
 
-Last session: 2026-06-16 02:10
-Stopped at: RSS feed quality fix deployed. Waiting for 5-min post-deploy confidence score distribution check.
+Last session: 2026-06-16 02:28
+Stopped at: Fallback timeout dynamic allocation and startup probe timeouts implemented and verified. All 104 tests pass.
 Resume file: None
 

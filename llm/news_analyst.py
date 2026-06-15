@@ -91,6 +91,8 @@ Rules:
 - Be conservative. Wrong signals cost money. Missed signals cost nothing.
 """
 
+        import time
+        start_time = time.time()
         prompt = f"Headline: {headline}\nSource: {source}"
         choice_content = None
 
@@ -114,14 +116,18 @@ Rules:
             if nv_key and nv_key != "placeholder":
                 url = f"{config.PROVIDER_NVIDIA}/chat/completions"
                 model = getattr(config, "MODEL_NEWS_ANALYST_FALLBACK", "qwen/qwen3-32b")
+                
+                elapsed = time.time() - start_time
+                fallback_timeout = max(10.0, config.NEWS_ANALYST_TIMEOUT_SECONDS - elapsed)
+                
                 try:
-                    logger.info(f"[NEWS_ANALYST] Calling fallback NVIDIA NIM ({model})...")
+                    logger.info(f"[NEWS_ANALYST] Calling fallback NVIDIA NIM ({model}) with timeout={fallback_timeout:.1f}s...")
                     choice_content = await asyncio.wait_for(
                         _execute_news_call(url, nv_key, model, system_content, prompt, is_fallback=True),
-                        timeout=config.NEWS_ANALYST_TIMEOUT_SECONDS / 2
+                        timeout=fallback_timeout
                     )
                 except asyncio.TimeoutError:
-                    logger.error(f"[NEWS_ANALYST] Fallback NVIDIA NIM call timed out (limit={config.NEWS_ANALYST_TIMEOUT_SECONDS / 2:.0f}s).")
+                    logger.error(f"[NEWS_ANALYST] Fallback NVIDIA NIM call timed out (limit={fallback_timeout:.1f}s).")
             else:
                 logger.error("[NEWS_ANALYST] NVIDIA API key missing, fallback unavailable.")
 
@@ -219,7 +225,7 @@ async def validate_models() -> None:
                 "HTTP-Referer": "https://github.com/zeroalpha",
                 "X-Title": "Zero Alpha Agent"
             }
-            async with asyncio.timeout(5.0):
+            async with asyncio.timeout(12.0):
                 async with aiohttp.ClientSession() as session:
                     async with session.post(url, json=payload, headers=headers) as response:
                         if response.status == 200:
@@ -230,7 +236,7 @@ async def validate_models() -> None:
                         else:
                             primary_err = f"Status {response.status}: {await response.text()}"
         except asyncio.TimeoutError:
-            primary_err = "Timeout after 5 seconds"
+            primary_err = "Timeout after 12 seconds"
         except Exception as e:
             primary_err = f"Exception: {type(e).__name__}: {e}"
 
@@ -254,7 +260,7 @@ async def validate_models() -> None:
                 "Authorization": f"Bearer {nv_key}",
                 "Content-Type": "application/json",
             }
-            async with asyncio.timeout(5.0):
+            async with asyncio.timeout(12.0):
                 async with aiohttp.ClientSession() as session:
                     async with session.post(url, json=payload, headers=headers) as response:
                         if response.status == 200:
@@ -265,7 +271,7 @@ async def validate_models() -> None:
                         else:
                             fallback_err = f"Status {response.status}: {await response.text()}"
         except asyncio.TimeoutError:
-            fallback_err = "Timeout after 5 seconds"
+            fallback_err = "Timeout after 12 seconds"
         except Exception as e:
             fallback_err = f"Exception: {type(e).__name__}: {e}"
 
