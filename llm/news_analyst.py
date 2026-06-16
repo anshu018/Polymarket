@@ -112,12 +112,12 @@ Rules:
             except asyncio.TimeoutError:
                 logger.warning(f"[NEWS_ANALYST] Primary OpenRouter call timed out (limit={config.NEWS_ANALYST_TIMEOUT_SECONDS}s).")
 
-        # 2. Attempt Fallback: NVIDIA NIM (Qwen3-32B)
+        # 2. Attempt Fallback: NVIDIA NIM (Llama-3.3-70B)
         if not choice_content:
             nv_key = os.environ.get("NVIDIA_API_KEY")
             if nv_key and nv_key != "placeholder":
                 url = f"{config.PROVIDER_NVIDIA}/chat/completions"
-                model = getattr(config, "MODEL_NEWS_ANALYST_FALLBACK", "qwen/qwen3-32b")
+                model = getattr(config, "MODEL_NEWS_ANALYST_FALLBACK", "meta/llama-3.3-70b-instruct")
                 
                 elapsed = time.time() - start_time
                 fallback_timeout = max(10.0, config.NEWS_ANALYST_TIMEOUT_SECONDS - elapsed)
