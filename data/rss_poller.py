@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from collections import deque
 from datetime import datetime
 import aiohttp
 import feedparser
@@ -14,8 +15,8 @@ FEEDS = {
     "NPR Politics":         "https://feeds.npr.org/1014/rss.xml",
     "BBC News World":       "https://feeds.bbci.co.uk/news/world/rss.xml",
     "Politico":             "https://rss.politico.com/politics-news.xml",
-    "NYT World":            "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
-    "WSJ World":            "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
+    "Reuters Top News":     "https://feeds.reuters.com/reuters/topNews",
+    "Reuters Politics":     "https://feeds.reuters.com/reuters/politicsNews",
 
     # ── TIER 2: CRYPTO — high-frequency Polymarket market coverage ─────────────
     "CoinDesk":             "https://feeds.feedburner.com/CoinDesk",
@@ -32,21 +33,19 @@ FEEDS = {
     # ── TIER 5: ECONOMICS / MARKETS ───────────────────────────────────────────
     "Federal Reserve FOMC": "https://www.federalreserve.gov/feeds/press_monetary.xml",
     "Financial Times":      "https://www.ft.com/rss/home",
-    "Bloomberg Markets":    "https://feeds.bloomberg.com/markets/news.rss",
 
     # ── TIER 6: LEGAL / GOVERNMENT (SCOTUS markets, White House policy) ─────────
     "SCOTUSblog":           "https://www.scotusblog.com/feed/",
     "White House":          "https://www.whitehouse.gov/news/feed/",
-    "Fox News":             "https://moxie.foxnews.com/google-publisher/latest.xml",
 
     # ── TIER 7: PLATFORM NEWS / SOURCE SEARCH (Google News Search queries) ──────
     "AP News (via Google)": "https://news.google.com/rss/search?q=source:%22Associated+Press%22&hl=en-US&gl=US&ceid=US:en",
-    "Metaculus (via Google)": "https://news.google.com/rss/search?q=%22Metaculus%22&hl=en-US&gl=US&ceid=US:en",
     "Polymarket (via Google)": "https://news.google.com/rss/search?q=%22Polymarket%22&hl=en-US&gl=US&ceid=US:en",
-    "Kalshi (via Google)":  "https://news.google.com/rss/search?q=%22Kalshi%22&hl=en-US&gl=US&ceid=US:en",
 }
 
-_seen_urls = set()
+# Bounded deque prevents unbounded memory growth on long-running instances.
+# Deque supports O(n) `in` checks which is fine for maxlen=5000.
+_seen_urls: deque = deque(maxlen=5000)
 
 async def _fetch_and_parse_feed(session: aiohttp.ClientSession, name: str, rss_url: str) -> tuple[str, str, list[dict]]:
     """Fetch and parse a single feed."""
@@ -117,9 +116,9 @@ async def poll_once() -> list[dict]:
                 fail_count += 1
                 
             for article in articles:
-                url = article["article_url"]
-                if url not in _seen_urls:
-                    _seen_urls.add(url)
+                article_url = article["article_url"]
+                if article_url not in _seen_urls:
+                    _seen_urls.append(article_url)
                     results.append(article)
                     
     logger.info(

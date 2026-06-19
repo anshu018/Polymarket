@@ -11,11 +11,12 @@ PROVIDER_NVIDIA = "https://integrate.api.nvidia.com/v1"
 PROVIDER_DEEPSEEK = "https://api.deepseek.com/v1"
 PROVIDER_SILICONFLOW = "https://api.siliconflow.cn/v1"
 
-FAIL_FAST_HTTP_CODES = [401, 402, 403]
+FAIL_FAST_HTTP_CODES = [401, 402, 403, 429]
 
 # News Analyst
-MODEL_NEWS_ANALYST = "qwen/qwen3-32b"
-MODEL_NEWS_ANALYST_FALLBACK = "meta/llama-3.3-70b-instruct"
+MODEL_NEWS_ANALYST = "Qwen/Qwen3-32B"           # SiliconFlow exact slug (case-sensitive)
+MODEL_NEWS_ANALYST_FALLBACK = "meta/llama-3.3-70b-instruct"  # NVIDIA NIM
+MODEL_NEWS_ANALYST_FALLBACK_2 = "gemini-2.0-flash"           # Google Gemini (free tier)
 
 
 # Contract Parser
@@ -32,7 +33,7 @@ MODEL_COORDINATOR = "meta/llama-3.3-70b-instruct"
 # LLM HARD LIMITS
 MAX_TOKENS_TRADE_DECISION = 900
 THINKING_BUDGET_TRADE_DECISION = 600
-NEWS_ANALYST_TIMEOUT_SECONDS = 15
+NEWS_ANALYST_TIMEOUT_SECONDS = 25  # Raised from 15: non-thinking Qwen3 needs ~2-6s; buffer for cold start
 
 # TELEGRAM
 TELEGRAM_TIMEOUT_SECONDS = 10
@@ -74,7 +75,7 @@ GAMMA_API_URL = "https://gamma-api.polymarket.com"
 POLYGON_CHAIN_ID = 137
 SUPABASE_TIMEOUT_SECONDS = 2
 LLM_TIMEOUT_SECONDS = 18
-FAIL_FAST_HTTP_CODES = [401, 402, 403]
+FAIL_FAST_HTTP_CODES = [401, 402, 403, 429]  # 429 = rate limit, treat same as auth failure → failover
 MIN_CONFIDENCE_THRESHOLD = 0.75
 FAST_PATH_CONFIDENCE_THRESHOLD = 0.87
 CONFIDENCE_CEILING = 0.88
@@ -97,13 +98,14 @@ KELLY_FRACTION_RECALIBRATION = 0.25
 KELLY_FRACTION_CORRELATION = 0.25
 KELLY_FRACTION_RESOLUTION = 0.35
 PIPELINE_QUEUE_MAXSIZE = 100
-SPACY_MODEL = "en_core_web_md"
+SPACY_MODEL = "en_core_web_lg"            # Aligned with GEMINI.md (lg = higher NER accuracy)
 
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 MIN_MARKET_VOLUME_USD = 500.0
 MARKET_MATCH_THRESHOLD = 0.30
 MARKET_CACHE_REFRESH_INTERVAL_SECONDS = 300
 MAX_SPREAD_THRESHOLD = 0.15
+PAPER_TRADING_PORTFOLIO_USDC = float(os.environ.get("PAPER_TRADING_PORTFOLIO_USDC", "10000"))
 
 
 ENVIRONMENT = os.environ.get(
@@ -123,6 +125,7 @@ POLYMARKET_PRIVATE_KEY = os.environ.get("POLYMARKET_PRIVATE_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")  # Optional: free tier fallback (1M tokens/day)
 
 _required_vars = [
     "SUPABASE_URL",
