@@ -18,6 +18,12 @@ from monitoring.telegram_alerts import alert_siliconflow_failover
 
 logger = logging.getLogger(__name__)
 
+class LLMFailFastError(Exception):
+    def __init__(self, status: int, provider: str):
+        self.status = status
+        self.provider = provider
+        super().__init__(f"Auth/quota error {status} on {provider}")
+
 # ─────────────────────────────────────────────
 # OUTPUT SCHEMA
 # ─────────────────────────────────────────────
@@ -87,6 +93,10 @@ async def _execute_llm_call(
 
     async with aiohttp.ClientSession() as session:
         async with session.post(url, json=payload, headers=headers) as response:
+            if response.status in config.FAIL_FAST_HTTP_CODES:
+                provider_name = "OpenRouter" if "openrouter" in url.lower() else "NVIDIA NIM"
+                logger.error(f"[LLM] Auth/quota error {response.status} on {provider_name} — immediate failover")
+                raise LLMFailFastError(response.status, provider_name)
             if response.status != 200:
                 text = await response.text()
                 logger.error(
@@ -200,6 +210,10 @@ async def escalate_to_llm_coordinator(
                 asyncio.create_task(
                     alert_siliconflow_failover(latency_ms, "OpenRouter")
                 )
+            except LLMFailFastError as e:
+                logger.warning(
+                    f"[COORDINATOR] Catching LLMFailFastError {e.status} on {e.provider} inside NVIDIA NIM primary attempt. Falling through to fallback immediately."
+                )
             except Exception as e:
                 logger.error(f"[COORDINATOR] NVIDIA NIM call failed: {e}, initiating failover...")
         else:
@@ -221,6 +235,9 @@ async def escalate_to_llm_coordinator(
                     return result
             except asyncio.TimeoutError:
                 logger.error("[COORDINATOR] Fallback OpenRouter timed out as well.")
+            except LLMFailFastError as e:
+                logger.error(f"[COORDINATOR] Fallback OpenRouter call failed with LLMFailFastError: {e}")
+                raise e
             except Exception as e:
                 logger.error(f"[COORDINATOR] Fallback OpenRouter call failed: {e}")
         else:

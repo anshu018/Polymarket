@@ -26,6 +26,12 @@ class NewsAnalystOutput(BaseModel):
     def clamp_confidence(cls, v: float) -> float:
         return min(v, 0.88)
 
+class LLMFailFastError(Exception):
+    def __init__(self, status: int, provider: str):
+        self.status = status
+        self.provider = provider
+        super().__init__(f"Auth/quota error {status} on {provider}")
+
 async def _execute_news_call(url: str, api_key: str, model: str, system_content: str, prompt: str, is_fallback: bool) -> Optional[str]:
     import aiohttp
     payload = {
@@ -45,20 +51,24 @@ async def _execute_news_call(url: str, api_key: str, model: str, system_content:
         headers["HTTP-Referer"] = "https://github.com/zeroalpha"
         headers["X-Title"] = "Zero Alpha Agent"
 
+    provider_name = "NVIDIA NIM" if is_fallback else "SiliconFlow"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, headers=headers) as response:
+                if response.status in config.FAIL_FAST_HTTP_CODES:
+                    logger.error(f"[LLM] Auth/quota error {response.status} on {provider_name} — immediate failover")
+                    raise LLMFailFastError(response.status, provider_name)
                 if response.status != 200:
                     text = await response.text()
-                    provider_name = "NVIDIA" if is_fallback else "OpenRouter"
                     logger.error(f"[NEWS_ANALYST] {provider_name} returned {response.status}: {text}")
                     return None
                 data = await response.json()
                 usage = data.get("usage", {})
                 logger.info(f"[NEWS_ANALYST] Token usage: {usage} | Fallback: {is_fallback}")
                 return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    except LLMFailFastError:
+        raise
     except Exception as e:
-        provider_name = "NVIDIA" if is_fallback else "OpenRouter"
         logger.error(f"[NEWS_ANALYST] {provider_name} request failed: {e}")
         return None
 
@@ -98,19 +108,21 @@ Rules:
             prompt += f"\nTarget Prediction Market Question: {market_question}"
         choice_content = None
 
-        # 1. Attempt Primary: OpenRouter (Gemma 4 12B free)
-        or_key = os.environ.get("OPENROUTER_API_KEY")
-        if or_key and or_key != "placeholder":
-            url = f"{config.PROVIDER_OPENROUTER}/chat/completions"
-            model = getattr(config, "MODEL_NEWS_ANALYST", "google/gemma-4-12b-it:free")
+        # 1. Attempt Primary: SiliconFlow (Qwen3-32B)
+        sf_key = os.environ.get("SILICONFLOW_API_KEY")
+        if sf_key and sf_key != "placeholder":
+            url = f"{config.PROVIDER_SILICONFLOW}/chat/completions"
+            model = getattr(config, "MODEL_NEWS_ANALYST", "qwen/qwen3-32b")
             try:
-                logger.info(f"[NEWS_ANALYST] Calling primary OpenRouter ({model})...")
+                logger.info(f"[NEWS_ANALYST] Calling primary SiliconFlow ({model})...")
                 choice_content = await asyncio.wait_for(
-                    _execute_news_call(url, or_key, model, system_content, prompt, is_fallback=False),
+                    _execute_news_call(url, sf_key, model, system_content, prompt, is_fallback=False),
                     timeout=config.NEWS_ANALYST_TIMEOUT_SECONDS
                 )
+            except LLMFailFastError as e:
+                logger.warning(f"[NEWS_ANALYST] Primary SiliconFlow auth/quota error: {e}. Proceeding immediately to fallback.")
             except asyncio.TimeoutError:
-                logger.warning(f"[NEWS_ANALYST] Primary OpenRouter call timed out (limit={config.NEWS_ANALYST_TIMEOUT_SECONDS}s).")
+                logger.warning(f"[NEWS_ANALYST] Primary SiliconFlow call timed out (limit={config.NEWS_ANALYST_TIMEOUT_SECONDS}s).")
 
         # 2. Attempt Fallback: NVIDIA NIM (Llama-3.3-70B)
         if not choice_content:
@@ -128,6 +140,8 @@ Rules:
                         _execute_news_call(url, nv_key, model, system_content, prompt, is_fallback=True),
                         timeout=fallback_timeout
                     )
+                except LLMFailFastError as e:
+                    logger.error(f"[NEWS_ANALYST] Fallback NVIDIA NIM auth/quota error: {e}.")
                 except asyncio.TimeoutError:
                     logger.error(f"[NEWS_ANALYST] Fallback NVIDIA NIM call timed out (limit={fallback_timeout:.1f}s).")
             else:
@@ -207,14 +221,14 @@ async def validate_models() -> None:
 
     logger.info("[NEWS_ANALYST] Running startup model validation probe...")
     
-    # 1. Probe Primary: OpenRouter
-    or_key = os.environ.get("OPENROUTER_API_KEY")
+    # 1. Probe Primary: SiliconFlow
+    sf_key = os.environ.get("SILICONFLOW_API_KEY")
     primary_ok = False
     primary_err = "API Key Missing"
-    primary_model = getattr(config, "MODEL_NEWS_ANALYST", "google/gemma-4-31b-it:free")
+    primary_model = getattr(config, "MODEL_NEWS_ANALYST", "qwen/qwen3-32b")
     
-    if or_key and or_key != "placeholder":
-        url = f"{config.PROVIDER_OPENROUTER}/chat/completions"
+    if sf_key and sf_key != "placeholder":
+        url = f"{config.PROVIDER_SILICONFLOW}/chat/completions"
         try:
             payload = {
                 "model": primary_model,
@@ -222,14 +236,15 @@ async def validate_models() -> None:
                 "max_tokens": 5
             }
             headers = {
-                "Authorization": f"Bearer {or_key}",
+                "Authorization": f"Bearer {sf_key}",
                 "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/zeroalpha",
-                "X-Title": "Zero Alpha Agent"
             }
             async with asyncio.timeout(25.0):
                 async with aiohttp.ClientSession() as session:
                     async with session.post(url, json=payload, headers=headers) as response:
+                        if response.status in config.FAIL_FAST_HTTP_CODES:
+                            logger.error(f"[LLM] Auth/quota error {response.status} on SiliconFlow — immediate failover")
+                            raise LLMFailFastError(response.status, "SiliconFlow")
                         if response.status == 200:
                             primary_ok = True
                             logger.info(f"[NEWS_ANALYST] Model validated: {primary_model}")
@@ -237,6 +252,8 @@ async def validate_models() -> None:
                             return
                         else:
                             primary_err = f"Status {response.status}: {await response.text()}"
+        except LLMFailFastError as fail_fast:
+            primary_err = f"FailFast: {fail_fast}"
         except asyncio.TimeoutError:
             primary_err = "Timeout after 25 seconds"
         except Exception as e:
@@ -265,6 +282,9 @@ async def validate_models() -> None:
             async with asyncio.timeout(25.0):
                 async with aiohttp.ClientSession() as session:
                     async with session.post(url, json=payload, headers=headers) as response:
+                        if response.status in config.FAIL_FAST_HTTP_CODES:
+                            logger.error(f"[LLM] Auth/quota error {response.status} on NVIDIA — immediate failover")
+                            raise LLMFailFastError(response.status, "NVIDIA")
                         if response.status == 200:
                             fallback_ok = True
                             logger.info(f"[NEWS_ANALYST] Model validated: {fallback_model}")
@@ -272,6 +292,8 @@ async def validate_models() -> None:
                             return
                         else:
                             fallback_err = f"Status {response.status}: {await response.text()}"
+        except LLMFailFastError as fail_fast:
+            fallback_err = f"FailFast: {fail_fast}"
         except asyncio.TimeoutError:
             fallback_err = "Timeout after 25 seconds"
         except Exception as e:

@@ -72,8 +72,8 @@ async def refresh_market_cache() -> None:
     """
     global _MARKET_CACHE, _CACHE_UPDATED_AT
 
-    PAGE_LIMIT = 100      # API hard cap per request
-    MAX_PAGES = 50        # Safety cap: 5,000 markets maximum
+    PAGE_LIMIT = 500      # API cap per request
+    MAX_PAGES = 5         # Safety cap: 2,500 markets maximum
     PER_REQUEST_TIMEOUT = 8.0
     TOTAL_TIMEOUT = 60.0
 
@@ -82,41 +82,40 @@ async def refresh_market_cache() -> None:
         all_markets: list[dict] = []
         base_url = f"{config.GAMMA_API_BASE}/markets?active=true&closed=false&limit={PAGE_LIMIT}"
 
-        async with httpx.AsyncClient() as client:
-            for page in range(MAX_PAGES):
-                offset = page * PAGE_LIMIT
-                url = f"{base_url}&offset={offset}"
-                response = await client.get(url, timeout=PER_REQUEST_TIMEOUT)
+        async def fetch_page(client: httpx.AsyncClient, page: int) -> list[dict]:
+            offset = page * PAGE_LIMIT
+            url = f"{base_url}&offset={offset}"
+            response = await client.get(url, timeout=PER_REQUEST_TIMEOUT)
 
-                if response.status_code != 200:
-                    logger.critical(
-                        f"[MARKET_DISCOVERY] Gamma API returned HTTP {response.status_code} "
-                        f"on page {page} (offset={offset})"
-                    )
-                    break
-
-                data = response.json()
-                if not isinstance(data, list):
-                    logger.critical(
-                        "[MARKET_DISCOVERY] Gamma API returned invalid format (expected list)"
-                    )
-                    break
-
-                if not data:
-                    # Empty page — end of results
-                    logger.debug(f"[MARKET_DISCOVERY] Empty page at offset={offset}, stopping.")
-                    break
-
-                parsed = _parse_markets_page(data)
-                all_markets.extend(parsed)
-                logger.debug(
-                    f"[MARKET_DISCOVERY] Page {page}: fetched {len(data)}, "
-                    f"kept {len(parsed)} (volume filter), running total={len(all_markets)}"
+            if response.status_code != 200:
+                logger.critical(
+                    f"[MARKET_DISCOVERY] Gamma API returned HTTP {response.status_code} "
+                    f"on page {page} (offset={offset})"
                 )
+                response.raise_for_status()
 
-                if len(data) < PAGE_LIMIT:
-                    # Last page (partial) — no more results
-                    break
+            data = response.json()
+            if not isinstance(data, list):
+                logger.critical(
+                    f"[MARKET_DISCOVERY] Gamma API returned invalid format (expected list) on page {page}"
+                )
+                raise ValueError("Gamma API returned invalid format (expected list)")
+
+            parsed = _parse_markets_page(data)
+            logger.debug(
+                f"[MARKET_DISCOVERY] Page {page}: fetched {len(data)}, "
+                f"kept {len(parsed)} (volume filter)"
+            )
+            return parsed
+
+        async with httpx.AsyncClient() as client:
+            tasks = [fetch_page(client, page) for page in range(MAX_PAGES)]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for res in results:
+                if isinstance(res, Exception):
+                    raise res
+                all_markets.extend(res)
 
         return all_markets
 
@@ -128,13 +127,16 @@ async def refresh_market_cache() -> None:
 
     except (httpx.HTTPError, httpx.TimeoutException) as e:
         logger.critical(f"[MARKET_DISCOVERY] Connection/timeout exception during cache refresh: {e}")
-        _send_cache_failure_alert(str(e))
-    except asyncio.TimeoutError:
+        err_detail = f"{type(e).__name__}: {str(e)}" if str(e) else type(e).__name__
+        _send_cache_failure_alert(err_detail)
+    except asyncio.TimeoutError as e:
         logger.critical(f"[MARKET_DISCOVERY] Cache refresh timed out (>{TOTAL_TIMEOUT}s)")
-        _send_cache_failure_alert(f"Total refresh timeout exceeded {TOTAL_TIMEOUT}s")
+        err_detail = f"{type(e).__name__}: {str(e)}" if str(e) else type(e).__name__
+        _send_cache_failure_alert(err_detail)
     except Exception as e:
         logger.critical(f"[MARKET_DISCOVERY] Unexpected exception refreshing market cache: {e}")
-        _send_cache_failure_alert(str(e))
+        err_detail = f"{type(e).__name__}: {str(e)}" if str(e) else type(e).__name__
+        _send_cache_failure_alert(err_detail)
 
 
 def _send_cache_failure_alert(error_detail: str) -> None:

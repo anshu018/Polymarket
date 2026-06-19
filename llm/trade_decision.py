@@ -21,6 +21,12 @@ from monitoring.telegram_alerts import alert_siliconflow_failover, alert_supabas
 
 logger = logging.getLogger(__name__)
 
+class LLMFailFastError(Exception):
+    def __init__(self, status: int, provider: str):
+        self.status = status
+        self.provider = provider
+        super().__init__(f"Auth/quota error {status} on {provider}")
+
 # ─────────────────────────────────────────────
 # OUTPUT SCHEMA
 # ─────────────────────────────────────────────
@@ -193,6 +199,10 @@ async def _execute_llm_call(
 
     async with aiohttp.ClientSession() as session:
         async with session.post(url, json=payload, headers=headers) as response:
+            if response.status in config.FAIL_FAST_HTTP_CODES:
+                provider_name = "OpenRouter" if "openrouter" in url.lower() else "NVIDIA NIM"
+                logger.error(f"[LLM] Auth/quota error {response.status} on {provider_name} — immediate failover")
+                raise LLMFailFastError(response.status, provider_name)
             if response.status != 200:
                 text = await response.text()
                 logger.error(
@@ -327,6 +337,10 @@ async def decide_trade(
             asyncio.create_task(
                 alert_siliconflow_failover(latency_ms, "OpenRouter")
             )
+        except LLMFailFastError as e:
+            logger.warning(
+                f"[TRADE_DECISION] Catching LLMFailFastError {e.status} on {e.provider} inside NVIDIA NIM primary attempt. Falling through to fallback immediately."
+            )
         except Exception as e:
             logger.error(f"[TRADE_DECISION] NVIDIA NIM call failed: {e}, initiating failover...")
     else:
@@ -336,7 +350,7 @@ async def decide_trade(
     or_key = os.environ.get("OPENROUTER_API_KEY")
     if or_key and or_key != "placeholder":
         url = f"{config.PROVIDER_OPENROUTER}/chat/completions"
-        model = config.MODEL_TRADE_DECISION
+        model = config.MODEL_TRADE_DECISION_FALLBACK
         
         try:
             logger.info(f"[TRADE_DECISION] Calling fallback OpenRouter for {market_id}...")
@@ -349,6 +363,9 @@ async def decide_trade(
                 return result, was_memoryless
         except asyncio.TimeoutError:
             logger.error("[TRADE_DECISION] Fallback OpenRouter timed out as well.")
+        except LLMFailFastError as e:
+            logger.error(f"[TRADE_DECISION] Fallback OpenRouter call failed with LLMFailFastError: {e}")
+            raise e
         except Exception as e:
             logger.error(f"[TRADE_DECISION] Fallback OpenRouter call failed: {e}")
     else:

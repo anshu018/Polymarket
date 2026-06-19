@@ -197,6 +197,13 @@ async def _write_cache(
         logger.error(f"[CONTRACT_PARSER] Cache write failed for {market_id}: {e}")
 
 
+class LLMFailFastError(Exception):
+    def __init__(self, status: int, provider: str):
+        self.status = status
+        self.provider = provider
+        super().__init__(f"Auth/quota error {status} on {provider}")
+
+
 async def _execute_parser_call(
     url: str,
     api_key: str,
@@ -226,6 +233,11 @@ async def _execute_parser_call(
 
     async with aiohttp.ClientSession() as session:
         async with session.post(url, json=payload, headers=headers) as response:
+            if response.status in config.FAIL_FAST_HTTP_CODES:
+                logger.error(
+                    f"[LLM] Auth/quota error {response.status} on {provider_name} — immediate failover"
+                )
+                raise LLMFailFastError(response.status, provider_name)
             if response.status != 200:
                 text = await response.text()
                 logger.error(
@@ -306,6 +318,8 @@ async def _call_deepseek(
             )
             if res is not None:
                 return res
+        except LLMFailFastError as e:
+            logger.warning(f"[CONTRACT_PARSER] Primary OpenRouter auth/quota error: {e}. Proceeding immediately to fallback.")
         except asyncio.TimeoutError:
             logger.warning("[CONTRACT_PARSER] Primary OpenRouter call timed out (limit=9s).")
         except Exception as e:
@@ -324,6 +338,8 @@ async def _call_deepseek(
             )
             if res is not None:
                 return res
+        except LLMFailFastError as e:
+            logger.warning(f"[CONTRACT_PARSER] Fallback 1 DeepSeek API auth/quota error: {e}. Proceeding immediately to fallback.")
         except asyncio.TimeoutError:
             logger.warning("[CONTRACT_PARSER] Fallback 1 DeepSeek API call timed out (limit=5s).")
         except Exception as e:
@@ -344,6 +360,8 @@ async def _call_deepseek(
             )
             if res is not None:
                 return res
+        except LLMFailFastError as e:
+            logger.warning(f"[CONTRACT_PARSER] Fallback 2 NVIDIA NIM auth/quota error: {e}.")
         except asyncio.TimeoutError:
             logger.warning("[CONTRACT_PARSER] Fallback 2 NVIDIA NIM call timed out (limit=4s).")
         except Exception as e:

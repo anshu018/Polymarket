@@ -99,3 +99,8 @@ docker-compose.prod.yml
 *.bak
 *.tmp
 *.temp
+
+# Local scratch and temp debugging files
+scratch/
+temp_*.py
+memory/supabase_mcp.py

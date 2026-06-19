@@ -9,9 +9,12 @@ load_dotenv(dotenv_path=_env_file, override=False)
 PROVIDER_OPENROUTER = "https://openrouter.ai/api/v1"
 PROVIDER_NVIDIA = "https://integrate.api.nvidia.com/v1"
 PROVIDER_DEEPSEEK = "https://api.deepseek.com/v1"
+PROVIDER_SILICONFLOW = "https://api.siliconflow.cn/v1"
+
+FAIL_FAST_HTTP_CODES = [401, 402, 403]
 
 # News Analyst
-MODEL_NEWS_ANALYST = "google/gemma-4-31b-it:free"
+MODEL_NEWS_ANALYST = "qwen/qwen3-32b"
 MODEL_NEWS_ANALYST_FALLBACK = "meta/llama-3.3-70b-instruct"
 
 
@@ -20,7 +23,8 @@ MODEL_CONTRACT_PARSER = "moonshotai/kimi-k2.6:free"
 MODEL_CONTRACT_PARSER_FALLBACK = "deepseek-ai/deepseek-v4-flash"
 
 # Trade Decision
-MODEL_TRADE_DECISION = "qwen/qwen3-next-80b-a3b-instruct"
+MODEL_TRADE_DECISION = "qwen/qwen3-235b-a22b"
+MODEL_TRADE_DECISION_FALLBACK = "qwen/qwen3-next-80b-a3b-instruct:free"
 
 # Coordinator
 MODEL_COORDINATOR = "meta/llama-3.3-70b-instruct"
@@ -70,6 +74,7 @@ GAMMA_API_URL = "https://gamma-api.polymarket.com"
 POLYGON_CHAIN_ID = 137
 SUPABASE_TIMEOUT_SECONDS = 2
 LLM_TIMEOUT_SECONDS = 18
+FAIL_FAST_HTTP_CODES = [401, 402, 403]
 MIN_CONFIDENCE_THRESHOLD = 0.75
 FAST_PATH_CONFIDENCE_THRESHOLD = 0.87
 CONFIDENCE_CEILING = 0.88
@@ -117,6 +122,7 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 POLYMARKET_PRIVATE_KEY = os.environ.get("POLYMARKET_PRIVATE_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY")
 
 _required_vars = [
     "SUPABASE_URL",
@@ -126,7 +132,8 @@ _required_vars = [
     "DEEPSEEK_API_KEY",
     "POLYMARKET_PRIVATE_KEY",
     "TELEGRAM_BOT_TOKEN",
-    "TELEGRAM_CHAT_ID"
+    "TELEGRAM_CHAT_ID",
+    "SILICONFLOW_API_KEY"
 ]
 
 _PLACEHOLDER_VALUES = {"placeholder", "your_polygon_wallet_private_key_here", "", None}

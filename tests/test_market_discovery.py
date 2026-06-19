@@ -45,13 +45,9 @@ async def test_refresh_market_cache_filters_low_volume() -> None:
         }
     ]
 
-    call_count = 0
-
     async def mock_get(url: str, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            # First page: return data (less than PAGE_LIMIT=100, so loop stops after 1 page)
+        if "offset=0" in url:
+            # First page: return data
             return MockResponse(200, mock_data)
         # Subsequent calls: empty (end of results)
         return MockResponse(200, [])
@@ -202,3 +198,27 @@ async def test_get_market_metadata_success() -> None:
         metadata = await get_market_metadata("m1")
         assert metadata["question"] == "Will Donald Trump face impeachment?"
         assert metadata["resolution_criteria"] == "Resolves YES if house votes."
+
+
+@pytest.mark.anyio
+async def test_refresh_market_cache_handles_http_error() -> None:
+    """Verify that exception propagation works and formats ConnectError properly."""
+    async def mock_get(url: str, **kwargs):
+        raise httpx.ConnectError("Connection refused")
+
+    with patch("httpx.AsyncClient.get", side_effect=mock_get), \
+         patch("data.market_discovery._send_cache_failure_alert") as mock_alert:
+        await refresh_market_cache()
+        mock_alert.assert_called_once_with("ConnectError: Connection refused")
+
+
+@pytest.mark.anyio
+async def test_refresh_market_cache_handles_unexpected_error() -> None:
+    """Verify that unexpected exception formatting works correctly."""
+    async def mock_get(url: str, **kwargs):
+        raise ValueError("Some weird JSON error")
+
+    with patch("httpx.AsyncClient.get", side_effect=mock_get), \
+         patch("data.market_discovery._send_cache_failure_alert") as mock_alert:
+        await refresh_market_cache()
+        mock_alert.assert_called_once_with("ValueError: Some weird JSON error")

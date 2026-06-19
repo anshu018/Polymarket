@@ -85,9 +85,15 @@ None yet.
 
 - **News Analyst Fallback Timeout — FIXED (2026-06-16)**: High rate of `conf=None` (timeout/abstain) signals persisted even after increase of primary timeout. Discovered fallback NVIDIA NIM requests sometimes take 5-8 seconds. Since fallback timeout was hardcoded to `NEWS_ANALYST_TIMEOUT_SECONDS / 2` (7.5s), it frequently timed out when primary OpenRouter returned 429 immediately. Implemented dynamic fallback timeout using remaining budget (`max(10.0, limit - elapsed)`), and increased startup model validation probe timeout from 5.0s to 12.0s.
 
+- **Market Discovery pagination concurrency, SiliconFlow integration & Fail-Fast — FIXED (2026-06-19)**:
+  - Switched `data/market_discovery.py` page loop to `asyncio.gather` for concurrent fetching, increasing page limit to 500 across 5 pages. Fixed empty Telegram crash detail formatting.
+  - Implemented free-only routing (SiliconFlow as primary News Analyst, NVIDIA NIM as fallback; NVIDIA NIM as primary Trade Decision/Coordinator, OpenRouter as fallback).
+  - Added immediate fail-fast handling on HTTP status `[401, 402, 403]` raising `LLMFailFastError` in `/llm/` wrappers for rapid failover.
+  - Standardized integration test suites to clear caching contamination and mock `asyncio.sleep` to run in 11s instead of 100s.
+
 ## Session Continuity
 
-Last session: 2026-06-16 02:28
-Stopped at: Fallback timeout dynamic allocation and startup probe timeouts implemented and verified. All 104 tests pass.
+Last session: 2026-06-19 23:30
+Stopped at: Concurrent market discovery fetching, fail-fast routing integration, and test suite optimizations completed and verified. All 32 unit and integration tests pass successfully.
 Resume file: None
 

@@ -156,4 +156,22 @@ Reference: PLAN.md Section 15 / TESTING.md Layer 6
 
 ---
 
+### [LAYER 6][ROUTING] — LLM routing changes call count expectations in integration tests
+
+What happened: Switching News Analyst and Trade Decision primary models from OpenRouter to SiliconFlow and NVIDIA NIM caused integration test assertions verifying `sf_calls` and `or_calls` counts to fail (e.g. fast path now requires 1 SiliconFlow call instead of 0).
+Why it's wrong: Call counts were hardcoded assuming the old LLM routing setup, leading to test suite breakages on correct implementation.
+Correct behavior: Update test assertions to match the new LLM routing configurations (News Analyst on SiliconFlow primary = 1 sf_call, Trade Decision primary on NVIDIA NIM = 1 sf_call).
+Reference: TESTING.md Criterion 6.2 / 6.3
+
+---
+
+### [LAYER 6][TIMEOUT] — Integration tests slowness due to rate limit sleep
+
+What happened: Integration tests ran very slowly (~100 seconds total) and hit execution timeouts because of `asyncio.sleep(2.0)` rate limits in the coordinator pipeline.
+Why it's wrong: Slow test suites degrade developer velocity and hit hard limits in test runners.
+Correct behavior: Implement a standard `mock_asyncio_sleep` autouse fixture in `tests/test_integration.py` to bypass 1s/2s rate-limit sleeps (speeding them up to 0.001s), reducing execution time to 11 seconds.
+Reference: TESTING.md Layer 6
+
+---
+
 END OF MEMORY.md

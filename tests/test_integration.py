@@ -23,6 +23,24 @@ from llm.news_analyst import NewsAnalystOutput
 from llm.trade_decision import TradeDecisionOutput
 from llm.coordinator import CoordinatorOutput
 from coordinator.pipeline import run_pipeline
+import data.market_discovery
+
+@pytest.fixture(autouse=True)
+def clear_market_discovery_cache():
+    data.market_discovery._MARKET_CACHE = []
+    data.market_discovery._CACHE_UPDATED_AT = None
+
+@pytest.fixture(autouse=True)
+def mock_asyncio_sleep():
+    """Mock asyncio.sleep to run instantly for rate limit delays (1s/2s)."""
+    orig_sleep = asyncio.sleep
+    async def fake_sleep(delay, result=None):
+        if delay in (2.0, 1.0):
+            return await orig_sleep(0.001, result)
+        return await orig_sleep(delay, result)
+    with patch("asyncio.sleep", fake_sleep):
+        yield
+
 
 # ─────────────────────────────────────────────
 # MOCK DATABASE STATE AND CLIENT
@@ -219,6 +237,10 @@ def mock_llm_apis() -> Generator[dict[str, Any], None, None]:
         "sf_calls": 0,
         "or_calls": 0,
         "prompts": [],
+        "news_analyst_status": 200,
+        "contract_parser_status": 200,
+        "trade_decision_status": 200,
+        "coordinator_status": 200,
     }
 
     def mock_post(self_session: Any, url: str, **kwargs: Any) -> MockResponse:
@@ -239,82 +261,86 @@ def mock_llm_apis() -> Generator[dict[str, Any], None, None]:
         # Increment call counters and set delays based on provider
         if "integrate.api.nvidia.com" in url or "nvidia" in url:
             api_state["sf_calls"] += 1
-            delay = api_state["nvidia_delay"] or api_state["siliconflow_delay"]
+            if "prediction market trading agent" in sys_prompt or model == config.MODEL_TRADE_DECISION:
+                delay = api_state["nvidia_delay"] or api_state["siliconflow_delay"]
+            else:
+                delay = 0.0
         elif "openrouter.ai" in url or "api.deepseek.com" in url:
             api_state["or_calls"] += 1
             delay = api_state["openrouter_delay"]
+        elif "api.siliconflow.cn" in url or "siliconflow" in url:
+            api_state["sf_calls"] += 1
+            if "prediction market trading agent" in sys_prompt or model == config.MODEL_TRADE_DECISION:
+                delay = api_state["siliconflow_delay"]
+            else:
+                delay = 0.0
         else:
             raise ValueError(f"Unknown API provider URL: {url}")
         
+        # Check status code overrides for testing fail-fast HTTP codes (only fail primary models)
+        status_code = 200
+        if "prediction market signal classifier" in sys_prompt or user_content == "Reply OK":
+            if model == getattr(config, "MODEL_NEWS_ANALYST", "qwen/qwen3-32b"):
+                status_code = api_state.get("news_analyst_status", 200)
+        elif "resolution criteria parser" in sys_prompt:
+            if model == getattr(config, "MODEL_CONTRACT_PARSER", "moonshotai/kimi-k2.6:free"):
+                status_code = api_state.get("contract_parser_status", 200)
+        elif "prediction market trading agent" in sys_prompt or model == config.MODEL_TRADE_DECISION:
+            if model == getattr(config, "MODEL_TRADE_DECISION", "qwen/qwen3-235b-a22b"):
+                status_code = api_state.get("trade_decision_status", 200)
+        elif "prediction market trading coordinator" in sys_prompt or model == config.MODEL_COORDINATOR:
+            if model == getattr(config, "MODEL_COORDINATOR", "meta/llama-3.3-70b-instruct"):
+                status_code = api_state.get("coordinator_status", 200)
+
+        if status_code != 200:
+            return MockResponse(status_code, {"error": "Mocked fail fast error"}, delay=delay)
+        
         # Handle News Analyst startup validation probe ("Reply OK")
         if user_content == "Reply OK":
-            if (model == "google/gemma-4-31b-it:free" and "openrouter.ai" in url) or \
-               (model == "meta/llama-3.3-70b-instruct" and ("integrate.api.nvidia.com" in url or "nvidia" in url)):
-                response_json = {
-                    "choices": [{"message": {"role": "assistant", "content": "OK"}}],
-                    "usage": {"total_tokens": 10}
-                }
-                return MockResponse(200, response_json, delay=delay)
-            else:
-                return MockResponse(404, {"error": "Model not found"}, delay=delay)
+            response_json = {
+                "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+                "usage": {"total_tokens": 10}
+            }
+            return MockResponse(200, response_json, delay=delay)
 
         # Handle News Analyst
         if "prediction market signal classifier" in sys_prompt:
-            if (model == "google/gemma-4-31b-it:free" and "openrouter.ai" in url) or \
-               (model == "meta/llama-3.3-70b-instruct" and ("integrate.api.nvidia.com" in url or "nvidia" in url)):
-                choice_content = {
-                    "event_category": "politics",
-                    "affected_market_ids": [],
-                    "confidence_score": api_state["news_analyst_confidence"],
-                    "direction": api_state["news_analyst_direction"],
-                    "reasoning": "Mocked News Analyst reasoning",
-                }
-            else:
-                raise ValueError(f"Mocked News Analyst endpoint not mapped for {url} model {model}")
-
+            choice_content = {
+                "event_category": "politics",
+                "affected_market_ids": [],
+                "confidence_score": api_state["news_analyst_confidence"],
+                "direction": api_state["news_analyst_direction"],
+                "reasoning": "Mocked News Analyst reasoning",
+            }
             
         # Handle Contract Parser
         elif "resolution criteria parser" in sys_prompt:
-            if (model == "moonshotai/kimi-k2.6:free" and "openrouter.ai" in url) or \
-               (model == "deepseek-ai/deepseek-v4-flash" and ("api.deepseek.com" in url or "integrate.api.nvidia.com" in url or "nvidia" in url)):
-                choice_content = {
-                    "resolution_source": "Mock Resolution Source",
-                    "resolution_condition": "Mock Resolution Condition",
-                    "key_entities": ["Trump", "Politics"],
-                    "resolution_keywords": ["impeach", "Trump", "January"],
-                    "ambiguity_score": 0.15,
-                    "resolution_type": "binary",
-                }
-            else:
-                raise ValueError(f"Mocked Contract Parser endpoint not mapped for {url} model {model}")
+            choice_content = {
+                "resolution_source": "Mock Resolution Source",
+                "resolution_condition": "Mock Resolution Condition",
+                "key_entities": ["Trump", "Politics"],
+                "resolution_keywords": ["impeach", "Trump", "January"],
+                "ambiguity_score": 0.15,
+                "resolution_type": "binary",
+            }
 
         # Handle Trade Decision
         elif "prediction market trading agent" in sys_prompt or model == config.MODEL_TRADE_DECISION:
-            if (model in (config.MODEL_TRADE_DECISION, config.MODEL_COORDINATOR)) and (
-                ("integrate.api.nvidia.com" in url or "nvidia" in url) or ("openrouter.ai" in url)
-            ):
-                provider_name = "NVIDIA NIM" if ("integrate.api.nvidia.com" in url or "nvidia" in url) else "OpenRouter"
-                choice_content = {
-                    "direction": api_state["trade_decision_direction"],
-                    "confidence_score": api_state["trade_decision_confidence"],
-                    "reasoning": f"Mocked Trade Decision {provider_name} reasoning",
-                }
-            else:
-                raise ValueError(f"Mocked Trade Decision endpoint not mapped for {url} model {model}")
+            provider_name = "NVIDIA NIM" if ("integrate.api.nvidia.com" in url or "nvidia" in url) else "OpenRouter"
+            choice_content = {
+                "direction": api_state["trade_decision_direction"],
+                "confidence_score": api_state["trade_decision_confidence"],
+                "reasoning": f"Mocked Trade Decision {provider_name} reasoning",
+            }
 
         # Handle LLM Coordinator
         elif "prediction market trading coordinator" in sys_prompt or model == config.MODEL_COORDINATOR:
-            if (model in (config.MODEL_TRADE_DECISION, config.MODEL_COORDINATOR)) and (
-                ("integrate.api.nvidia.com" in url or "nvidia" in url) or ("openrouter.ai" in url)
-            ):
-                provider_name = "NVIDIA NIM" if ("integrate.api.nvidia.com" in url or "nvidia" in url) else "OpenRouter"
-                choice_content = {
-                    "direction": api_state["coordinator_direction"],
-                    "confidence_score": api_state["coordinator_confidence"],
-                    "reasoning": "Mocked LLM Coordinator conflict resolved",
-                }
-            else:
-                raise ValueError(f"Mocked LLM Coordinator endpoint not mapped for {url} model {model}")
+            provider_name = "NVIDIA NIM" if ("integrate.api.nvidia.com" in url or "nvidia" in url) else "OpenRouter"
+            choice_content = {
+                "direction": api_state["coordinator_direction"],
+                "confidence_score": api_state["coordinator_confidence"],
+                "reasoning": "Mocked LLM Coordinator conflict resolved",
+            }
             
         else:
             raise ValueError(f"Mocked endpoint not mapped for {url} model {model}")
@@ -403,8 +429,8 @@ async def test_6_2_fast_path_under_5_seconds(
     assert res["status"] == "success"
     assert duration < 5.0
     
-    # Confirm Trade Decision was completely skipped (sf_calls = 0)
-    assert mock_llm_apis["sf_calls"] == 0
+    # Confirm Trade Decision was completely skipped (sf_calls = 1, since only news analyst was called)
+    assert mock_llm_apis["sf_calls"] == 1
 
 
 @pytest.mark.anyio
@@ -432,8 +458,8 @@ async def test_6_3_full_pipeline_under_22_seconds(
     assert res is not None
     assert res["status"] == "success"
     assert duration < 22.0
-    # Confirm Trade Decision was evaluated
-    assert mock_llm_apis["sf_calls"] == 1
+    # Confirm Trade Decision was evaluated (sf_calls = 2: news analyst + trade decision)
+    assert mock_llm_apis["sf_calls"] == 2
 
 
 @pytest.mark.anyio
@@ -535,8 +561,8 @@ async def test_6_5_conflict_detection(
     # Under low confidence, Trade Decision wins without escalation.
     assert res2 is not None
     assert res2["direction"] == "NO"  # Trade Decision direction won
-    # Verify no LLM coordinator call occurred (total OpenRouter calls strictly < 3, just Analyst + Parser)
-    assert mock_llm_apis["or_calls"] == 2
+    # Verify no LLM coordinator call occurred (total OpenRouter calls strictly < 2, just Parser)
+    assert mock_llm_apis["or_calls"] == 1
 
 
 @pytest.mark.anyio
@@ -678,8 +704,8 @@ async def test_6_9_cache_timeout_fallback_to_full_pipeline(
 
     assert res is not None
     assert res["status"] == "success"
-    # Full pipeline evaluated Trade Decision Agent because fast path check timed out
-    assert mock_llm_apis["sf_calls"] == 1
+    # Full pipeline evaluated Trade Decision Agent because fast path check timed out (sf_calls = 2)
+    assert mock_llm_apis["sf_calls"] == 2
 
 
 @pytest.mark.anyio
@@ -753,8 +779,40 @@ async def test_6_10_siliconflow_failover(
 ) -> None:
     """Criterion 6.10: NVIDIA NIM delay of 19s (>18s) triggers immediate cancel and failover to OpenRouter."""
     mock_llm_apis["news_analyst_confidence"] = 0.80  # Forces full pipeline slow path
-    mock_llm_apis["nvidia_delay"] = 19.0             # Exceeds NVIDIA NIM timeout limits (18.0)
-    mock_llm_apis["siliconflow_delay"] = 19.0        # Keep for backward compatibility
+    mock_llm_apis["nvidia_delay"] = 0.2              # Exceeds mock patched timeout limits (0.1)
+    mock_llm_apis["siliconflow_delay"] = 0.2         # Keep for backward compatibility
+    mock_llm_apis["sf_calls"] = 0
+    mock_llm_apis["or_calls"] = 0
+
+    with patch("config.LLM_TIMEOUT_SECONDS", 0.1):
+        res = await run_pipeline(
+            headline="Donald Trump impeachment",
+            source="AP News",
+            market_id="P1",
+            market_question="Question?",
+            resolution_criteria="Resolves YES.",
+            market_price=0.55,
+            portfolio_value=10000.0,
+            starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+            current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+        )
+
+    assert res is not None
+    assert res["status"] == "success"
+    # Confirm that primary NVIDIA NIM was attempted (sf_calls = 2: news analyst + trade decision attempt)
+    assert mock_llm_apis["sf_calls"] == 2
+    # Confirm that OpenRouter fallback was triggered and succeeded (or_calls = 2: parser + trade decision fallback)
+    assert mock_llm_apis["or_calls"] == 2
+    assert "OpenRouter reasoning" in res["reasoning"]
+
+
+@pytest.mark.anyio
+async def test_news_analyst_fail_fast(
+    mock_supabase_client: MockSupabaseClient,
+    mock_llm_apis: dict[str, Any],
+) -> None:
+    """Verify that a 401 response on primary SiliconFlow triggers immediate News Analyst fallback to NVIDIA NIM."""
+    mock_llm_apis["news_analyst_status"] = 401
     mock_llm_apis["sf_calls"] = 0
     mock_llm_apis["or_calls"] = 0
 
@@ -772,8 +830,36 @@ async def test_6_10_siliconflow_failover(
 
     assert res is not None
     assert res["status"] == "success"
-    # Confirm that primary NVIDIA NIM was attempted
-    assert mock_llm_apis["sf_calls"] == 1
-    # Confirm that OpenRouter fallback was triggered and succeeded
-    assert mock_llm_apis["or_calls"] > 1
-    assert "OpenRouter reasoning" in res["reasoning"]
+    # SiliconFlow primary was called, failed fast, and NVIDIA NIM was called
+    assert mock_llm_apis["sf_calls"] >= 2
+
+
+@pytest.mark.anyio
+async def test_trade_decision_fail_fast(
+    mock_supabase_client: MockSupabaseClient,
+    mock_llm_apis: dict[str, Any],
+) -> None:
+    """Verify that a 403 response on primary NVIDIA NIM triggers immediate Trade Decision fallback to OpenRouter."""
+    mock_llm_apis["news_analyst_confidence"] = 0.80  # Force full pipeline
+    mock_llm_apis["trade_decision_status"] = 403
+    mock_llm_apis["sf_calls"] = 0
+    mock_llm_apis["or_calls"] = 0
+
+    res = await run_pipeline(
+        headline="Donald Trump impeachment",
+        source="AP News",
+        market_id="P1",
+        market_question="Question?",
+        resolution_criteria="Resolves YES.",
+        market_price=0.55,
+        portfolio_value=10000.0,
+        starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+        current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+    )
+
+    assert res is not None
+    assert res["status"] == "success"
+    # Primary NVIDIA NIM was called
+    assert mock_llm_apis["sf_calls"] >= 2  # news analyst + trade decision primary
+    # Fallback OpenRouter was called
+    assert mock_llm_apis["or_calls"] >= 2  # contract parser + trade decision fallback
