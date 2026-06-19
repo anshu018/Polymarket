@@ -31,6 +31,7 @@ class MockTableBuilder:
         self.filters = []
         self._is_null_filters = []
         self._order = None
+        self._is_delete = False
 
     def select(self, cols: str) -> "MockTableBuilder":
         return self
@@ -57,6 +58,7 @@ class MockTableBuilder:
 
         rows = self.db_state.get(self.table_name, [])
         matched = []
+        remaining = []
         for row in rows:
             ok = True
             for col, val in self.filters:
@@ -73,6 +75,12 @@ class MockTableBuilder:
                     ok = False
             if ok:
                 matched.append(row.copy())
+            else:
+                remaining.append(row)
+
+        if self._is_delete:
+            self.db_state[self.table_name] = remaining
+
         return Result(matched)
 
     def insert(self, data: dict[str, Any]) -> "MockTableBuilder":
@@ -91,16 +99,7 @@ class MockTableBuilder:
         return self
 
     def delete(self) -> "MockTableBuilder":
-        table = self.db_state.get(self.table_name, [])
-        remaining = []
-        for row in table:
-            match = True
-            for col, val in self.filters:
-                if row.get(col) != val:
-                    match = False
-            if not match:
-                remaining.append(row)
-        self.db_state[self.table_name] = remaining
+        self._is_delete = True
         return self
 
 
@@ -130,6 +129,13 @@ def mock_supabase_client(db_state: dict[str, list[dict[str, Any]]]) -> Generator
 
     with patch("execution.reconciliation.get_client", fake_get_client):
         yield client
+
+
+@pytest.fixture(autouse=True)
+def force_reconciliation_live_mode():
+    """Force PAPER_TRADING=False for all existing tests in this file."""
+    with patch("config.PAPER_TRADING", False):
+        yield
 
 
 # ─────────────────────────────────────────────
@@ -274,3 +280,61 @@ async def test_7_4_reconciliation_halt_on_inconsistency(
     assert mock_alert.called
     assert "M1" in mock_alert.call_args[0][0]
     assert "0 actual shares" in mock_alert.call_args[0][0]
+
+
+@pytest.mark.anyio
+async def test_paper_trading_reconciliation_resolved_market(
+    mock_supabase_client: MockSupabaseClient,
+    db_state: dict[str, list[dict[str, Any]]]
+) -> None:
+    """Verify that paper trading reconciliation resolves a closed position using the Gamma API."""
+    db_state["open_positions"].append({
+        "id": "pos-1",
+        "market_id": "M1",
+        "market_question": "Will Trump win?",
+        "direction": "YES",
+        "entry_price": 0.50,
+        "position_size_usdc": 100.0,
+        "strategy": "recalibration",
+        "agent_estimate": 0.70,
+        "confidence_at_entry": 0.80,
+        "category": "politics",
+        "opened_at": datetime.now(timezone.utc).isoformat()
+    })
+
+    # Mock get_polymarket_client to not fail USDC fetch
+    mock_clob = MagicMock()
+    mock_clob.get_balance_allowance.return_value = {"balance": "100000000"}  # USDC balance
+
+    class MockResponse:
+        def __init__(self, status_code: int, data: dict[str, Any]) -> None:
+            self.status_code = status_code
+            self._data = data
+        def json(self) -> dict[str, Any]:
+            return self._data
+
+    mock_gamma_data = {
+        "id": "M1",
+        "umaResolutionStatus": "resolved",
+        "outcomes": ["Yes", "No"],
+        "outcomePrices": ["1", "0"],
+        "closed": True
+    }
+
+    # Patch replaces the unbound method, so `self` (the client instance) is passed first
+    async def mock_get(_self: Any, url: str, **kwargs: Any) -> MockResponse:
+        return MockResponse(200, mock_gamma_data)
+
+    with patch("execution.reconciliation.get_polymarket_client", return_value=mock_clob), \
+         patch("httpx.AsyncClient.get", mock_get), \
+         patch("config.PAPER_TRADING", True):
+        
+        await reconcile_on_startup()
+
+    # Position should be moved to closed_trades as a win
+    assert len(db_state["open_positions"]) == 0
+    assert len(db_state["closed_trades"]) == 1
+    assert db_state["closed_trades"][0]["market_id"] == "M1"
+    assert db_state["closed_trades"][0]["outcome"] == "win"
+    assert db_state["closed_trades"][0]["exit_price"] == 1.0
+
