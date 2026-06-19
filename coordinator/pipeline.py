@@ -4,6 +4,7 @@ Coordinates the entire ingestion, analysis, cache, parsing, trade decision, risk
 """
 
 import asyncio
+import os
 import logging
 import uuid
 import time
@@ -32,6 +33,20 @@ from monitoring.telegram_alerts import (
 
 logger = logging.getLogger(__name__)
 
+
+
+# ─────────────────────────────────────────────
+# KEYWORD EXPANSION FOR MARKET MATCHING (C4)
+# ─────────────────────────────────────────────
+
+KEYWORD_EXPANSION: dict[str, list[str]] = {
+    "federal reserve": ["fed", "fomc", "interest rate", "rate cut", "rate hike", "powell"],
+    "election": ["president", "senate", "house", "vote", "ballot", "democrat", "republican"],
+    "bitcoin": ["btc", "crypto", "cryptocurrency", "digital asset"],
+    "supreme court": ["scotus", "justices", "ruling", "decision"],
+    "ukraine": ["russia", "war", "ceasefire", "nato"],
+    "trump": ["president", "white house", "executive order"],
+}
 
 
 # Stop words filtered from entity extraction before market matching.
@@ -102,6 +117,22 @@ def extract_entities(headline: str) -> list[str]:
         e for e in set(fallback_ents)
         if len(e) > 1 and e.lower() not in _ENTITY_STOP_WORDS
     ]
+
+    # Keyword expansion: if any known trigger phrase appears in the headline,
+    # add its expanded synonyms so they participate in market matching.
+    headline_lower = headline.lower()
+    expanded: list[str] = []
+    for trigger, synonyms in KEYWORD_EXPANSION.items():
+        if trigger in headline_lower:
+            expanded.extend(synonyms)
+
+    # Merge and de-duplicate, keeping originals first
+    seen: set[str] = {e.lower() for e in filtered}
+    for syn in expanded:
+        if syn.lower() not in seen:
+            filtered.append(syn)
+            seen.add(syn.lower())
+
     return filtered
 
 
@@ -176,8 +207,8 @@ async def fetch_open_positions_exposure(category: str) -> Tuple[float, float]:
     try:
         rows = await asyncio.wait_for(_fetch(), timeout=config.SUPABASE_TIMEOUT_SECONDS)
         
-        # Calculate total portfolio value — let's assume portfolio size = $10,000 for standard testing/exposure limits
-        total_portfolio = 10000.0  
+        # Calculate total portfolio value from env var (C2 fix — no hardcode)
+        total_portfolio: float = float(os.environ.get("PAPER_TRADING_PORTFOLIO_USDC", "10000"))
         cat_total = 0.0
         corr_total = 0.0
         
@@ -326,6 +357,49 @@ async def log_to_open_positions(
 
 
 # ─────────────────────────────────────────────
+# CACHE WARMUP HELPER (C3)
+# ─────────────────────────────────────────────
+
+async def _warm_resolution_cache(top_n: int = 15) -> None:
+    """Pre-populate resolution keyword cache for top active markets to enable fast path."""
+    try:
+        from data.market_discovery import _MARKET_CACHE as markets
+        if not markets:
+            logger.info("[PIPELINE] Cache warmup: no markets available yet.")
+            return
+
+        # Sort by volume descending, take top N
+        sorted_markets = sorted(
+            markets,
+            key=lambda m: float(m.get("volume_usd") or m.get("volume") or m.get("liquidity") or 0),
+            reverse=True
+        )[:top_n]
+
+        warmed = 0
+        for market in sorted_markets:
+            market_id = market.get("market_id") or market.get("id") or market.get("conditionId", "")
+            question = market.get("question", "")
+            if market_id and question:
+                # Extract simple keywords from question (words > 4 chars)
+                keywords = [w.lower() for w in question.split() if len(w) > 4]
+                if keywords:
+                    try:
+                        client = await get_client()
+                        client.table("resolution_keyword_cache").upsert({
+                            "market_id": market_id,
+                            "keywords": keywords[:10],
+                            "cached_at": datetime.now(timezone.utc).isoformat()
+                        }, on_conflict="market_id").execute()
+                        warmed += 1
+                    except Exception:
+                        pass  # Cache warmup is best-effort — never crash the bot
+
+        logger.info(f"[PIPELINE] Cache warmup: pre-populated {warmed} markets for fast path.")
+    except Exception as e:
+        logger.warning(f"[PIPELINE] Cache warmup failed (non-critical): {e}")
+
+
+# ─────────────────────────────────────────────
 # MASTER PIPELINE ENTRYPOINT
 # ─────────────────────────────────────────────
 
@@ -395,7 +469,7 @@ async def run_pipeline(
     if not news_output:
         logger.warning("[PIPELINE] News Analyst returned None (timeout or error). Dropping signal.")
         return None
-    await asyncio.sleep(2)
+    # NOTE: asyncio.sleep(2) removed — was a 2-second dead wait with no purpose (perf fix C1)
 
     # Confidence check
     if news_output.confidence_score < config.MIN_CONFIDENCE_THRESHOLD:
@@ -461,7 +535,7 @@ async def run_pipeline(
         if not parser_output:
             logger.warning("[PIPELINE] Contract Parser failed. Dropping signal.")
             return None
-        await asyncio.sleep(2)
+        # NOTE: asyncio.sleep(2) removed — was a 2-second dead wait with no purpose (perf fix C1)
             
         time_to_res = 48.0  # Simulated time to resolution in hours
         
@@ -480,7 +554,7 @@ async def run_pipeline(
         if not trade_output:
             logger.warning("[PIPELINE] Trade Decision Agent returned None. Dropping signal.")
             return None
-        await asyncio.sleep(2)
+        # NOTE: asyncio.sleep(2) removed — was a 2-second dead wait with no purpose (perf fix C1)
 
         # C. Coordinator Layer (Python Weighted Aggregation / LLM escalation)
         coordinator_output = await coordinate_decision(
@@ -492,7 +566,7 @@ async def run_pipeline(
         if not coordinator_output:
             logger.warning("[PIPELINE] Coordinator returned None. Dropping signal.")
             return None
-        await asyncio.sleep(2)
+        # NOTE: asyncio.sleep(2) removed — was a 2-second dead wait with no purpose (perf fix C1)
 
         decision_direction = coordinator_output.direction
         decision_confidence = coordinator_output.confidence_score

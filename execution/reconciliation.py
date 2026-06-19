@@ -213,6 +213,57 @@ async def reconcile_on_startup() -> None:
         size_usdc = float(pos["position_size_usdc"])
         expected_shares = size_usdc / entry_price
 
+        # Paper Trading path: fetch from Gamma API to check if resolved
+        if config.PAPER_TRADING:
+            try:
+                import httpx
+                import json
+                async def _fetch_gamma() -> dict[str, Any]:
+                    url = f"https://gamma-api.polymarket.com/markets/{market_id}"
+                    async with httpx.AsyncClient() as client_http:
+                        res = await client_http.get(url, timeout=config.POLYMARKET_API_TIMEOUT_SECONDS)
+                        if res.status_code == 200:
+                            return res.json()
+                        raise RuntimeError(f"Gamma API status {res.status_code}")
+                
+                market = await asyncio.wait_for(_fetch_gamma(), timeout=config.POLYMARKET_API_TIMEOUT_SECONDS)
+                
+                is_resolved = (
+                    market.get("umaResolutionStatus") == "resolved" or
+                    market.get("closed") is True or
+                    market.get("resolved") is True
+                )
+                
+                if is_resolved:
+                    outcome_prices = market.get("outcomePrices")
+                    outcomes = market.get("outcomes")
+                    if isinstance(outcome_prices, str):
+                        outcome_prices = json.loads(outcome_prices)
+                    if isinstance(outcomes, str):
+                        outcomes = json.loads(outcomes)
+                    
+                    exit_price = 0.0
+                    if outcomes and outcome_prices:
+                        dir_match = "Yes" if direction.upper() == "YES" else "No"
+                        try:
+                            idx = [o.strip().title() for o in outcomes].index(dir_match)
+                            exit_price = float(outcome_prices[idx])
+                        except (ValueError, IndexError):
+                            pass
+                    
+                    outcome = "win" if exit_price == 1.0 else "loss"
+                    logger.info(f"[RECONCILIATION] [PAPER_TRADING] Market {market_id} resolved (exit price={exit_price}). Closing position.")
+                    await _supabase_move_to_closed(pos, exit_price, outcome)
+                else:
+                    logger.info(f"[RECONCILIATION] [PAPER_TRADING] Market {market_id} is active. Keeping position.")
+                continue
+
+            except Exception as e:
+                logger.critical(f"[RECONCILIATION] [PAPER_TRADING] Failed to fetch Gamma market details for {market_id}: {e}")
+                unresolvable = True
+                inconsistency_detail = f"Failed to retrieve Gamma market details for {market_id}: {e}"
+                break
+
         # Fetch market details and conditional balance
         try:
             async def _fetch_mkt() -> dict[str, Any]:

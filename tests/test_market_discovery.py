@@ -97,20 +97,27 @@ async def test_find_matching_markets_returns_sorted_by_score() -> None:
 @pytest.mark.anyio
 async def test_find_matching_markets_filters_below_threshold() -> None:
     """Verify that markets below config.MARKET_MATCH_THRESHOLD are excluded."""
-    md._MARKET_CACHE = [
-        {
-            "market_id": "m1",
-            "question": "Will Donald Trump face impeachment?",
-            "token_id": "0x123",
-            "end_date_iso": "2026-12-31",
-            "volume_usd": 1000.0
-        }
-    ]
-    md._CACHE_UPDATED_AT = datetime.now(timezone.utc)
+    import config
+    orig_threshold = config.MARKET_MATCH_THRESHOLD
+    config.MARKET_MATCH_THRESHOLD = 0.50
+    try:
+        md._MARKET_CACHE = [
+            {
+                "market_id": "m1",
+                "question": "Will Donald Trump face impeachment?",
+                "token_id": "0x123",
+                "end_date_iso": "2026-12-31",
+                "volume_usd": 1000.0
+            }
+        ]
+        md._CACHE_UPDATED_AT = datetime.now(timezone.utc)
 
-    # Threshold is 0.30. Matching 1 out of 4 entities = 0.25 (should filter out m1)
-    res = find_matching_markets({"entities": ["Trump", "France", "Germany", "Japan"]})
-    assert len(res) == 0
+        # Capped denominator is 3. 1 match ("Trump") out of 4 = 1/3 = 0.33 (below 0.50, should filter out)
+        res = find_matching_markets({"entities": ["Trump", "France", "Germany", "Japan"]})
+        assert len(res) == 0
+    finally:
+        config.MARKET_MATCH_THRESHOLD = orig_threshold
+
 
 
 @pytest.mark.anyio

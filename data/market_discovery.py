@@ -112,10 +112,26 @@ async def refresh_market_cache() -> None:
             tasks = [fetch_page(client, page) for page in range(MAX_PAGES)]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            for res in results:
+            failed_pages = 0
+            for i, res in enumerate(results):
                 if isinstance(res, Exception):
-                    raise res
-                all_markets.extend(res)
+                    logger.warning(
+                        f"[MARKET_DISCOVERY] Page {i} failed (skipping, not aborting): {res}"
+                    )
+                    failed_pages += 1
+                else:
+                    all_markets.extend(res)
+
+            if failed_pages == MAX_PAGES:
+                for res in results:
+                    if isinstance(res, Exception):
+                        raise res
+
+            if failed_pages > 0:
+                logger.warning(
+                    f"[MARKET_DISCOVERY] {failed_pages}/{MAX_PAGES} pages failed. "
+                    f"Cache built from {MAX_PAGES - failed_pages} successful pages."
+                )
 
         return all_markets
 
@@ -180,22 +196,26 @@ def find_matching_markets(signal_entities: dict) -> list[dict]:
         
     matched_markets = []
     total_entities = len(entities)
-    
+    # Cap the denominator to avoid KEYWORD_EXPANSION inflating entity lists
+    # and penalizing scores: 1 match out of 10 synonyms should still qualify.
+    effective_denominator = max(1, min(total_entities, 3))
+
     for market in _MARKET_CACHE:
         question_lower = market["question"].lower()
         matched_count = 0
         for entity in entities:
             if entity.lower() in question_lower:
                 matched_count += 1
-                
-        score = matched_count / total_entities
-        
+
+        # Score: fraction of "primary slots" matched, capped so synonyms don't dilute
+        score = matched_count / effective_denominator
+
         if score >= config.MARKET_MATCH_THRESHOLD:
             # Create a copy with score included
             entry = market.copy()
-            entry["score"] = score
+            entry["score"] = min(score, 1.0)  # cap at 1.0
             matched_markets.append(entry)
-            
+
     # Sort descending by score
     matched_markets.sort(key=lambda x: x["score"], reverse=True)
     return matched_markets

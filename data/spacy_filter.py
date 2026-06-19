@@ -1,5 +1,8 @@
+import asyncio
 import os
+import re
 import logging
+from typing import Pattern
 import config
 
 logger = logging.getLogger(__name__)
@@ -74,6 +77,21 @@ DOMAIN_ALLOWLIST = [
 # Remove duplicates (e.g., filibuster)
 DOMAIN_ALLOWLIST = list(dict.fromkeys(DOMAIN_ALLOWLIST))
 
+# ---------------------------------------------------------------------------
+# Pre-compiled regex patterns for known junk sources.
+# These match headlines that are NEVER prediction market signals and are
+# blocked before allowlist / spaCy checks (zero LLM cost, O(1) per pattern).
+# ---------------------------------------------------------------------------
+_JUNK_PATTERNS: list[Pattern] = [
+    re.compile(r'\d:\d{2}-[a-z]{2,3}-\d{4,}', re.IGNORECASE),   # PACER docket: "1:23-cr-00309"
+    re.compile(r'^\d{4}-\d{5}\s'),                               # Fed Register doc: "2024-12345 ..."
+    re.compile(r'Federal Register.*?Vol\.\s*\d+', re.IGNORECASE), # Fed Reg volume refs
+    re.compile(r'^FR Doc \d', re.IGNORECASE),                    # "FR Doc 2024-12345"
+    re.compile(                                                   # "Smith v. DEPARTMENT OF ..."
+        r'\bv\.\s+[A-Z][A-Z\s]+(?:LLC|INC|CORP|DEPARTMENT|AGENCY|ADMINISTRATION)\b'
+    ),
+]
+
 nlp = None
 
 if config.ENVIRONMENT == "production":
@@ -90,9 +108,15 @@ if config.ENVIRONMENT == "production":
         raise
 
 async def filter_signal(headline: str, source: str) -> bool:
-    """Returns True to proceed, False to block."""
+    """Returns True to proceed to LLM, False to block. Junk patterns checked first."""
     env = os.environ.get("ENVIRONMENT", config.ENVIRONMENT)
-    
+
+    # Stage 0: Junk pattern filter (O(1) per pattern, no LLM cost)
+    for pattern in _JUNK_PATTERNS:
+        if pattern.search(headline):
+            logger.debug(f"[SPACY_FILTER] Junk pattern blocked: {headline[:60]}")
+            return False
+
     if env != "production":
         logger.info(f"[SPACY_FILTER] DEV MODE passthrough: {headline[:60]}")
         return True
@@ -107,7 +131,8 @@ async def filter_signal(headline: str, source: str) -> bool:
         logger.critical("spaCy not loaded but in production mode")
         raise RuntimeError("spaCy error")
 
-    doc = nlp(headline)
+    loop = asyncio.get_event_loop()
+    doc = await loop.run_in_executor(None, nlp, headline)
     valid_types = {"ORG", "PERSON", "GPE", "LAW", "DATE", "MONEY", "PERCENT", "EVENT"}
     
     found_entities = [(e.text, e.label_) for e in doc.ents if e.label_ in valid_types]

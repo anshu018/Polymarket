@@ -102,7 +102,8 @@ SPACY_MODEL = "en_core_web_lg"            # Aligned with GEMINI.md (lg = higher 
 
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 MIN_MARKET_VOLUME_USD = 500.0
-MARKET_MATCH_THRESHOLD = 0.30
+MARKET_MATCH_THRESHOLD = 0.10  # 1 entity match out of 3 capped denominator = 0.33, well above this
+
 MARKET_CACHE_REFRESH_INTERVAL_SECONDS = 300
 MAX_SPREAD_THRESHOLD = 0.15
 PAPER_TRADING_PORTFOLIO_USDC = float(os.environ.get("PAPER_TRADING_PORTFOLIO_USDC", "10000"))
