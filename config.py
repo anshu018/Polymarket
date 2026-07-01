@@ -27,8 +27,8 @@ MODEL_CONTRACT_PARSER_FALLBACK_OR = "qwen/qwen3-next-80b-a3b-instruct:free"
 
 
 # Trade Decision
-MODEL_TRADE_DECISION = "nvidia/llama-3.1-nemotron-70b-instruct"
-MODEL_TRADE_DECISION_FALLBACK = "google/gemini-2.5-flash"
+MODEL_TRADE_DECISION = "qwen/qwen3-next-80b-a3b-instruct"
+MODEL_TRADE_DECISION_FALLBACK = "qwen/qwen3-235b-a22b"
 
 # Coordinator
 MODEL_COORDINATOR = "meta/llama-3.3-70b-instruct"
