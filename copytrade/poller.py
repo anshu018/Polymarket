@@ -77,8 +77,8 @@ async def _fetch_gamma_trades(
         timestamp   — Unix timestamp of execution
         volume      — Total market volume at time of trade
     """
-    url = f"{config.GAMMA_API_URL}/trades"
-    params = {"maker": wallet_address, "limit": 20}
+    url = "https://data-api.polymarket.com/trades"
+    params = {"user": wallet_address, "limit": 20}
 
     try:
         async with asyncio.timeout(config.GAMMA_API_TIMEOUT_SECONDS):
