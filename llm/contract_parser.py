@@ -295,9 +295,10 @@ async def _call_deepseek(
     """
     Parse Polymarket resolution criteria using primary/fallback models (18-second total limit).
     Attempts:
-      1. Primary: moonshotai/kimi-k2.6:free on OpenRouter (9s timeout)
-      2. Fallback 1: deepseek-ai/deepseek-v4-flash on DeepSeek API (5s timeout)
-      3. Fallback 2: deepseek-ai/deepseek-v4-flash on NVIDIA NIM (4s timeout)
+      1. Primary: MODEL_CONTRACT_PARSER on OpenRouter (8s timeout)
+      2. Fallback 1: MODEL_CONTRACT_PARSER_FALLBACK_DS on DeepSeek API (3s timeout)
+      3. Fallback 2: MODEL_CONTRACT_PARSER_FALLBACK_NV on NVIDIA NIM (3s timeout)
+      4. Fallback 3: MODEL_CONTRACT_PARSER_FALLBACK_OR on OpenRouter (4s timeout)
     """
     user_prompt = (
         f"Market question: {market_question}\n"
@@ -305,69 +306,88 @@ async def _call_deepseek(
         f"Parse this into structured JSON."
     )
 
-    # 1. Primary: OpenRouter (moonshotai/kimi-k2.6:free)
+    # 1. Primary: OpenRouter
     or_key = os.environ.get("OPENROUTER_API_KEY")
     if or_key and or_key != "placeholder":
         url = f"{config.PROVIDER_OPENROUTER}/chat/completions"
-        model = getattr(config, "MODEL_CONTRACT_PARSER", "moonshotai/kimi-k2.6:free")
+        model = getattr(config, "MODEL_CONTRACT_PARSER", "meta-llama/llama-3.3-70b-instruct:free")
         try:
             logger.info(f"[CONTRACT_PARSER] Calling primary OpenRouter ({model})...")
             res = await asyncio.wait_for(
                 _execute_parser_call(url, or_key, model, user_prompt, "OpenRouter", is_openrouter=True),
-                timeout=9.0
+                timeout=8.0
             )
             if res is not None:
                 return res
         except LLMFailFastError as e:
             logger.warning(f"[CONTRACT_PARSER] Primary OpenRouter auth/quota error: {e}. Proceeding immediately to fallback.")
         except asyncio.TimeoutError:
-            logger.warning("[CONTRACT_PARSER] Primary OpenRouter call timed out (limit=9s).")
+            logger.warning("[CONTRACT_PARSER] Primary OpenRouter call timed out (limit=8s).")
         except Exception as e:
             logger.error(f"[CONTRACT_PARSER] Primary OpenRouter call failed: {e}")
 
-    # 2. Fallback 1: DeepSeek API (deepseek-ai/deepseek-v4-flash)
+    # 2. Fallback 1: DeepSeek API
     ds_key = os.environ.get("DEEPSEEK_API_KEY")
     if ds_key and ds_key != "placeholder":
         url = f"{config.PROVIDER_DEEPSEEK}/chat/completions"
-        model = getattr(config, "MODEL_CONTRACT_PARSER_FALLBACK", "deepseek-ai/deepseek-v4-flash")
+        model = getattr(config, "MODEL_CONTRACT_PARSER_FALLBACK_DS", "deepseek-chat")
         try:
             logger.info(f"[CONTRACT_PARSER] Calling Fallback 1 DeepSeek API ({model})...")
             res = await asyncio.wait_for(
                 _execute_parser_call(url, ds_key, model, user_prompt, "DeepSeek API", is_openrouter=False),
-                timeout=5.0
+                timeout=3.0
             )
             if res is not None:
                 return res
         except LLMFailFastError as e:
             logger.warning(f"[CONTRACT_PARSER] Fallback 1 DeepSeek API auth/quota error: {e}. Proceeding immediately to fallback.")
         except asyncio.TimeoutError:
-            logger.warning("[CONTRACT_PARSER] Fallback 1 DeepSeek API call timed out (limit=5s).")
+            logger.warning("[CONTRACT_PARSER] Fallback 1 DeepSeek API call timed out (limit=3s).")
         except Exception as e:
             logger.error(f"[CONTRACT_PARSER] Fallback 1 DeepSeek API call failed: {e}")
     else:
         logger.warning("[CONTRACT_PARSER] DeepSeek API key missing, Fallback 1 skipped.")
 
-    # 3. Fallback 2: NVIDIA NIM (deepseek-ai/deepseek-v4-flash)
+    # 3. Fallback 2: NVIDIA NIM
     nv_key = os.environ.get("NVIDIA_API_KEY")
     if nv_key and nv_key != "placeholder":
         url = f"{config.PROVIDER_NVIDIA}/chat/completions"
-        model = getattr(config, "MODEL_CONTRACT_PARSER_FALLBACK", "deepseek-ai/deepseek-v4-flash")
+        model = getattr(config, "MODEL_CONTRACT_PARSER_FALLBACK_NV", "meta/llama-3.1-8b-instruct")
         try:
             logger.info(f"[CONTRACT_PARSER] Calling Fallback 2 NVIDIA NIM ({model})...")
             res = await asyncio.wait_for(
                 _execute_parser_call(url, nv_key, model, user_prompt, "NVIDIA NIM", is_openrouter=False),
+                timeout=3.0
+            )
+            if res is not None:
+                return res
+        except LLMFailFastError as e:
+            logger.warning(f"[CONTRACT_PARSER] Fallback 2 NVIDIA NIM auth/quota error: {e}. Proceeding immediately to fallback.")
+        except asyncio.TimeoutError:
+            logger.warning("[CONTRACT_PARSER] Fallback 2 NVIDIA NIM call timed out (limit=3s).")
+        except Exception as e:
+            logger.error(f"[CONTRACT_PARSER] Fallback 2 NVIDIA NIM call failed: {e}")
+    else:
+        logger.warning("[CONTRACT_PARSER] NVIDIA API key missing, Fallback 2 skipped.")
+
+    # 4. Fallback 3: OpenRouter Free Backup
+    if or_key and or_key != "placeholder":
+        url = f"{config.PROVIDER_OPENROUTER}/chat/completions"
+        model = getattr(config, "MODEL_CONTRACT_PARSER_FALLBACK_OR", "qwen/qwen3-next-80b-a3b-instruct:free")
+        try:
+            logger.info(f"[CONTRACT_PARSER] Calling Fallback 3 OpenRouter ({model})...")
+            res = await asyncio.wait_for(
+                _execute_parser_call(url, or_key, model, user_prompt, "OpenRouter Backup", is_openrouter=True),
                 timeout=4.0
             )
             if res is not None:
                 return res
         except LLMFailFastError as e:
-            logger.warning(f"[CONTRACT_PARSER] Fallback 2 NVIDIA NIM auth/quota error: {e}.")
+            logger.warning(f"[CONTRACT_PARSER] Fallback 3 OpenRouter auth/quota error: {e}.")
         except asyncio.TimeoutError:
-            logger.warning("[CONTRACT_PARSER] Fallback 2 NVIDIA NIM call timed out (limit=4s).")
+            logger.warning("[CONTRACT_PARSER] Fallback 3 OpenRouter call timed out (limit=4s).")
         except Exception as e:
-            logger.error(f"[CONTRACT_PARSER] Fallback 2 NVIDIA NIM call failed: {e}")
-    else:
-        logger.warning("[CONTRACT_PARSER] NVIDIA API key missing, Fallback 2 skipped.")
+            logger.error(f"[CONTRACT_PARSER] Fallback 3 OpenRouter call failed: {e}")
 
     logger.error("[CONTRACT_PARSER] All parser attempts failed or timed out.")
     return None

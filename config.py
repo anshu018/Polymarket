@@ -21,7 +21,10 @@ MODEL_NEWS_ANALYST_FALLBACK_2 = "gemini-2.0-flash"           # Google Gemini (fr
 
 # Contract Parser
 MODEL_CONTRACT_PARSER = "meta-llama/llama-3.3-70b-instruct:free"
-MODEL_CONTRACT_PARSER_FALLBACK = "qwen/qwen3-next-80b-a3b-instruct:free"
+MODEL_CONTRACT_PARSER_FALLBACK_DS = "deepseek-chat"
+MODEL_CONTRACT_PARSER_FALLBACK_NV = "meta/llama-3.1-8b-instruct"
+MODEL_CONTRACT_PARSER_FALLBACK_OR = "qwen/qwen3-next-80b-a3b-instruct:free"
+
 
 # Trade Decision
 MODEL_TRADE_DECISION = "qwen/qwen3-235b-a22b"
