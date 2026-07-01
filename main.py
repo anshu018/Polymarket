@@ -24,21 +24,21 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 
-async def _market_cache_loop():
-    """Background loop to periodically refresh the market discovery cache."""
-    from data.market_discovery import refresh_market_cache
-    import config
-    logger.info("[MARKET_CACHE] Starting background cache loop...")
+async def _market_cache_loop() -> None:
+    """Refresh market discovery cache every 5 minutes indefinitely."""
+    from data.market_discovery import refresh_market_cache, _MARKET_CACHE
+    # Wait 300 seconds first, because we already ran an initial refresh on startup
+    await asyncio.sleep(300)
     while True:
         try:
-            await asyncio.sleep(config.MARKET_CACHE_REFRESH_INTERVAL_SECONDS)
-            logger.info("[MARKET_CACHE] Refreshing cache in background...")
             await refresh_market_cache()
-        except asyncio.CancelledError:
-            logger.info("[MARKET_CACHE] Background cache loop cancelled.")
-            raise
+            cache_size = len(_MARKET_CACHE)
+            logger.info(
+                f"[MARKET_DISCOVERY] Background cache refreshed: {cache_size} markets"
+            )
         except Exception as e:
-            logger.error(f"[MARKET_CACHE] Error in background cache loop: {e}")
+            logger.error(f"[MAIN] Market cache refresh failed: {e}")
+        await asyncio.sleep(300)
 
 
 async def main():
@@ -86,25 +86,32 @@ async def main():
         from data.market_discovery import refresh_market_cache, _MARKET_CACHE
         logger.info("Performing initial market cache refresh...")
         await refresh_market_cache()
-
-        # Guard: if cache is still empty after refresh, alert and log — never silent
-        from data.market_discovery import _MARKET_CACHE as _cache_check
-        if not _cache_check:
+        cache_size = len(_MARKET_CACHE)
+        if cache_size < 10:
             logger.critical(
-                "[MARKET_CACHE] STARTUP: Market cache is empty after initial refresh. "
-                "No markets available for signal matching. Coordinator will abstain on all signals."
-            )
-            from monitoring.telegram_alerts import alert_pipeline_component_crash
-            await alert_pipeline_component_crash(
-                component="main.startup.market_cache",
-                error_type="EmptyCacheAtStartup",
-                error_detail="Market cache is 0 after initial refresh. Check Gamma API connectivity."
+                f"[MARKET_CACHE] STARTUP: Cache has {cache_size} markets "
+                f"(under 10). This is a primary trade blocker."
             )
         else:
-            logger.info(f"[MARKET_CACHE] Startup cache populated with {len(_cache_check)} markets.")
+            logger.info(
+                f"[MARKET_DISCOVERY] Startup cache loaded: {cache_size} markets"
+            )
 
         # Start background market cache loop
-        cache_loop_task = asyncio.create_task(_market_cache_loop(), name="market_cache_loop")
+        asyncio.create_task(_market_cache_loop(), name="market_cache_refresher")
+
+        # Start Strategy 5: Copy Edge (CopyTrade) engine
+        from copytrade.poller import run_copy_poller
+        from copytrade.classifier import run_classifier
+        from copytrade.executor import run_class_a_executor, run_class_b_executor
+        _copy_signal_queue = asyncio.Queue(maxsize=config.COPY_SIGNAL_QUEUE_MAXSIZE)
+        _copy_queue_a = asyncio.Queue(maxsize=config.COPY_EXECUTION_QUEUE_MAXSIZE)
+        _copy_queue_b = asyncio.Queue(maxsize=config.COPY_EXECUTION_QUEUE_MAXSIZE)
+        asyncio.create_task(run_copy_poller(_copy_signal_queue), name="copy_poller")
+        asyncio.create_task(run_classifier(_copy_signal_queue, _copy_queue_a, _copy_queue_b), name="copy_classifier")
+        asyncio.create_task(run_class_a_executor(_copy_queue_a), name="copy_executor_a")
+        asyncio.create_task(run_class_b_executor(_copy_queue_b), name="copy_executor_b")
+        logger.info("[COPY_EDGE] Strategy 5 CopyTrade engine started (poller + classifier + 2 executors).")
 
         # Validate News Analyst models before starting signal processing
         from llm.news_analyst import validate_models
@@ -125,15 +132,9 @@ async def main():
             await pipeline_task
         except asyncio.CancelledError:
             logger.info("Signal pipeline task cancelled. Shutting down...")
-            cache_loop_task.cancel()
-            try:
-                await cache_loop_task
-            except asyncio.CancelledError:
-                pass
             raise
         except Exception as pipeline_exc:
             logger.critical(f"Continuous signal pipeline crashed: {pipeline_exc}", exc_info=True)
-            cache_loop_task.cancel()
             from monitoring.telegram_alerts import alert_pipeline_component_crash
             await alert_pipeline_component_crash(
                 component="main.continuous_pipeline",

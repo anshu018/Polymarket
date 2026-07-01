@@ -91,6 +91,15 @@ None yet.
   - Added immediate fail-fast handling on HTTP status `[401, 402, 403]` raising `LLMFailFastError` in `/llm/` wrappers for rapid failover.
   - Standardized integration test suites to clear caching contamination and mock `asyncio.sleep` to run in 11s instead of 100s.
 
+- **Market cache regression from commit 84abb88 — FIXED (2026-06-29)**:
+  - **Root cause:** Commit `84abb88` (2026-06-20) changed page-level exception handling to silently swallow failures and commit partial results. Before it, any single page failure aborted the whole refresh (too aggressive). After it, partial failures were swallowed at WARNING level (not aggressive enough). On Railway, intermittent Gamma API failures caused some pages to fail silently, producing a cache of ~3 markets instead of 4,600+. The cache was committed without any CRITICAL-level indication.
+  - **Timeline:** Phase 8 confirmed 4,642 markets on 2026-06-15. Commit `84abb88` landed 2026-06-20 — 5 days after Phase 8 verification. Regression introduced AFTER Phase 8 was confirmed working.
+  - **Fix 1 — Floor guard (Option A):** Added `MIN_MARKET_CACHE_SIZE = 100` in `config.py`. In `refresh_market_cache()`, if a healthy prior cache exists (size > 0, non-None timestamp) and the new result falls below the floor, the refresh is rejected (CRITICAL logged) and the prior cache is kept intact. Cold-boot (no prior cache) accepts any non-empty result. Cache mutation is in-place (`.clear()` + `.extend()`) — no reassignment — so no module holding a reference to the cache object goes stale.
+  - **Fix 2 — Page-level CRITICAL logging:** Upgraded per-page exception logging from `WARNING` to `CRITICAL` with full `type(e).__name__: {str}` detail. All pages that fail now produce prominent log lines instead of being silently skipped.
+  - **Fix 3 — Network self-test:** Added `_network_self_test()` that runs at the start of every `refresh_market_cache()` call. DNS-resolves `gamma-api.polymarket.com` and `clob.polymarket.com`, logs resolved IPs, and tests TCP port 443 connectivity with a 3-second timeout. Runs regardless of what follows — provides immediate diagnosis of DNS hijack / ISP blocking (confirmed on dev machine: both resolve to `49.44.79.236`, an Indian-ISP IP, not Polymarket infra).
+  - **Tests:** 109 passed before, 109 passed after. No test changes.
+  - **Local dev observation:** Dev machine cannot reach Polymarket APIs at all (DNS hijack to `49.44.79.236`). All diagnostics log correctly. Railway deployment needed for production verification.
+
 ## Session Continuity
 
 Last session: 2026-06-19 23:30

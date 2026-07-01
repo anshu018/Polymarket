@@ -33,6 +33,35 @@ from monitoring.telegram_alerts import (
 
 logger = logging.getLogger(__name__)
 
+# Stage-by-stage drop counters (Task 2)
+_drop_counters: dict[str, int] = {
+    "price_fetch_failed": 0,
+    "no_market_match": 0,
+    "news_analyst_none": 0,
+    "low_confidence": 0,
+    "contract_parser_none": 0,
+    "trade_decision_none": 0,
+    "abstain": 0,
+    "risk_gate:circuit_breaker": 0,
+    "risk_gate:auto_exit_liquidity": 0,
+    "risk_gate:low_liquidity": 0,
+    "risk_gate:low_confidence": 0,
+    "risk_gate:low_edge": 0,
+    "risk_gate:max_category_exposure": 0,
+    "risk_gate:max_correlated_exposure": 0,
+}
+
+def _increment_drop(reason: str) -> None:
+    """Increment the drop counter for a specific reason."""
+    if reason in _drop_counters:
+        _drop_counters[reason] += 1
+    else:
+        _drop_counters[reason] = 1
+
+def get_drop_counters() -> dict[str, int]:
+    """Return a copy of the stage-by-stage drop counters."""
+    return _drop_counters.copy()
+
 
 
 # ─────────────────────────────────────────────
@@ -445,11 +474,21 @@ async def run_pipeline(
             market_price = await get_market_price(token_id)
         except Exception as e:
             logger.warning(f"[PIPELINE] Failed to fetch price for market {market_id}: {e}")
+            _increment_drop("price_fetch_failed")
+            logger.warning(f"[PIPELINE][DROP:price_fetch_failed] market_id={market_id} error='{e}'")
             return None
     else:
         # If no match in cache and no market_id was explicitly provided, discard
         if not market_id:
             logger.info("[PIPELINE] No matching markets found. Discarding before LLM News Analyst.")
+            from data.market_discovery import _MARKET_CACHE as _disc_cache
+            _increment_drop("no_market_match")
+            logger.warning(
+                f"[PIPELINE][DROP:no_market_match] "
+                f"cache_size={len(_disc_cache)} "
+                f"entities={entities[:5]} "
+                f"headline='{headline[:80]}'"
+            )
             return {"status": "blocked", "reason": "no_matching_markets"}
         # Backward compatibility fallback for tests
         token_id = f"mock-token-{market_id}"
@@ -458,6 +497,8 @@ async def run_pipeline(
                 market_price = await get_market_price(token_id)
             except Exception as e:
                 logger.warning(f"[PIPELINE] Failed to fetch price for explicit market {market_id}: {e}")
+                _increment_drop("price_fetch_failed")
+                logger.warning(f"[PIPELINE][DROP:price_fetch_failed] market_id={market_id} error='{e}'")
                 return None
 
     # Ensure market_price is set
@@ -468,6 +509,8 @@ async def run_pipeline(
     news_output = await classify_signal(headline, source, market_question=market_question)
     if not news_output:
         logger.warning("[PIPELINE] News Analyst returned None (timeout or error). Dropping signal.")
+        _increment_drop("news_analyst_none")
+        logger.warning(f"[PIPELINE][DROP:news_analyst_none] src={source} headline='{headline[:80]}'")
         return None
     # NOTE: asyncio.sleep(2) removed — was a 2-second dead wait with no purpose (perf fix C1)
 
@@ -477,6 +520,8 @@ async def run_pipeline(
             f"[PIPELINE] News Analyst confidence {news_output.confidence_score:.2f} < "
             f"threshold {config.MIN_CONFIDENCE_THRESHOLD}. Discarding signal."
         )
+        _increment_drop("low_confidence")
+        logger.warning(f"[PIPELINE][DROP:low_confidence] score={news_output.confidence_score:.3f} threshold={config.MIN_CONFIDENCE_THRESHOLD} headline='{headline[:80]}'")
         return {"status": "blocked", "reason": "low_confidence"}
 
     # Update category based on analyst decision
@@ -534,6 +579,8 @@ async def run_pipeline(
         parser_output = await parse_contract(market_id, market_question, resolution_criteria)
         if not parser_output:
             logger.warning("[PIPELINE] Contract Parser failed. Dropping signal.")
+            _increment_drop("contract_parser_none")
+            logger.warning(f"[PIPELINE][DROP:contract_parser_none] market_id={market_id}")
             return None
         # NOTE: asyncio.sleep(2) removed — was a 2-second dead wait with no purpose (perf fix C1)
             
@@ -553,6 +600,8 @@ async def run_pipeline(
         )
         if not trade_output:
             logger.warning("[PIPELINE] Trade Decision Agent returned None. Dropping signal.")
+            _increment_drop("trade_decision_none")
+            logger.warning(f"[PIPELINE][DROP:trade_decision_none] market_id={market_id}")
             return None
         # NOTE: asyncio.sleep(2) removed — was a 2-second dead wait with no purpose (perf fix C1)
 
@@ -575,6 +624,8 @@ async def run_pipeline(
     # If agents decided ABSTAIN, stop
     if decision_direction == "ABSTAIN":
         logger.info("[PIPELINE] Final coordinated decision is ABSTAIN. Stopping.")
+        _increment_drop("abstain")
+        logger.info(f"[PIPELINE][DROP:abstain] market_id={market_id} confidence={decision_confidence:.3f}")
         return None
 
     # 5. RISK ENGINE CHECKS (Rule 8: Always run on both paths)
@@ -598,15 +649,21 @@ async def run_pipeline(
                 )
             )
             # Log signal as discarded (circuit breaker)
+            _increment_drop("risk_gate:circuit_breaker")
+            logger.info(f"[PIPELINE][DROP:risk_gate:circuit_breaker] market_id={market_id}")
             return {"status": "blocked", "reason": "circuit_breaker"}
 
     # B. Liquidity Gate
     liq_status = risk_engine.check_liquidity(available_liquidity, current_market_liquidity)
     if liq_status == "EXIT_NOW":
         logger.warning("[PIPELINE] Risk check: market liquidity below auto-exit floor.")
+        _increment_drop("risk_gate:auto_exit_liquidity")
+        logger.info(f"[PIPELINE][DROP:risk_gate:auto_exit_liquidity] market_id={market_id}")
         return {"status": "exit_triggered", "reason": "auto_exit_liquidity"}
     elif liq_status == "BLOCK":
         logger.warning("[PIPELINE] Risk check: available liquidity below minimum entry threshold. Blocking.")
+        _increment_drop("risk_gate:low_liquidity")
+        logger.info(f"[PIPELINE][DROP:risk_gate:low_liquidity] market_id={market_id}")
         return {"status": "blocked", "reason": "low_liquidity"}
 
     # C. Confidence and Edge gates
@@ -614,12 +671,16 @@ async def run_pipeline(
     clamped_conf = risk_engine.apply_confidence_ceiling(decision_confidence)
     if risk_engine.check_min_confidence(clamped_conf) == "BLOCK":
         logger.info(f"[PIPELINE] Risk check: confidence {clamped_conf:.2f} below minimum. Blocking.")
+        _increment_drop("risk_gate:low_confidence")
+        logger.info(f"[PIPELINE][DROP:risk_gate:low_confidence] market_id={market_id}")
         return {"status": "blocked", "reason": "low_confidence"}
 
     # Edge gate: assume agent estimate is derived
     estimated_probability = market_price + 0.10  # Simulating calibration model probability
     if risk_engine.check_edge(estimated_probability, market_price) == "BLOCK":
         logger.info(f"[PIPELINE] Risk check: edge below minimum. Blocking.")
+        _increment_drop("risk_gate:low_edge")
+        logger.info(f"[PIPELINE][DROP:risk_gate:low_edge] market_id={market_id}")
         return {"status": "blocked", "reason": "low_edge"}
 
     # D. Portfolio exposure gates
@@ -640,10 +701,14 @@ async def run_pipeline(
 
     if risk_engine.check_category_exposure(cat_exp, proposed_pct) == "BLOCK":
         logger.warning(f"[PIPELINE] Risk check: category exposure would exceed 30% cap. Blocking.")
+        _increment_drop("risk_gate:max_category_exposure")
+        logger.info(f"[PIPELINE][DROP:risk_gate:max_category_exposure] market_id={market_id}")
         return {"status": "blocked", "reason": "max_category_exposure"}
 
     if risk_engine.check_correlation_exposure(corr_exp + proposed_pct) == "BLOCK":
         logger.warning(f"[PIPELINE] Risk check: correlated exposure would exceed 20% cap. Blocking.")
+        _increment_drop("risk_gate:max_correlated_exposure")
+        logger.info(f"[PIPELINE][DROP:risk_gate:max_correlated_exposure] market_id={market_id}")
         return {"status": "blocked", "reason": "max_correlated_exposure"}
 
     # All risk gates PASSED!

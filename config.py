@@ -98,6 +98,21 @@ KELLY_FRACTION_RECALIBRATION = 0.25
 KELLY_FRACTION_CORRELATION = 0.25
 KELLY_FRACTION_RESOLUTION = 0.35
 PIPELINE_QUEUE_MAXSIZE = 100
+
+# ── STRATEGY 5: COPY EDGE (CopyTrade) ────────────────────────────────────────
+# PRD source: CopyTrade.md §7.1, §9.2
+KELLY_FRACTION_COPY = 0.10              # 10% fractional Kelly for Class B sizing
+COPY_CLASS_A_MAX_SIZE_USDC = 10.0      # Fixed hard cap for Class A (speed) trades
+COPY_CLASS_B_MAX_SIZE_USDC = 50.0      # Max cap for Class B (macro) trades
+COPY_CLASS_A_SLIPPAGE_THRESHOLD = 0.010  # 1.0 cent max slippage for Class A
+COPY_CLASS_B_SLIPPAGE_THRESHOLD = 0.015  # 1.5 cent max slippage for Class B
+COPY_MIN_MARKET_VOLUME_USD = 25000.0   # Minimum market volume to copy any trade
+COPY_POLL_INTERVAL_SECONDS = 5         # How often to poll Gamma API per wallet
+COPY_WALLET_RELOAD_INTERVAL_SECONDS = 300  # How often to reload tracked_wallets from DB
+COPY_SIGNAL_QUEUE_MAXSIZE = 50         # Max in-flight unclassified signals
+COPY_EXECUTION_QUEUE_MAXSIZE = 20      # Max in-flight signals per execution class
+COPY_LIMIT_PRICE_BUFFER = 0.005        # +0.5 cents above tracker price for limit orders
+GAMMA_API_TIMEOUT_SECONDS = 8          # HTTP timeout for Gamma API calls
 SPACY_MODEL = "en_core_web_lg"            # Aligned with GEMINI.md (lg = higher NER accuracy)
 
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"

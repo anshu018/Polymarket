@@ -164,6 +164,71 @@ SQL_MIGRATIONS = [
             superseded_by UUID REFERENCES layer_c_category_versions(id)
         );
         """
+    },
+    {
+        # Strategy 5: Copy Edge — tracked_wallets table
+        # Stores the curated whitelist of top-trader Polygon addresses.
+        # Operators add rows here via Supabase dashboard or API.
+        # class_type: 'A' = speed/bypass, 'B' = macro/LLM-validated
+        "table": "tracked_wallets",
+        "sql": """
+        CREATE TABLE IF NOT EXISTS tracked_wallets (
+            wallet_address VARCHAR(42) PRIMARY KEY,
+            trader_name   VARCHAR(100) NOT NULL,
+            class_type    VARCHAR(1)  NOT NULL CHECK (class_type IN ('A', 'B')),
+            is_active     BOOLEAN     NOT NULL DEFAULT TRUE,
+            added_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """
+    },
+    {
+        # Strategy 5: Copy Edge -- individual copy trade log
+        # Every executed copy trade is logged here for outcome tracking.
+        # When positions close, status and pnl_usdc are updated by the reconciler.
+        "table": "copytrade_log",
+        "sql": """
+        CREATE TABLE IF NOT EXISTS copytrade_log (
+            id                UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+            wallet_address    VARCHAR(42) NOT NULL REFERENCES tracked_wallets(wallet_address),
+            trader_name       VARCHAR(100),
+            market_id         TEXT        NOT NULL,
+            direction         TEXT        NOT NULL CHECK (direction IN ('YES', 'NO')),
+            class_type        VARCHAR(1)  NOT NULL CHECK (class_type IN ('A', 'B')),
+            entry_price       DECIMAL(10,4),
+            size_usdc         DECIMAL(10,4),
+            slippage          DECIMAL(10,6),
+            idempotency_uuid  UUID,
+            status            TEXT        NOT NULL DEFAULT 'open'
+                              CHECK (status IN ('open', 'won', 'lost', 'cancelled')),
+            exit_price        DECIMAL(10,4),
+            pnl_usdc          DECIMAL(12,4),
+            opened_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            resolved_at       TIMESTAMPTZ
+        );
+        CREATE INDEX IF NOT EXISTS idx_copytrade_log_wallet
+            ON copytrade_log(wallet_address);
+        CREATE INDEX IF NOT EXISTS idx_copytrade_log_market_open
+            ON copytrade_log(market_id, status) WHERE status = 'open';
+        """
+    },
+    {
+        # Strategy 5: Copy Edge -- per-wallet trust score aggregation
+        # Recomputed every time a copy trade resolves.
+        # trust_score = Bayesian-damped win rate + PnL quality bonus.
+        # Used by classifier for conflict resolution between wallets.
+        "table": "trader_performance",
+        "sql": """
+        CREATE TABLE IF NOT EXISTS trader_performance (
+            wallet_address      VARCHAR(42)   PRIMARY KEY REFERENCES tracked_wallets(wallet_address),
+            trader_name         VARCHAR(100),
+            total_trades_copied INTEGER       NOT NULL DEFAULT 0,
+            winning_trades      INTEGER       NOT NULL DEFAULT 0,
+            losing_trades       INTEGER       NOT NULL DEFAULT 0,
+            total_pnl_usdc      DECIMAL(12,4) NOT NULL DEFAULT 0,
+            trust_score         DECIMAL(6,4)  NOT NULL DEFAULT 0.5,
+            last_updated        TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+        );
+        """
     }
 ]
 

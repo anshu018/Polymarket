@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import socket
 from datetime import datetime, timezone
 import json
 from typing import Optional
@@ -62,6 +63,36 @@ def _parse_markets_page(data: list) -> list[dict]:
     return parsed
 
 
+def _network_self_test() -> None:
+    """
+    Synchronous DNS resolve + 3-second TCP connect test for Polymarket hosts.
+    Runs at the start of every refresh_market_cache() call.
+    Logs resolved IP and connect success/failure regardless of what happens afterward.
+    """
+    hosts = [
+        ("gamma-api.polymarket.com", 443),
+        ("clob.polymarket.com", 443),
+    ]
+    for hostname, port in hosts:
+        try:
+            ip = socket.gethostbyname(hostname)
+            sock = socket.create_connection((hostname, port), timeout=3)
+            sock.close()
+            logger.info(f"[MARKET_DISCOVERY] Network self-test: {hostname} -> {ip} (TCP port {port} OK)")
+        except socket.gaierror:
+            logger.critical(f"[MARKET_DISCOVERY] Network self-test: {hostname} DNS resolution FAILED")
+        except (socket.timeout, OSError) as e:
+            resolved_ip = "unknown"
+            try:
+                resolved_ip = socket.gethostbyname(hostname)
+            except Exception:
+                pass
+            logger.critical(
+                f"[MARKET_DISCOVERY] Network self-test: {hostname} -> {resolved_ip} "
+                f"TCP port {port} FAILED ({type(e).__name__}: {e})"
+            )
+
+
 async def refresh_market_cache() -> None:
     """
     Fetches all active, non-resolved markets from Polymarket Gamma API using
@@ -69,6 +100,11 @@ async def refresh_market_cache() -> None:
     Filters out markets below MIN_MARKET_VOLUME_USD and updates the global cache.
     Wrapped in a 60-second total timeout. On failure, logs CRITICAL and sends
     a Telegram alert — never fails silently.
+
+    Safety guard: if the refresh produces fewer than MIN_MARKET_CACHE_SIZE markets
+    and a healthy prior cache exists, the refresh is rejected and the prior cache
+    is kept intact. Mutation is in-place (.clear() + list extend) so no module
+    holding a reference to _MARKET_CACHE goes stale.
     """
     global _MARKET_CACHE, _CACHE_UPDATED_AT
 
@@ -76,6 +112,9 @@ async def refresh_market_cache() -> None:
     MAX_PAGES = 5         # Safety cap: 2,500 markets maximum
     PER_REQUEST_TIMEOUT = 8.0
     TOTAL_TIMEOUT = 60.0
+
+    # Item 3: Network self-test — runs regardless of what follows
+    _network_self_test()
 
     async def _fetch_all_pages() -> list[dict]:
         """Paginate through all market pages using offset."""
@@ -115,20 +154,23 @@ async def refresh_market_cache() -> None:
             failed_pages = 0
             for i, res in enumerate(results):
                 if isinstance(res, Exception):
-                    logger.warning(
-                        f"[MARKET_DISCOVERY] Page {i} failed (skipping, not aborting): {res}"
+                    err_msg = str(res) if str(res) else type(res).__name__
+                    logger.critical(
+                        f"[MARKET_DISCOVERY] Page {i} FAILED "
+                        f"({type(res).__name__}: {err_msg})"
                     )
                     failed_pages += 1
                 else:
                     all_markets.extend(res)
 
             if failed_pages == MAX_PAGES:
+                # All pages failed — still re-raise (nothing to commit)
                 for res in results:
                     if isinstance(res, Exception):
                         raise res
 
             if failed_pages > 0:
-                logger.warning(
+                logger.critical(
                     f"[MARKET_DISCOVERY] {failed_pages}/{MAX_PAGES} pages failed. "
                     f"Cache built from {MAX_PAGES - failed_pages} successful pages."
                 )
@@ -137,7 +179,23 @@ async def refresh_market_cache() -> None:
 
     try:
         all_markets = await asyncio.wait_for(_fetch_all_pages(), timeout=TOTAL_TIMEOUT)
-        _MARKET_CACHE = all_markets
+
+        # Floor guard: reject sub-floor refresh only when a healthy prior cache exists
+        prior_cache_size = len(_MARKET_CACHE)
+        has_prior_cache = prior_cache_size > 0 and _CACHE_UPDATED_AT is not None
+        floor = getattr(config, "MIN_MARKET_CACHE_SIZE", 100)
+
+        if has_prior_cache and len(all_markets) < floor:
+            logger.critical(
+                f"[MARKET_DISCOVERY] Floor guard REJECTED refresh: "
+                f"got {len(all_markets)} markets (floor={floor}), "
+                f"keeping prior cache with {prior_cache_size} markets intact."
+            )
+            return
+
+        # Mutate existing cache object in-place (no reassignment)
+        _MARKET_CACHE.clear()
+        _MARKET_CACHE.extend(all_markets)
         _CACHE_UPDATED_AT = datetime.now(timezone.utc)
         logger.info(f"[MARKET_DISCOVERY] Cache refreshed: {len(_MARKET_CACHE)} active markets.")
 

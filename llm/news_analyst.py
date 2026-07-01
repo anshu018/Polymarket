@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import time
 import asyncio
 import aiohttp
 from typing import Literal, Optional
@@ -53,6 +54,7 @@ async def _execute_news_call(
     provider_name: Optional[str] = None,
 ) -> Optional[str]:
     """Execute a single LLM API call and return the raw content string."""
+    start_time = time.time()
     # A1: Disable thinking mode; add max_tokens
     payload = {
         "model": model,
@@ -81,6 +83,19 @@ async def _execute_news_call(
         # A5: Reuse module-level session
         session = await _get_session()
         async with session.post(url, json=payload, headers=headers) as response:
+            latency_ms = (time.time() - start_time) * 1000
+            if "openrouter.ai" in url:
+                status = response.status
+                logger.debug(
+                    f"[NEWS_ANALYST] OpenRouter status={response.status} "
+                    f"latency_ms={latency_ms:.0f}"
+                )
+                if status == 429:
+                    logger.warning(
+                        "[NEWS_ANALYST] OpenRouter RATE LIMITED (429). "
+                        "Free tier daily cap likely exhausted. "
+                        "Activate $10 credit or switch provider for News Analyst."
+                    )
             if response.status in config.FAIL_FAST_HTTP_CODES:
                 logger.error(f"[LLM] Auth/quota error {response.status} on {resolved_provider} — immediate failover")
                 raise LLMFailFastError(response.status, resolved_provider)
@@ -136,7 +151,6 @@ Examples:
 - "Local city council meets Tuesday" → direction: ABSTAIN, confidence_score: 0.0, event_category: other
 """
 
-        import time
         start_time = time.time()
         prompt = f"Headline: {headline}\nSource: {source}"
         if market_question:
@@ -204,9 +218,29 @@ Examples:
             else:
                 logger.debug("[NEWS_ANALYST] GEMINI_API_KEY not set — Gemini fallback unavailable.")
 
+        # 4. Attempt Third Fallback: OpenRouter (using Google Gemini 2.5 Flash)
+        if not choice_content:
+            or_key = os.environ.get("OPENROUTER_API_KEY")
+            if or_key and or_key not in ("placeholder", ""):
+                url = f"{config.PROVIDER_OPENROUTER}/chat/completions"
+                model = "google/gemini-2.5-flash"
+                elapsed = time.time() - start_time
+                or_timeout = max(8.0, 45.0 - elapsed)
+                try:
+                    logger.info(f"[NEWS_ANALYST] Calling third fallback OpenRouter ({model})...")
+                    choice_content = await asyncio.wait_for(
+                        _execute_news_call(url, or_key, model, system_content, prompt, is_fallback=True, provider_name="OpenRouter"),
+                        timeout=or_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("[NEWS_ANALYST] OpenRouter third fallback timed out.")
+                except Exception as e:
+                    logger.error(f"[NEWS_ANALYST] OpenRouter third fallback failed: {e}")
+            else:
+                logger.debug("[NEWS_ANALYST] OPENROUTER_API_KEY not set — OpenRouter fallback unavailable.")
 
         if not choice_content:
-            logger.error("[NEWS_ANALYST] Empty response from both primary and fallback providers")
+            logger.error("[NEWS_ANALYST] Empty response from all primary and fallback providers")
             return None
                         
         try:
@@ -363,9 +397,51 @@ async def validate_models() -> None:
             fallback_err = f"Exception: {type(e).__name__}: {e}"
 
     logger.warning(f"[NEWS_ANALYST] Fallback model validation failed: {fallback_err}")
+
+    # 3. Probe Fallback 3: OpenRouter
+    or_key = os.environ.get("OPENROUTER_API_KEY")
+    or_ok = False
+    or_err = "API Key Missing"
+    or_model = "google/gemini-2.5-flash"
+
+    if or_key and or_key != "placeholder":
+        url = f"{config.PROVIDER_OPENROUTER}/chat/completions"
+        try:
+            payload = {
+                "model": or_model,
+                "messages": [{"role": "user", "content": "Reply OK"}],
+                "max_tokens": 5
+            }
+            headers = {
+                "Authorization": f"Bearer {or_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/zeroalpha",
+                "X-Title": "Zero Alpha Agent"
+            }
+            async with asyncio.timeout(25.0):
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload, headers=headers) as response:
+                        if response.status in config.FAIL_FAST_HTTP_CODES:
+                            logger.error(f"[LLM] Auth/quota error {response.status} on OpenRouter — immediate failover")
+                            raise LLMFailFastError(response.status, "OpenRouter")
+                        if response.status == 200:
+                            or_ok = True
+                            logger.info(f"[NEWS_ANALYST] Model validated via OpenRouter: {or_model}")
+                            _models_validated = True
+                            return
+                        else:
+                            or_err = f"Status {response.status}: {await response.text()}"
+        except LLMFailFastError as fail_fast:
+            or_err = f"FailFast: {fail_fast}"
+        except asyncio.TimeoutError:
+            or_err = "Timeout after 25 seconds"
+        except Exception as e:
+            or_err = f"Exception: {type(e).__name__}: {e}"
+
+    logger.warning(f"[NEWS_ANALYST] OpenRouter fallback model validation failed: {or_err}")
     
-    # Both failed
+    # All failed
     raise RuntimeError(
-        f"Model validation failed. Primary ({primary_model}): {primary_err}. Fallback ({fallback_model}): {fallback_err}."
+        f"Model validation failed. Primary ({primary_model}): {primary_err}. Fallback ({fallback_model}): {fallback_err}. OpenRouter ({or_model}): {or_err}."
     )
 

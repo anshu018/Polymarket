@@ -122,3 +122,25 @@ async def alert_startup(environment: str, paper_trading: bool) -> None:
     asyncio.create_task(_send_to_telegram(msg))
     # Give the task event loop time to kick off the fire-and-forget request before exit
     await asyncio.sleep(0.5)
+
+async def alert_copy_trade_executed(
+    class_type: str,
+    trader_name: str,
+    market_id: str,
+    direction: str,
+    size_usdc: float,
+    entry_price: float,
+    slippage: float,
+    paper_trading: bool,
+) -> None:
+    """Alert when a Copy Edge (Strategy 5) trade is executed."""
+    now = datetime.now(timezone.utc).isoformat()
+    pt_str = "[PAPER] " if paper_trading else ""
+    msg = (f"{pt_str}[ZERO-ALPHA] INFO | COPY_TRADE_EXECUTED\n"
+           f"Time: {now}\n"
+           f"Class: {class_type} | Trader: {trader_name}\n"
+           f"Market: {market_id[:16]}...\n"
+           f"Direction: {direction} | Size: ${size_usdc:.2f} USDC\n"
+           f"Entry: {entry_price:.4f} | Slippage: {slippage:.4f}\n"
+           f"Action: Position logged and idempotency confirmed.")
+    asyncio.create_task(_send_to_telegram(msg))

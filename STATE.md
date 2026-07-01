@@ -9,8 +9,8 @@
   - Added new high-signal feeds: BBC News World, Politico, NYT World, WSJ World, The Hill.
 
 ## 2. Test Verification
-- **Total Tests Run**: 104
-- **Passed**: 104
+- **Total Tests Run**: 136
+- **Passed**: 136
 - **Failed**: 0
 - **Verification Result**: PASS
 
@@ -29,3 +29,29 @@
   - `[2026-06-15T22:05:54] conf=0.85 | headline: CFTC sues New Mexico over prediction market jurisdiction`
   - `[2026-06-15T22:04:32] conf=0.80 | headline: Bitcoin shoots higher on Iran peace deal, with Strait of Hormuz set to open`
 - **Result Details**: High-signal feeds are successfully filtering out low-relevance noise, resulting in significantly fewer `0.0` confidence signals than before (which were previously 99%+ of all signals).
+
+## 5. Diagnostic Instrumentation Pass
+- **Status**: Completed
+- **Tasks**:
+  - Task 1: Fix market cache background loop in `main.py` to run as a repeating loop every 300 seconds and check cache size at startup. [x]
+  - Task 2: Add stage-by-stage drop counters with `[PIPELINE][DROP:*]` tags in `coordinator/pipeline.py`. [x]
+  - Task 3: Add pipeline stats counter and stats reporter task in `data/pipeline.py`. [x]
+  - Task 4: Log OpenRouter HTTP status and rate-limiting warnings in `llm/news_analyst.py`. [x]
+
+## 6. Strategy 5: Copy Edge — CopyTrade Implementation
+- **Status**: Phase 1 + Phase 2 COMPLETE (Phase 3 = paper testing with real wallets)
+- **Files Created**:
+  - `copytrade/__init__.py` — Package marker
+  - `copytrade/poller.py` — Gamma API polling worker (5s loop per wallet, dedup, SELL-filter)
+  - `copytrade/classifier.py` — Slippage guard, volume check, Class A vs B routing
+  - `copytrade/executor.py` — Class A fast-path ($10 fixed, risk gates, idempotency); Class B → coordinator pipeline
+  - `tests/test_copytrade.py` — 25 unit tests, all passing
+- **Files Modified**:
+  - `config.py` — 14 COPY_* constants added (KELLY_FRACTION_COPY, thresholds, caps, intervals)
+  - `memory/migrations.py` — `tracked_wallets` table migration added (9th table)
+  - `main.py` — 4 CopyTrade asyncio tasks wired at startup (poller + classifier + executor_a + executor_b)
+  - `monitoring/telegram_alerts.py` — `alert_copy_trade_executed()` added
+- **Test Results**: 25/25 copytrade tests + 136/136 total suite PASS.
+- **To Activate**: Add wallet rows to `tracked_wallets` table in Supabase dashboard.
+  - Required columns: `wallet_address` (Polygon 0x...), `trader_name` (string), `class_type` ('A' or 'B')
+  - The poller auto-detects new rows every 5 minutes — no restart needed.

@@ -33,6 +33,13 @@ logger = logging.getLogger(__name__)
 # Exactly 3 workers per specification
 NUM_WORKERS: int = 3
 
+_pipeline_stats: dict = {
+    "signals_received": 0,
+    "spacy_passed": 0,
+    "analyst_passed": 0,
+    "analyst_failures": 0,
+}
+
 
 async def _process_loop(queue: asyncio.Queue) -> None:
     """
@@ -48,6 +55,7 @@ async def _process_loop(queue: asyncio.Queue) -> None:
     """
     while True:
         article: dict = await queue.get()
+        _pipeline_stats["signals_received"] += 1
         headline: str = article.get("headline", "")
         source: str = article.get("source_name", "")
 
@@ -60,6 +68,7 @@ async def _process_loop(queue: asyncio.Queue) -> None:
                     headline,
                 )
             else:
+                _pipeline_stats["spacy_passed"] += 1
                 # --- Stage 2: Coordinated Integration Pipeline ----------------
                 snippet = headline[:60]
                 logger.info("[PIPELINE] Routing signal to coordinator | Headline: '%s'", snippet)
@@ -71,6 +80,7 @@ async def _process_loop(queue: asyncio.Queue) -> None:
                 outcome = "skipped"
                 detail = None
                 if result:
+                    _pipeline_stats["analyst_passed"] += 1
                     status = result.get("status")
                     if status == "success":
                         outcome = "traded"
@@ -81,6 +91,7 @@ async def _process_loop(queue: asyncio.Queue) -> None:
                         outcome = "exit-triggered"
                         detail = f"exit-triggered: {result.get('reason')}"
                 else:
+                    _pipeline_stats["analyst_failures"] += 1
                     # News Analyst failed, timed out, or Coordinator decided ABSTAIN
                     outcome = "abstain"
                     detail = "abstain or news analyst timeout/error"
@@ -118,6 +129,23 @@ async def _process_loop(queue: asyncio.Queue) -> None:
             queue.task_done()
 
 
+async def _stats_reporter() -> None:
+    """Log a pipeline health summary every 5 minutes."""
+    from coordinator.pipeline import get_drop_counters
+    while True:
+        await asyncio.sleep(300)
+        drops = get_drop_counters()
+        drops_str = " ".join(f"{k}={v}" for k, v in drops.items())
+        logger.info(
+            "[PIPELINE][5MIN_STATS] "
+            f"received={_pipeline_stats['signals_received']} "
+            f"spacy_pass={_pipeline_stats['spacy_passed']} "
+            f"analyst_pass={_pipeline_stats['analyst_passed']} "
+            f"analyst_fail={_pipeline_stats['analyst_failures']} | "
+            f"drops: {drops_str}"
+        )
+
+
 async def _run_workers(queue: asyncio.Queue) -> None:
     """
     Spawn exactly NUM_WORKERS concurrent _process_loop coroutines as asyncio
@@ -130,6 +158,7 @@ async def _run_workers(queue: asyncio.Queue) -> None:
     Args:
         queue: Shared queue to pass to each worker.
     """
+    asyncio.create_task(_stats_reporter(), name="pipeline_stats_reporter")
     worker_tasks = [
         asyncio.create_task(
             _process_loop(queue),
