@@ -9,7 +9,7 @@ load_dotenv(dotenv_path=_env_file, override=False)
 PROVIDER_OPENROUTER = "https://openrouter.ai/api/v1"
 PROVIDER_NVIDIA = "https://integrate.api.nvidia.com/v1"
 PROVIDER_DEEPSEEK = "https://api.deepseek.com/v1"
-PROVIDER_SILICONFLOW = "https://api.siliconflow.cn/v1"
+PROVIDER_SILICONFLOW = "https://api.siliconflow.com/v1"
 
 FAIL_FAST_HTTP_CODES = [401, 402, 403, 429]
 
