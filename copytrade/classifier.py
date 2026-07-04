@@ -37,7 +37,7 @@ import time
 import aiohttp
 
 import config
-from copytrade.performance_tracker import get_trust_score, resolve_conflict
+from copytrade.performance_tracker import get_trust_score, resolve_conflict, get_is_priority
 
 logger = logging.getLogger(__name__)
 
@@ -184,37 +184,52 @@ async def run_classifier(
 
                 # ── Conflict resolution (trust-based dedup per market) ─────────
                 now = time.monotonic()
+                was_priority_pick = False
                 if market_id in _CONFLICT_MAP:
                     incumbent_wallet, ts = _CONFLICT_MAP[market_id]
                     if now - ts < COPY_CONFLICT_MAP_TTL_SECONDS:
                         # A signal for this market is already in-flight.
-                        # Check trust scores to decide who wins.
+                        # Use Priority + trust score resolution (CopyTrade.md §3.6).
+                        incumbent_priority = get_is_priority(incumbent_wallet)
+                        challenger_priority = get_is_priority(wallet_address)
+
                         winner = resolve_conflict(incumbent_wallet, wallet_address)
                         if winner != wallet_address:
                             logger.info(
                                 "[COPY_CLASSIFIER][DROP:conflict_lost] market=%s "
-                                "incumbent=%s (score=%.3f) beats challenger=%s (score=%.3f)",
+                                "incumbent=%s (score=%.3f, priority=%s) beats "
+                                "challenger=%s (score=%.3f, priority=%s)",
                                 market_id[:12],
                                 incumbent_wallet[:10],
                                 get_trust_score(incumbent_wallet),
+                                incumbent_priority,
                                 wallet_address[:10],
                                 get_trust_score(wallet_address),
+                                challenger_priority,
                             )
                             continue
                         else:
-                            # Challenger has higher trust — replace incumbent
+                            # Challenger won the conflict
+                            # Set priority pick flag if challenger won because of Priority status
+                            if challenger_priority and not incumbent_priority:
+                                was_priority_pick = True
                             logger.info(
                                 "[COPY_CLASSIFIER][CONFLICT_OVERRIDE] market=%s "
-                                "new wallet=%s (%.3f) > old wallet=%s (%.3f)",
+                                "new wallet=%s (%.3f, priority=%s) > old wallet=%s (%.3f, priority=%s) "
+                                "priority_pick=%s",
                                 market_id[:12],
                                 wallet_address[:10],
                                 get_trust_score(wallet_address),
+                                challenger_priority,
                                 incumbent_wallet[:10],
                                 get_trust_score(incumbent_wallet),
+                                incumbent_priority,
+                                was_priority_pick,
                             )
 
                 # Register this wallet as the current holder of this market signal
                 _CONFLICT_MAP[market_id] = (wallet_address, now)
+                signal["was_priority_pick"] = was_priority_pick
 
                 # Guard 1: Volume check (both classes)
                 if not _volume_ok(market_volume_usd):

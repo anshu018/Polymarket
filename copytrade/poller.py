@@ -220,7 +220,11 @@ async def _load_active_wallets() -> list[dict]:
         client = await get_client()
         res = (
             client.table("tracked_wallets")
-            .select("wallet_address,trader_name,class_type")
+            .select(
+                "wallet_address,trader_name,class_type,state,"
+                "wins_count,losses_count,resolved_trades_count,"
+                "trust_score,is_priority,avg_roi_per_trade"
+            )
             .eq("is_active", True)
             .execute()
         )

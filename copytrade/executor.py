@@ -4,26 +4,27 @@ copytrade/executor.py — Strategy 5: Copy Edge
 Executes copy trades through two paths:
 
 Class A (Fast-Path, Bypass LLM):
-    - Fixed $10 USDC position size (hard cap, overrides Kelly).
+    - Trust-driven sizing per CopyTrade.md §4:
+        raw_size = CLASS_A_CEILING * state_multiplier * trust_score
+        final_size = risk_engine.position_size_check(raw_size, ...)
+      Hard ceiling: COPY_CLASS_A_MAX_SIZE_USDC ($10).
     - Uses a limit order priced at tracker_entry_price + 0.005 (0.5 cents
-      above the tracker's entry, per PRD §12 to avoid slippage dumps).
-    - All standard risk engine gates STILL apply (drawdown, liquidity,
-      category exposure, correlated exposure).
-    - Order logged to idempotency_log + open_positions.
+      above the tracker's entry, to avoid slippage dumps).
+    - All standard risk engine gates STILL apply.
+    - PAPER TRADING FIX (CopyTrade.md §8): paper mode now logs a simulated
+      fill to open_positions — Class A is no longer invisible to Brier scoring.
     - Target: < 500ms from signal detection to order placement.
 
 Class B (Macro, LLM-Validated):
     - Routes the signal through coordinator/pipeline.run_pipeline() with
-      signal_source="copy_edge". That pipeline handles: News Analyst,
-      Trade Decision, risk gates, idempotency, position logging.
-    - Dynamic Kelly sizing capped at $50 USDC.
-    - The market_question is fetched from Gamma before routing so the
-      coordinator pipeline has full market context.
+      signal_source="copy_edge".
+    - Trust-driven sizing: raw_size = $50 * state_multiplier * trust_score,
+      then passed through risk_engine. Hard ceiling: COPY_CLASS_B_MAX_SIZE_USDC.
 
 Safety rules:
     - Inherits ALL of the coordinator/pipeline safety invariants for Class B.
     - Class A explicitly calls every risk_engine gate before execution.
-    - PAPER_TRADING=true sends both classes to mock execution (no real orders).
+    - PAPER_TRADING=true sends both classes to simulated execution.
     - All config sourced from config.py — nothing hardcoded.
 """
 
@@ -40,7 +41,12 @@ import config
 from memory.supabase_client import get_client
 from risk import risk_engine
 from monitoring.telegram_alerts import alert_circuit_breaker, alert_supabase_degradation
-from copytrade.performance_tracker import log_copy_trade as _tracker_log_trade
+from copytrade.performance_tracker import (
+    log_copy_trade as _tracker_log_trade,
+    get_trust_score,
+    get_wallet_state,
+    compute_state_multiplier,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -205,12 +211,15 @@ async def _execute_class_a(signal: dict) -> None:
 
     Steps:
         1. Validate all risk engine gates.
-        2. Set fixed size = COPY_CLASS_A_MAX_SIZE_USDC ($10).
+        2. Compute trust-driven size per CopyTrade.md §4.
         3. Generate idempotency UUID.
         4. Write idempotency record as pending.
-        5. Submit limit order (or mock in paper trading mode).
+        5. Submit limit order (or write simulated fill in paper mode).
         6. Confirm idempotency record.
-        7. Log to open_positions.
+        7. Log to open_positions AND copytrade_log.
+
+    Paper mode fix (CopyTrade.md §8): paper mode now logs a simulated fill
+    to open_positions — Class A is no longer a silent no-op.
 
     Target latency: < 500ms from signal arrival to order placement.
     """
@@ -222,21 +231,21 @@ async def _execute_class_a(signal: dict) -> None:
     live_ask: float = signal["live_ask"]
     tracker_price: float = signal["tracker_price"]
     trader_name: str = signal.get("trader_name", "unknown")
+    wallet_address: str = signal.get("wallet_address", "")
+    was_priority_pick: bool = signal.get("was_priority_pick", False)
 
     logger.info(
-        "[COPY_EXECUTOR][CLASS_A] Starting execution | market=%s direction=%s ask=%.4f trader=%s",
+        "[COPY_EXECUTOR][CLASS_A] Starting execution | market=%s direction=%s ask=%.4f trader=%s priority=%s",
         market_id[:12],
         direction,
         live_ask,
         trader_name,
+        was_priority_pick,
     )
 
     # ── Risk Gate 1: Drawdown circuit breakers ────────────────────────────────
-    portfolio_value = config.PAPER_TRADING_PORTFOLIO_USDC
-    # Use current portfolio as both starting and current for simplicity in
-    # Class A fast-path (full reconciliation is not available here).
-    # The drawdown gates are checked; if portfolio has shrunk materially,
-    # the reconciliation module would have already halted the bot at startup.
+    from coordinator.pipeline import get_live_portfolio_value
+    portfolio_value = await get_live_portfolio_value()
     for period in ["daily", "weekly", "monthly"]:
         status = risk_engine.check_drawdown(
             starting_balance=portfolio_value,
@@ -255,9 +264,7 @@ async def _execute_class_a(signal: dict) -> None:
             )
             return
 
-    # ── Risk Gate 2: Liquidity (hardcoded available_liquidity for Class A) ────
-    # Class A requires ≥ $25,000 volume (already checked by classifier).
-    # We use the market volume as a proxy for available liquidity.
+    # ── Risk Gate 2: Liquidity ────────────────────────────────────────────────
     market_volume = signal.get("market_volume_usd", 0.0)
     liq_status = risk_engine.check_liquidity(
         available_liquidity=market_volume,
@@ -266,15 +273,32 @@ async def _execute_class_a(signal: dict) -> None:
     if liq_status != "ALLOW":
         logger.warning(
             "[COPY_EXECUTOR][CLASS_A][DROP:liquidity] gate=%s market=%s",
-            liq_status,
-            market_id[:12],
+            liq_status, market_id[:12],
         )
         return
 
+    # ── Trust-driven sizing (CopyTrade.md §4) ────────────────────────────────
+    # raw_size = class_ceiling * state_multiplier * trust_score
+    trust_score = get_trust_score(wallet_address)
+    wallet_state = get_wallet_state(wallet_address)
+    state_multiplier = compute_state_multiplier(wallet_state)
+    raw_size = config.COPY_CLASS_A_MAX_SIZE_USDC * state_multiplier * trust_score
+    # Clamp to the single-trade percentage cap, then to the absolute ceiling
+    trade_cap = min(
+        config.COPY_CLASS_A_MAX_SIZE_USDC,
+        portfolio_value * config.MAX_SINGLE_TRADE_PCT,
+    )
+    final_size = min(raw_size, trade_cap)
+
+    logger.info(
+        "[COPY_EXECUTOR][CLASS_A] Sizing | trust=%.3f state=%s multiplier=%.1f "
+        "raw=$%.2f capped=$%.2f",
+        trust_score, wallet_state, state_multiplier, raw_size, final_size,
+    )
+
     # ── Risk Gate 3: Portfolio exposure ───────────────────────────────────────
     cat_exp, corr_exp = await _fetch_exposure()
-    fixed_size = config.COPY_CLASS_A_MAX_SIZE_USDC
-    proposed_pct = fixed_size / portfolio_value
+    proposed_pct = final_size / portfolio_value
 
     if risk_engine.check_category_exposure(cat_exp, proposed_pct) == "BLOCK":
         logger.warning("[COPY_EXECUTOR][CLASS_A][DROP:category_exposure] market=%s", market_id[:12])
@@ -284,8 +308,6 @@ async def _execute_class_a(signal: dict) -> None:
         return
 
     # ── Limit order pricing ───────────────────────────────────────────────────
-    # Per PRD §12: Use limit order at tracker_entry_price + 0.5 cents
-    # to avoid buying at the top of a pump.
     limit_price = round(tracker_price + config.COPY_LIMIT_PRICE_BUFFER, 4)
 
     # ── Idempotency ───────────────────────────────────────────────────────────
@@ -297,63 +319,61 @@ async def _execute_class_a(signal: dict) -> None:
         )
         return
 
-    await _write_idempotency_pending(order_uuid, market_id, direction, fixed_size)
+    await _write_idempotency_pending(order_uuid, market_id, direction, final_size)
 
     # ── Order submission ──────────────────────────────────────────────────────
     if config.PAPER_TRADING:
-        # Paper trading: simulate order, no real CLOB call
-        mock_order_id = f"copy_a_mock_{int(time.time())}"
+        # PAPER MODE FIX (CopyTrade.md §8): simulate fill — no silent no-op.
+        # This makes Class A trades visible to the Brier score and paper gate.
+        mock_order_id = f"copy_a_paper_{int(time.time())}"
         logger.info(
-            "[COPY_EXECUTOR][CLASS_A][PAPER] LIMIT %s %.4f USDC @ price=%.4f | order=%s",
-            direction,
-            fixed_size,
-            limit_price,
-            mock_order_id,
+            "[COPY_EXECUTOR][CLASS_A][PAPER] Simulated LIMIT %s $%.2f @ %.4f | "
+            "trust=%.3f state=%s order=%s",
+            direction, final_size, limit_price,
+            trust_score, wallet_state, mock_order_id,
         )
         order_id = mock_order_id
     else:
-        # TODO: Real CLOB limit order submission via execution.polymarket_auth
-        # Implementation gate: requires live CLOB integration (Phase 3).
+        # TODO: Real CLOB limit order via execution.polymarket_auth (Phase 3 gate).
         logger.warning(
             "[COPY_EXECUTOR][CLASS_A] Live order submission not yet wired. "
             "Set PAPER_TRADING=true until Phase 3 integration is complete."
         )
         order_id = f"copy_a_noop_{int(time.time())}"
 
-    # ── Confirm and log ───────────────────────────────────────────────────────
+    # ── Confirm idempotency and log position ──────────────────────────────────
     await _confirm_idempotency(order_uuid, order_id)
+    # Always log to open_positions (both paper and live) — CopyTrade.md §8 fix
     await _log_open_position(
         market_id=market_id,
         direction=direction,
         entry_price=limit_price,
-        size_usdc=fixed_size,
+        size_usdc=final_size,
         class_type="A",
         trader_name=trader_name,
         idempotency_uuid=order_uuid,
     )
 
-    # Log to copytrade_log for trust score tracking
+    # Log to copytrade_log for trust score tracking and priority audit trail
     await _tracker_log_trade(
-        wallet_address=signal.get("wallet_address", ""),
+        wallet_address=wallet_address,
         trader_name=trader_name,
         market_id=market_id,
         direction=direction,
         class_type="A",
         entry_price=limit_price,
-        size_usdc=fixed_size,
+        size_usdc=final_size,
         slippage=signal.get("slippage", 0.0),
         idempotency_uuid=order_uuid,
+        was_priority_pick=was_priority_pick,
     )
 
     elapsed_ms = (time.monotonic() - start_ts) * 1000
     logger.info(
-        "[COPY_EXECUTOR][CLASS_A] ✅ Executed in %.0fms | market=%s dir=%s size=$%.2f price=%.4f trust=%.3f",
-        elapsed_ms,
-        market_id[:12],
-        direction,
-        fixed_size,
-        limit_price,
-        signal.get("trust_score", 0.5),
+        "[COPY_EXECUTOR][CLASS_A] ✅ Executed in %.0fms | market=%s dir=%s "
+        "size=$%.2f price=%.4f trust=%.3f state=%s priority=%s",
+        elapsed_ms, market_id[:12], direction,
+        final_size, limit_price, trust_score, wallet_state, was_priority_pick,
     )
 
     if elapsed_ms > 500:
@@ -410,7 +430,7 @@ async def _execute_class_b(signal: dict, session: aiohttp.ClientSession) -> None
             market_id=market_id,
             market_question=market_question,
             market_price=live_ask,
-            portfolio_value=config.PAPER_TRADING_PORTFOLIO_USDC,
+            portfolio_value=None,
             signal_source="copy_edge",
         )
 

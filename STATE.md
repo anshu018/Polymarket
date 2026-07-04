@@ -38,20 +38,24 @@
   - Task 3: Add pipeline stats counter and stats reporter task in `data/pipeline.py`. [x]
   - Task 4: Log OpenRouter HTTP status and rate-limiting warnings in `llm/news_analyst.py`. [x]
 
-## 6. Strategy 5: Copy Edge — CopyTrade Implementation
-- **Status**: Phase 1 + Phase 2 COMPLETE (Phase 3 = paper testing with real wallets)
-- **Files Created**:
-  - `copytrade/__init__.py` — Package marker
-  - `copytrade/poller.py` — Gamma API polling worker (5s loop per wallet, dedup, SELL-filter)
-  - `copytrade/classifier.py` — Slippage guard, volume check, Class A vs B routing
-  - `copytrade/executor.py` — Class A fast-path ($10 fixed, risk gates, idempotency); Class B → coordinator pipeline
-  - `tests/test_copytrade.py` — 25 unit tests, all passing
-- **Files Modified**:
-  - `config.py` — 14 COPY_* constants added (KELLY_FRACTION_COPY, thresholds, caps, intervals)
-  - `memory/migrations.py` — `tracked_wallets` table migration added (9th table)
-  - `main.py` — 4 CopyTrade asyncio tasks wired at startup (poller + classifier + executor_a + executor_b)
-  - `monitoring/telegram_alerts.py` — `alert_copy_trade_executed()` added
-- **Test Results**: 25/25 copytrade tests + 136/136 total suite PASS.
-- **To Activate**: Add wallet rows to `tracked_wallets` table in Supabase dashboard.
-  - Required columns: `wallet_address` (Polygon 0x...), `trader_name` (string), `class_type` ('A' or 'B')
-  - The poller auto-detects new rows every 5 minutes — no restart needed.
+## 6. Strategy 5: Copy Edge — CopyTrade Phase 2 Complete
+- **Status**: Phase 2 COMPLETE. Phase 3 = paper validation (need 20 resolved copy-trades before live).
+- **Test Results**: **75/75** tests pass — `test_copytrade.py` (25 tests) + `test_copytrade_trust.py` (50 tests).
+- **Supabase Migration Applied (live, 2026-07-05)**:
+  - `tracked_wallets` +10 columns: `state TEXT DEFAULT 'NEW'`, `resolved_trades_count INT DEFAULT 0`, `wins_count INT DEFAULT 0`, `losses_count INT DEFAULT 0`, `trust_score DECIMAL DEFAULT 0.5000`, `avg_roi_per_trade DECIMAL DEFAULT 0.0`, `is_priority BOOL DEFAULT false`, `probation_entered_at TIMESTAMPTZ`, `probation_resolved_at_entry INT DEFAULT 0`, `last_updated_at TIMESTAMPTZ`.
+  - `copytrade_log` +3 columns: `was_priority_pick BOOL DEFAULT false`, `pnl_percent DECIMAL`, `wallet_address TEXT`.
+  - Existing rows backfilled: `state='NEW'`, `trust_score=0.5000`, `is_priority=false`.
+- **Core Logic Rewrites**:
+  - `performance_tracker.py` — Bayesian formula `(wins+5)/(wins+losses+10)`, 4-state machine (NEW/ACTIVE/PROBATION/RETIRED), Priority at trust≥0.80 AND resolved≥30, single source of truth (tracked_wallets only).
+  - `executor.py` — `raw_size = COPY_CLASS_A_MAX_SIZE_USDC × state_multiplier × trust_score` (line 285); paper-mode no-op bug fixed (writes to open_positions, line 347).
+  - `classifier.py` — Priority §3.6 conflict resolution; `was_priority_pick` audit flag on signals.
+  - `poller.py` — fetches full wallet row including state, trust, priority, counts.
+- **Write Order (Class A execution)**:
+  1. `idempotency_log` → status=`pending` (line 322) — BEFORE order
+  2. Paper fill (line 325–335) / live order (line 336–342)
+  3. `idempotency_log` → status=`confirmed` (line 345)
+  4. `open_positions` row inserted (line 347)
+  5. `copytrade_log` row inserted (line 358)
+  - On resolution: `copytrade_log` row closed (exit_price/pnl_usdc/pnl_percent), `tracked_wallets` atomically updated (wins/losses/trust/state).
+- **dead code**: `memory/migrations.py:219` creates `trader_performance` table at startup but nothing reads or writes it (kept to avoid breaking Railway cold-start migration runner).
+- **Files Created/Modified**: `copytrade/performance_tracker.py` (rewrite), `copytrade/executor.py`, `copytrade/classifier.py`, `copytrade/poller.py`, `tests/test_copytrade_trust.py` (rewrite), `scratch/migration_copytrade_phase1.sql`.
