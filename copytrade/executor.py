@@ -434,6 +434,11 @@ async def _execute_class_b(signal: dict, session: aiohttp.ClientSession) -> None
             market_price=live_ask,
             portfolio_value=None,
             signal_source="copy_edge",
+            strategy_override="copy_edge_class_b",
+            wallet_address=signal.get("wallet_address"),
+            was_priority_pick=signal.get("was_priority_pick", False),
+            slippage=signal.get("slippage", 0.0),
+            trader_name=trader_name,
         )
 
         if result and result.get("status") == "success":

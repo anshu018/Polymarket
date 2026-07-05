@@ -55,6 +55,7 @@ class MockTableBuilder:
         self.filters = []
         self._is_null_filters = []
         self._order = None
+        self._is_delete = False
 
     def select(self, cols: str) -> "MockTableBuilder":
         return self
@@ -85,6 +86,7 @@ class MockTableBuilder:
 
         rows = self.db_state.get(self.table_name, [])
         matched = []
+        remaining = []
         for row in rows:
             ok = True
             for col, val in self.filters:
@@ -101,6 +103,11 @@ class MockTableBuilder:
                     ok = False
             if ok:
                 matched.append(row.copy())
+            else:
+                remaining.append(row)
+
+        if self._is_delete:
+            self.db_state[self.table_name] = remaining
 
         if self._order:
             col, desc = self._order
@@ -109,7 +116,11 @@ class MockTableBuilder:
         return Result(matched)
 
     def insert(self, data: dict[str, Any]) -> "MockTableBuilder":
-        self.db_state.setdefault(self.table_name, []).append(data.copy())
+        inserted_data = data.copy()
+        if "id" not in inserted_data:
+            import uuid
+            inserted_data["id"] = f"mock-id-{uuid.uuid4()}"
+        self.db_state.setdefault(self.table_name, []).append(inserted_data)
         return self
 
     def upsert(self, data: dict[str, Any], on_conflict: str = None) -> "MockTableBuilder":
@@ -136,6 +147,10 @@ class MockTableBuilder:
                     match = False
             if match:
                 row.update(data)
+        return self
+
+    def delete(self) -> "MockTableBuilder":
+        self._is_delete = True
         return self
 
 
@@ -189,6 +204,7 @@ def mock_supabase_client(db_state: dict[str, list[dict[str, Any]]]) -> Generator
          patch("llm.contract_parser.get_client", fake_get_client), \
          patch("llm.trade_decision.get_client", fake_get_client), \
          patch("strategies.calibration.get_client", fake_get_client), \
+         patch("copytrade.performance_tracker.get_client", fake_get_client), \
          patch("memory.supabase_client.get_client", fake_get_client):
         yield client
 
@@ -863,3 +879,120 @@ async def test_trade_decision_fail_fast(
     assert mock_llm_apis["sf_calls"] >= 2  # news analyst + trade decision primary
     # Fallback OpenRouter was called
     assert mock_llm_apis["or_calls"] >= 2  # contract parser + trade decision fallback
+
+
+@pytest.mark.anyio
+async def test_copy_trade_class_b_end_to_end_flow(
+    mock_supabase_client: MockSupabaseClient,
+    mock_llm_apis: dict[str, Any],
+) -> None:
+    """Integration: Class B copy-trade signal routes through the coordinator pipeline,
+    tags strategy='copy_edge_class_b', writes to copytrade_log, and resolves via reconciliation.
+    """
+    from unittest.mock import patch, MagicMock
+    from execution.reconciliation import reconcile_on_startup
+
+    wallet_addr = "0xClassBCopy0000000000000000000000000000"
+    
+    # 1. Seed the tracked_wallets starting state
+    mock_supabase_client.db_state.setdefault("tracked_wallets", []).append({
+        "wallet_address": wallet_addr,
+        "trader_name": "MacroGenius",
+        "class_type": "B",
+        "state": "NEW",
+        "is_active": True,
+        "resolved_trades_count": 0,
+        "wins_count": 0,
+        "losses_count": 0,
+        "trust_score": 0.5000,
+        "avg_roi_per_trade": 0.0,
+        "probation_entered_at": None,
+        "probation_resolved_at_entry": 0,
+        "is_priority": False,
+        "added_at": datetime.now(timezone.utc).isoformat(),
+        "last_updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    
+    # 2. Run the pipeline with the Class B copy-trade signal
+    res = await run_pipeline(
+        headline="Donald Trump faces impeachment house vote",
+        source="AP News",
+        market_id="P1",
+        market_question="Will Trump be impeached?",
+        resolution_criteria="Resolves YES if house votes to impeach before 2027.",
+        market_price=0.55,
+        portfolio_value=10000.0,
+        starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+        current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+        signal_source="copy_edge",
+        strategy_override="copy_edge_class_b",
+        wallet_address=wallet_addr,
+        was_priority_pick=False,
+        slippage=0.002,
+        trader_name="MacroGenius",
+    )
+    
+    assert res is not None
+    assert res["status"] == "success"
+    
+    # Assert strategy is tagged correctly in open_positions
+    positions = mock_supabase_client.db_state.get("open_positions", [])
+    assert len(positions) == 1
+    assert positions[0]["strategy"] == "copy_edge_class_b", (
+        f"Expected strategy='copy_edge_class_b', got '{positions[0]['strategy']}'"
+    )
+    
+    # Assert copytrade_log row was written
+    logs = mock_supabase_client.db_state.get("copytrade_log", [])
+    assert len(logs) == 1
+    assert logs[0]["wallet_address"] == wallet_addr
+    assert logs[0]["class_type"] == "B"
+    assert logs[0]["status"] == "open"
+    
+    # Save the generated idempotency_uuid to simulate reconciliation resolution
+    idem_uuid = positions[0]["idempotency_uuid"]
+    
+    # 3. Simulate reconciliation resolution (Paper Trading = True)
+    mock_gamma_data = {
+        "id": "P1",
+        "umaResolutionStatus": "resolved",
+        "outcomes": ["Yes", "No"],
+        "outcomePrices": ["1", "0"],
+        "closed": True,
+    }
+    
+    mock_clob = MagicMock()
+    mock_clob.get_balance_allowance.return_value = {"balance": "100000000"}
+    
+    class MockResponse:
+        def __init__(self, status_code: int, data: dict[str, Any]) -> None:
+            self.status_code = status_code
+            self._data = data
+        def json(self) -> dict[str, Any]:
+            return self._data
+            
+    async def mock_get(_self: Any, url: str, **kwargs: Any) -> MockResponse:
+        return MockResponse(200, mock_gamma_data)
+        
+    async def fake_get_client_pt() -> MockSupabaseClient:
+        return mock_supabase_client
+        
+    with patch("execution.reconciliation.get_polymarket_client", return_value=mock_clob),          patch("httpx.AsyncClient.get", mock_get),          patch("config.PAPER_TRADING", True),          patch("execution.reconciliation.get_client", fake_get_client_pt),          patch("copytrade.performance_tracker.get_client", fake_get_client_pt):
+         
+        await reconcile_on_startup()
+        
+    # Assert open_positions was closed
+    assert len(mock_supabase_client.db_state["open_positions"]) == 0
+    
+    # Assert copytrade_log row was updated to won
+    assert logs[0]["status"] == "won"
+    
+    # Assert tracked_wallets was updated with win + trust_score recomputed
+    wallets = mock_supabase_client.db_state.get("tracked_wallets", [])
+    assert len(wallets) == 1
+    w = wallets[0]
+    assert w["wins_count"] == 1
+    assert w["resolved_trades_count"] == 1
+    # Bayesian: (0+1+5)/(0+0+1+10) = 6/11
+    expected_trust = 6.0 / 11.0
+    assert abs(w["trust_score"] - expected_trust) < 0.001

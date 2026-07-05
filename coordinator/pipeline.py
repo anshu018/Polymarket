@@ -49,6 +49,8 @@ _drop_counters: dict[str, int] = {
     "risk_gate:low_edge": 0,
     "risk_gate:max_category_exposure": 0,
     "risk_gate:max_correlated_exposure": 0,
+    "risk_gate:cash_reserve": 0,
+    "risk_gate:deadline_risk": 0,
 }
 
 def _increment_drop(reason: str) -> None:
@@ -216,13 +218,13 @@ async def fetch_category_defaults(category: str) -> dict[str, Any]:
     }
 
 
-async def fetch_open_positions_exposure(category: str) -> Tuple[float, float]:
+async def fetch_open_positions_exposure(category: str) -> Tuple[float, float, float]:
     """
     Fetch category and correlated exposures from Supabase under a 2-second timeout (RULE 5).
     If database read times out or fails: HALT trading (Fail Closed).
     
     Returns:
-        tuple[category_exposure_pct, correlated_exposure_pct]
+        tuple[category_exposure_pct, correlated_exposure_pct, open_pos_value]
     """
     async def _fetch() -> list[dict[str, Any]]:
         client = await get_client()
@@ -236,8 +238,8 @@ async def fetch_open_positions_exposure(category: str) -> Tuple[float, float]:
     try:
         rows = await asyncio.wait_for(_fetch(), timeout=config.SUPABASE_TIMEOUT_SECONDS)
         
-        # Calculate total portfolio value from env var (C2 fix — no hardcode)
-        total_portfolio: float = float(os.environ.get("PAPER_TRADING_PORTFOLIO_USDC", "10000"))
+        # Calculate total portfolio value dynamically
+        total_portfolio = await get_live_portfolio_value()
         cat_total = 0.0
         corr_total = 0.0
         
@@ -250,7 +252,7 @@ async def fetch_open_positions_exposure(category: str) -> Tuple[float, float]:
             # Correlated exposure (all open positions in the portfolio contribute to common shocks)
             corr_total += size
             
-        return (cat_total / total_portfolio), (corr_total / total_portfolio)
+        return (cat_total / total_portfolio), (corr_total / total_portfolio), corr_total
 
     except asyncio.TimeoutError as e:
         logger.critical(
@@ -428,6 +430,28 @@ async def _warm_resolution_cache(top_n: int = 15) -> None:
         logger.warning(f"[PIPELINE] Cache warmup failed (non-critical): {e}")
 
 
+async def get_live_portfolio_value() -> float:
+    """Helper to get just the total portfolio value (zero DB calls in paper trading)."""
+    if config.PAPER_TRADING:
+        return float(os.environ.get("PAPER_TRADING_PORTFOLIO_USDC", "10000"))
+    try:
+        from execution.polymarket_auth import get_polymarket_client
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+        client = get_polymarket_client()
+        usdc_res = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        actual_usdc = float(usdc_res.get("balance", "0")) / 1000000.0
+
+        db_client = await get_client()
+        res = db_client.table("open_positions").select("position_size_usdc").execute()
+        open_pos_value = sum(float(r.get("position_size_usdc", 0)) for r in res.data)
+
+        return actual_usdc + open_pos_value
+    except Exception as e:
+        logger.error(f"[PORTFOLIO] Failed to fetch live portfolio value: {e}")
+        return float(os.environ.get("PAPER_TRADING_PORTFOLIO_USDC", "10000"))
+
+
 # ─────────────────────────────────────────────
 # MASTER PIPELINE ENTRYPOINT
 # ─────────────────────────────────────────────
@@ -439,12 +463,17 @@ async def run_pipeline(
     market_question: Optional[str] = None,
     resolution_criteria: Optional[str] = None,
     market_price: Optional[float] = None,
-    portfolio_value: float = 10000.0,
+    portfolio_value: Optional[float] = None,
     starting_balances: Optional[dict[str, float]] = None,
     current_balances: Optional[dict[str, float]] = None,
     available_liquidity: float = 10000.0,
     current_market_liquidity: float = 10000.0,
     signal_source: Optional[str] = "news_velocity",
+    strategy_override: Optional[str] = None,
+    wallet_address: Optional[str] = None,
+    was_priority_pick: bool = False,
+    slippage: float = 0.0,
+    trader_name: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """
     Executes the Dual-Path trading pipeline coordinating News Analyst, Contract Parser,
@@ -453,11 +482,15 @@ async def run_pipeline(
     now_str = datetime.now(timezone.utc).isoformat()
     logger.info(f"[{now_str}] [PIPELINE] Received new signal: '{headline}' from {source}")
 
+    # Fetch live balances (zero DB calls in paper trading)
+    if portfolio_value is None:
+        portfolio_value = await get_live_portfolio_value()
+
     # Default balance values if not provided
     if starting_balances is None:
-        starting_balances = {"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0}
+        starting_balances = {"daily": portfolio_value, "weekly": portfolio_value, "monthly": portfolio_value}
     if current_balances is None:
-        current_balances = {"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0}
+        current_balances = {"daily": portfolio_value, "weekly": portfolio_value, "monthly": portfolio_value}
 
     # --- Market Discovery FIRST ---
     # Attempt to match headline entities against Gamma cached markets
@@ -465,11 +498,13 @@ async def run_pipeline(
     signal_entities = {"entities": entities}
     matching_markets = find_matching_markets(signal_entities)
 
+    end_date_iso = None
     if matching_markets:
         best_match = matching_markets[0]
         market_id = best_match["market_id"]
         token_id = best_match["token_id"]
         market_question = best_match["question"]
+        end_date_iso = best_match.get("end_date_iso")
         try:
             market_price = await get_market_price(token_id)
         except Exception as e:
@@ -571,6 +606,7 @@ async def run_pipeline(
                 metadata = await get_market_metadata(market_id)
                 market_question = metadata["question"]
                 resolution_criteria = metadata["resolution_criteria"]
+                end_date_iso = metadata.get("end_date_iso")
             except Exception as e:
                 logger.warning(f"[PIPELINE] Failed to fetch metadata for market {market_id}: {e}")
                 return None
@@ -685,17 +721,43 @@ async def run_pipeline(
 
     # D. Portfolio exposure gates
     # Fetch exposure under 2s timeout (Rule 5 handles halting on failure)
-    cat_exp, corr_exp = await fetch_open_positions_exposure(category)
+    cat_exp, corr_exp, open_pos_value = await fetch_open_positions_exposure(category)
     
-    # Sizing trade
-    kelly_fraction = config.KELLY_FRACTION_VELOCITY if is_fast_path else config.KELLY_FRACTION_RECALIBRATION
-    raw_size = risk_engine.kelly_size(
-        win_probability=clamped_conf,
-        odds=1.0,
-        kelly_fraction=kelly_fraction,
-        portfolio_value=portfolio_value
-    )
-    final_trade_size = risk_engine.position_size_check(raw_size, portfolio_value, strategy="velocity" if is_fast_path else "recalibration")
+    # Calculate net odds b: we risk market_price to win (1.0 - market_price)
+    m_price = max(min(market_price, 0.99), 0.01)
+    net_odds = (1.0 - m_price) / m_price
+
+    # Sizing trade using net_odds
+    if strategy_override == "copy_edge_class_b":
+        kelly_fraction = config.KELLY_FRACTION_COPY
+        kelly_raw = risk_engine.kelly_size(
+            win_probability=clamped_conf,
+            odds=net_odds,
+            kelly_fraction=kelly_fraction,
+            portfolio_value=portfolio_value
+        )
+        if wallet_address:
+            from copytrade.performance_tracker import get_trust_score, get_wallet_state, compute_state_multiplier
+            trust_score = get_trust_score(wallet_address)
+            wallet_state = get_wallet_state(wallet_address)
+            state_multiplier = compute_state_multiplier(wallet_state)
+            
+            # class_ceiling = $50 * state_multiplier * trust_score
+            class_ceiling = config.COPY_CLASS_B_MAX_SIZE_USDC * state_multiplier * trust_score
+            raw_size = min(kelly_raw, class_ceiling)
+        else:
+            raw_size = kelly_raw
+    else:
+        kelly_fraction = config.KELLY_FRACTION_VELOCITY if is_fast_path else config.KELLY_FRACTION_RECALIBRATION
+        raw_size = risk_engine.kelly_size(
+            win_probability=clamped_conf,
+            odds=net_odds,
+            kelly_fraction=kelly_fraction,
+            portfolio_value=portfolio_value
+        )
+        
+    strategy_for_check = strategy_override if strategy_override else ("velocity" if is_fast_path else "recalibration")
+    final_trade_size = max(0.0, risk_engine.position_size_check(raw_size, portfolio_value, strategy=strategy_for_check))
     
     proposed_pct = final_trade_size / portfolio_value
 
@@ -710,6 +772,45 @@ async def run_pipeline(
         _increment_drop("risk_gate:max_correlated_exposure")
         logger.info(f"[PIPELINE][DROP:risk_gate:max_correlated_exposure] market_id={market_id}")
         return {"status": "blocked", "reason": "max_correlated_exposure"}
+
+    # Cash reserve gate
+    if config.PAPER_TRADING:
+        available_cash = max(0.0, portfolio_value - open_pos_value)
+    else:
+        try:
+            from execution.polymarket_auth import get_polymarket_client
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            client = get_polymarket_client()
+            usdc_res = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+            available_cash = float(usdc_res.get("balance", "0")) / 1000000.0
+        except Exception as e:
+            logger.error(f"[PORTFOLIO] Failed to fetch live USDC balance: {e}")
+            available_cash = max(0.0, portfolio_value - open_pos_value)
+
+    if risk_engine.check_cash_reserve(final_trade_size, available_cash, portfolio_value) == "BLOCK":
+        logger.warning(f"[PIPELINE] Risk check: cash reserve violation. Blocking.")
+        _increment_drop("risk_gate:cash_reserve")
+        logger.info(f"[PIPELINE][DROP:risk_gate:cash_reserve] market_id={market_id}")
+        return {"status": "blocked", "reason": "cash_reserve"}
+
+    # Calculate remaining days to resolution for deadline risk gate
+    days_to_resolution = 365
+    if end_date_iso:
+        try:
+            iso_str = end_date_iso.replace("Z", "+00:00")
+            end_dt = datetime.fromisoformat(iso_str)
+            now_dt = datetime.now(timezone.utc)
+            delta = end_dt - now_dt
+            days_to_resolution = max(0, delta.days)
+        except Exception as e:
+            logger.warning(f"[PIPELINE] Failed to parse end_date_iso '{end_date_iso}': {e}")
+
+    # Deadline risk gate
+    if risk_engine.check_deadline_risk(market_price, days_to_resolution) == "BLOCK":
+        logger.warning(f"[PIPELINE] Risk check: deadline risk violation. Blocking.")
+        _increment_drop("risk_gate:deadline_risk")
+        logger.info(f"[PIPELINE][DROP:risk_gate:deadline_risk] market_id={market_id}")
+        return {"status": "blocked", "reason": "deadline_risk"}
 
     # All risk gates PASSED!
     logger.info(f"[PIPELINE] All risk gates passed! Size approved: ${final_trade_size:.2f} USDC.")
@@ -749,13 +850,33 @@ async def run_pipeline(
         direction=decision_direction,
         entry_price=market_price,
         size_usdc=final_trade_size,
-        strategy="velocity" if is_fast_path else "recalibration",
+        strategy=strategy_for_check,
         agent_estimate=estimated_probability,
         confidence=clamped_conf,
         kelly_fraction=kelly_fraction,
         category=category,
         idempotency_uuid=order_uuid
     )
+
+    # Log to copytrade_log for trust scoring and audit trail (Class B)
+    if strategy_override == "copy_edge_class_b" and wallet_address:
+        try:
+            from copytrade.performance_tracker import log_copy_trade as _tracker_log_trade
+            await _tracker_log_trade(
+                wallet_address=wallet_address,
+                trader_name=trader_name or "unknown",
+                market_id=market_id,
+                direction=decision_direction,
+                class_type="B",
+                entry_price=market_price,
+                size_usdc=final_trade_size,
+                slippage=slippage,
+                idempotency_uuid=order_uuid,
+                was_priority_pick=was_priority_pick,
+            )
+            logger.info("[PIPELINE] Class B copy trade logged to copytrade_log: %s", market_id)
+        except Exception as ct_err:
+            logger.error("[PIPELINE] Failed to log Class B copy trade to copytrade_log: %s", ct_err)
 
     logger.info(f"[PIPELINE] Unified pipeline executed successfully for market {market_id}!")
     
