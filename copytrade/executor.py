@@ -286,9 +286,11 @@ async def _execute_class_a(signal: dict) -> None:
     # Apply class-specific absolute ceiling (copy-trade business logic — stays here).
     class_capped = min(raw_size, config.COPY_CLASS_A_MAX_SIZE_USDC)
     # Route the portfolio-percentage cap through the single authoritative function,
-    # matching coordinator/pipeline.py:733.  "copy_trade" falls through the else-branch
-    # in position_size_check() to the standard MAX_SINGLE_TRADE_PCT (5%) cap.
-    final_size = risk_engine.position_size_check(class_capped, portfolio_value, strategy="copy_trade")
+    # matching coordinator/pipeline.py:733.  "copy_edge_class_a" falls through the
+    # else-branch in position_size_check() to the standard MAX_SINGLE_TRADE_PCT (5%) cap.
+    # Using the canonical strategy string that open_positions already records (line 161)
+    # — eliminates the orphan "copy_trade" label that existed nowhere else.
+    final_size = risk_engine.position_size_check(class_capped, portfolio_value, strategy="copy_edge_class_a")
 
     logger.info(
         "[COPY_EXECUTOR][CLASS_A] Sizing | trust=%.3f state=%s multiplier=%.1f "

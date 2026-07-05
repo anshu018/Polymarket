@@ -347,14 +347,17 @@ async def resolve_copy_trade(
     Called when a copy-traded position is closed (won or lost).
 
     Args:
-        idempotency_uuid: When supplied (e.g. from reconciliation.py), the
-            copytrade_log row is looked up by this UUID instead of
-            market_id+direction.  This avoids attributing a resolution to
-            the wrong wallet when two wallets copied the same market.
+        idempotency_uuid: Required.  The copytrade_log row is looked up
+            exclusively by this UUID, which is always set on copy-trade
+            open_positions rows (generated pre-order at executor.py:314,
+            written at executor.py:166).  If None, the call logs CRITICAL
+            and returns early — a silent market_id+direction fallback would
+            risk attributing the resolution to the wrong wallet when two
+            wallets copied the same market.
 
     Steps:
-        1. Find the open copytrade_log row (by idempotency_uuid if given,
-           else by market_id+direction for backward compatibility).
+        1. Guard: log CRITICAL and return if idempotency_uuid is missing.
+        2. Find the open copytrade_log row by idempotency_uuid.
         2. Compute PnL and pnl_percent.
         3. Update copytrade_log with outcome.
         4. Update tracked_wallets: wins/losses/avg_roi/trust_score/is_priority/state.
@@ -369,30 +372,32 @@ async def resolve_copy_trade(
     won = pnl > 0
     outcome = "won" if won else "lost"
 
-    # ── Step 1: Find open copytrade_log row ───────────────────────────────────
-    # Prefer idempotency_uuid lookup (precise — no multi-wallet ambiguity).
-    # Fall back to market_id+direction for backward compatibility.
+    # Step 1: Find open copytrade_log row ───────────────────────────────────
+    # Lookup MUST use idempotency_uuid — it is always set on copy-trade
+    # open_positions rows (generated before any order is submitted, written to
+    # open_positions at executor.py:166).  A missing uuid means something
+    # structurally wrong happened upstream; silently falling back to
+    # market_id+direction risks attributing this resolution to the wrong wallet
+    # and corrupting its trust score without any visible signal.
+    if not idempotency_uuid:
+        logger.critical(
+            "[TRUST] resolve_copy_trade called without idempotency_uuid for market=%s "
+            "direction=%s — cannot safely identify wallet. Skipping trust update to "
+            "avoid wrong-wallet attribution. Investigate caller.",
+            market_id, direction,
+        )
+        return
+
     async def _find_open():
         client = await get_client()
-        if idempotency_uuid:
-            res = (
-                client.table("copytrade_log")
-                .select("id,wallet_address,trader_name")
-                .eq("idempotency_uuid", idempotency_uuid)
-                .eq("status", "open")
-                .limit(1)
-                .execute()
-            )
-        else:
-            res = (
-                client.table("copytrade_log")
-                .select("id,wallet_address,trader_name")
-                .eq("market_id", market_id)
-                .eq("direction", direction)
-                .eq("status", "open")
-                .limit(1)
-                .execute()
-            )
+        res = (
+            client.table("copytrade_log")
+            .select("id,wallet_address,trader_name")
+            .eq("idempotency_uuid", idempotency_uuid)
+            .eq("status", "open")
+            .limit(1)
+            .execute()
+        )
         return res.data[0] if res.data else None
 
     try:

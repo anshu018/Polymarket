@@ -476,3 +476,117 @@ async def test_copy_trade_resolution_updates_trust_score(
     assert abs(w["trust_score"] - expected_trust) < 0.001, (
         f"trust_score should be ~{expected_trust:.4f} (Bayesian), got {w['trust_score']}."
     )
+
+
+@pytest.mark.anyio
+async def test_non_copy_trade_resolution_does_not_call_resolve_copy_trade(
+    mock_supabase_client: MockSupabaseClient,
+    db_state: dict[str, list[dict[str, Any]]],
+) -> None:
+    """Negative test: the copy_edge_class_* guard in reconciliation.py must NOT
+    fire for standard strategy positions.
+
+    The four non-copy strategies are: velocity, resolution, recalibration,
+    fast_path.  None of them start with "copy_edge_class_", so
+    _resolve_copy_trade() must never be called when they resolve.
+
+    This test modifies a shared file (reconciliation.py) and proves the guard
+    actually excludes the other four strategies, not just that it includes
+    copy trades.
+    """
+    for strategy in ("velocity", "resolution", "recalibration", "fast_path"):
+        db_state["open_positions"].clear()
+        db_state["closed_trades"].clear()
+
+        db_state["open_positions"].append({
+            "id": f"pos-{strategy}",
+            "market_id": "M_STD",
+            "market_question": f"Standard {strategy} position",
+            "direction": "YES",
+            "entry_price": 0.60,
+            "position_size_usdc": 20.0,
+            "strategy": strategy,
+            "agent_estimate": 0.70,
+            "confidence_at_entry": 0.80,
+            "category": "politics",
+            "idempotency_uuid": "idem-std-abc-456",
+            "opened_at": datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc).isoformat(),
+        })
+
+        mock_gamma_data = {
+            "id": "M_STD",
+            "umaResolutionStatus": "resolved",
+            "outcomes": ["Yes", "No"],
+            "outcomePrices": ["1", "0"],
+            "closed": True,
+        }
+
+        mock_clob = MagicMock()
+        mock_clob.get_balance_allowance.return_value = {"balance": "100000000"}
+
+        class MockResponse:
+            def __init__(self, status_code: int, data: dict[str, Any]) -> None:
+                self.status_code = status_code
+                self._data = data
+            def json(self) -> dict[str, Any]:
+                return self._data
+
+        async def mock_get(_self: Any, url: str, **kwargs: Any) -> MockResponse:
+            return MockResponse(200, mock_gamma_data)
+
+        resolve_call_count = 0
+
+        async def fake_resolve_copy_trade(**kwargs: Any) -> None:
+            nonlocal resolve_call_count
+            resolve_call_count += 1
+
+        with patch("execution.reconciliation.get_polymarket_client", return_value=mock_clob),              patch("httpx.AsyncClient.get", mock_get),              patch("config.PAPER_TRADING", True),              patch("execution.reconciliation._resolve_copy_trade", fake_resolve_copy_trade):
+            await reconcile_on_startup()
+
+        assert resolve_call_count == 0, (
+            f"_resolve_copy_trade() was called {resolve_call_count} time(s) for "
+            f"strategy='{strategy}'. The copy_edge_class_* guard is not excluding "
+            "standard strategies correctly."
+        )
+        assert len(db_state["closed_trades"]) == 1, (
+            f"Position with strategy='{strategy}' should still be closed normally."
+        )
+        assert db_state["closed_trades"][0]["outcome"] == "win"
+
+
+@pytest.mark.anyio
+async def test_resolve_copy_trade_missing_uuid_logs_critical_and_skips() -> None:
+    """Negative test: resolve_copy_trade() called without idempotency_uuid must
+    log CRITICAL and return early — never silently guess via market_id+direction.
+
+    A silent fallback would corrupt a specific wallet's trust score without any
+    observable signal.  This test locks in the loud-failure behaviour.
+    """
+    from copytrade.performance_tracker import resolve_copy_trade
+
+    critical_msgs = []
+
+    def capture_critical(msg: str, *args: Any, **kwargs: Any) -> None:
+        critical_msgs.append(msg % args if args else msg)
+
+    with patch("copytrade.performance_tracker.logger") as mock_logger:
+        mock_logger.critical.side_effect = capture_critical
+        # Call with idempotency_uuid=None (explicit missing)
+        await resolve_copy_trade(
+            market_id="M_TEST",
+            direction="YES",
+            exit_price=1.0,
+            entry_price=0.50,
+            size_usdc=5.0,
+            idempotency_uuid=None,
+        )
+
+    assert len(critical_msgs) >= 1, (
+        "Expected at least one CRITICAL log when idempotency_uuid is None, got none."
+    )
+    assert any("idempotency_uuid" in m for m in critical_msgs), (
+        f"CRITICAL message should mention idempotency_uuid. Got: {critical_msgs}"
+    )
+    assert any("wrong-wallet" in m or "wrong wallet" in m.lower() for m in critical_msgs), (
+        f"CRITICAL message should mention wrong-wallet risk. Got: {critical_msgs}"
+    )
