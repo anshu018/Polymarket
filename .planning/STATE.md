@@ -3,7 +3,7 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: active
-last_updated: "2026-07-05T13:09:00.000Z"
+last_updated: "2026-07-05T13:58:00.000Z"
 progress:
   total_phases: 9
   completed_phases: 8
@@ -75,6 +75,19 @@ Recent decisions affecting current work:
   - Files rewritten: `copytrade/performance_tracker.py`, `copytrade/executor.py`, `copytrade/classifier.py`, `copytrade/poller.py`, `tests/test_copytrade_trust.py`.
   - Test suite: 75/75 pass — `test_copytrade.py` (25 tests) + `test_copytrade_trust.py` (50 tests).
   - Single source of truth: `tracked_wallets` only (trader_performance table kept as dead code — never read or written, preserved to avoid breaking Railway migration runner).
+- [Strategy 5 / Copy Trade — Phase 2 bug fixes, commit c530c02, 2026-07-05]: Two post-Phase-2 live bugs found and fixed. 80/80 tests pass.
+  - **Bug 1 (critical):** `resolve_copy_trade()` in `performance_tracker.py` had zero call sites — trust scores never updated after any market resolution. Fixed by wiring it into `execution/reconciliation.py` immediately after `_supabase_move_to_closed()` for `copy_edge_class_*` positions. Lookup uses `idempotency_uuid` (not `market_id+direction`) to prevent multi-wallet attribution error. Call is `await` / inline — not fire-and-forget — so trust scores are current before next trade sizes.
+  - **Bug 2 (risk control gap):** `copytrade/executor.py` re-implemented the 5% portfolio cap inline instead of calling `risk_engine.position_size_check()`. Fixed: class ceiling ($10) still applied in executor (copy-trade business logic), then final size routed through `position_size_check(..., strategy="copy_trade")` — same as `coordinator/pipeline.py:733` for all other strategies.
+  - **New test:** `test_copy_trade_resolution_updates_trust_score` in `test_reconciliation.py` — integration test that seeds open_positions + copytrade_log + tracked_wallets, runs paper-mode reconciliation, and asserts `wins_count` and `trust_score` actually changed. Would have caught Bug 1 before commit.
+- [Strategy 5 / Copy Trade — naming + guard hardening, commit 5c7ff40, 2026-07-05]: Three follow-on fixes. 82/82 tests pass.
+  - **Naming:** `copytrade/executor.py` `position_size_check()` call now uses `strategy="copy_edge_class_a"` (the canonical label already written to `open_positions` at line 161) instead of the orphan `"copy_trade"` string that existed nowhere else. Behaviour unchanged (still falls to 5% cap).
+  - **Guard hardened:** `performance_tracker.resolve_copy_trade()` silent `market_id+direction` fallback removed. Missing `idempotency_uuid` now logs CRITICAL and returns early — a silent guess would corrupt a specific wallet's trust score without any visible signal. `idempotency_uuid` is always set on copy-trade `open_positions` rows (generated pre-order, written at `executor.py:166`), so the fallback was dead code in practice.
+  - **Negative tests added:** (1) `test_non_copy_trade_resolution_does_not_call_resolve_copy_trade` — loops over all four standard strategies (`velocity`, `resolution`, `recalibration`, `fast_path`), patches `_resolve_copy_trade` with a call counter, asserts zero calls each time. (2) `test_resolve_copy_trade_missing_uuid_logs_critical_and_skips` — calls `resolve_copy_trade(idempotency_uuid=None)` directly and asserts CRITICAL is logged before any DB access.
+- [Strategy 5 / Copy Trade — Class B pipeline integration + documentation, commit 70cfade, 2026-07-05]: Fixed strategy tagging and logging for Class B copy trades. 97/97 tests pass.
+  - **Class B Strategy Tagging:** Wired a strategy override path through `coordinator/pipeline.py`. If a signal is a Class B copy trade, it overrides strategy as `"copy_edge_class_b"`. This ensures the startswith("copy_edge_class_") reconciliation guard resolves Class B copy trades (previously, they were logged as "velocity"/"recalibration" and ignored on resolution, corrupting trust scores).
+  - **Class B Sizing & Logging:** Fixed Class B copy trades bypassing the `copytrade_log` database table completely. They now correctly log to `copytrade_log` upon successful order execution, allowing future resolutions to calculate ROI/trust. Sizing logic uses the correct `config.KELLY_FRACTION_COPY` (0.10) and clamps the raw Kelly size under the wallet's trust-dampened ceiling ($50 max).
+  - **E2E Integration Test:** Added `test_copy_trade_class_b_end_to_end_flow` to `tests/test_integration.py`. This test seeds tracked_wallets, runs the pipeline with the copy trade signal (which tags strategy correctly and writes to copytrade_log), simulates paper-mode resolution, and asserts trust score updates. Also updated `MockTableBuilder` in `test_integration.py` to support `delete()` and auto-generate UUID `id` to avoid KeyErrors.
+  - **Documentation:** Updated Section 4 sizing pseudocode in `CopyTrade.md` to reflect canonical `copy_edge_class_a` and `copy_edge_class_b` strategy labels.
 
 
 ### Pending Todos
@@ -111,5 +124,5 @@ Recent decisions affecting current work:
 ## Session Continuity
 
 Last session: 2026-07-05
-Stopped at: Copy Trade Phase 2 complete (commit 142bc53). Trust scoring, 4-state wallet lifecycle, Priority conflict resolution, and schema migration applied to live Supabase. 75/75 tests pass. Phase 3 paper validation is the next gate before any live execution work.
+Stopped at: Class B pipeline integration, database logging, and testing complete (commit 70cfade). Class B now tags strategy=copy_edge_class_b and logs to copytrade_log, E2E integration test added, MockTableBuilder updated, documentation synchronized. 97/97 tests pass. Phase 3 paper validation is the next gate before live execution.
 Resume file: None
