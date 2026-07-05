@@ -338,3 +338,141 @@ async def test_paper_trading_reconciliation_resolved_market(
     assert db_state["closed_trades"][0]["outcome"] == "win"
     assert db_state["closed_trades"][0]["exit_price"] == 1.0
 
+
+
+@pytest.mark.anyio
+async def test_copy_trade_resolution_updates_trust_score(
+    mock_supabase_client: MockSupabaseClient,
+    db_state: dict[str, list[dict[str, Any]]],
+) -> None:
+    """Integration: reconciling a resolved copy-trade position must update tracked_wallets.
+
+    This is the class of bug that was invisible before this test:
+    resolve_copy_trade() existed but had zero call sites, so trust scores
+    never updated regardless of how many markets resolved.
+
+    Flow under test:
+        reconcile_on_startup() [paper mode]
+          -> _supabase_move_to_closed()
+          -> _resolve_copy_trade()           <- new wiring in reconciliation.py
+              -> copytrade_log status -> "won"
+              -> tracked_wallets: wins_count +1, trust_score recomputed
+    """
+    wallet_addr = "0xDeAdBeEf000000000000000000000000000000AA"
+    idem_uuid = "idem-copy-trade-abc-123"
+
+    # Seed: one open copy-trade position (strategy tag must match copy_edge_class_*)
+    db_state["open_positions"].append({
+        "id": "pos-copy-1",
+        "market_id": "M_COPY",
+        "market_question": "Will the copy trader be right?",
+        "direction": "YES",
+        "entry_price": 0.50,
+        "position_size_usdc": 5.00,
+        "strategy": "copy_edge_class_a",
+        "agent_estimate": 0.50,
+        "confidence_at_entry": 1.0,
+        "category": "copy_edge",
+        "idempotency_uuid": idem_uuid,
+        "opened_at": datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc).isoformat(),
+    })
+
+    # Seed: corresponding copytrade_log row (looked up by idempotency_uuid)
+    db_state.setdefault("copytrade_log", []).append({
+        "id": "log-copy-1",
+        "wallet_address": wallet_addr,
+        "trader_name": "SmartMoney",
+        "market_id": "M_COPY",
+        "direction": "YES",
+        "class_type": "A",
+        "entry_price": 0.50,
+        "size_usdc": 5.00,
+        "slippage": 0.001,
+        "idempotency_uuid": idem_uuid,
+        "was_priority_pick": False,
+        "status": "open",
+        "exit_price": None,
+        "pnl_usdc": None,
+        "pnl_percent": None,
+        "opened_at": datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc).isoformat(),
+        "resolved_at": None,
+    })
+
+    # Seed: tracked_wallets starting state (0 wins, 0 losses)
+    db_state.setdefault("tracked_wallets", []).append({
+        "wallet_address": wallet_addr,
+        "trader_name": "SmartMoney",
+        "class_type": "A",
+        "state": "NEW",
+        "is_active": True,
+        "resolved_trades_count": 0,
+        "wins_count": 0,
+        "losses_count": 0,
+        "trust_score": 0.5000,
+        "avg_roi_per_trade": 0.0,
+        "probation_entered_at": None,
+        "probation_resolved_at_entry": 0,
+        "is_priority": False,
+        "added_at": datetime(2026, 6, 1, 0, 0, 0, tzinfo=timezone.utc).isoformat(),
+        "last_updated_at": datetime(2026, 6, 1, 0, 0, 0, tzinfo=timezone.utc).isoformat(),
+    })
+
+    # Gamma API: market resolved YES=1.0 (a win)
+    mock_gamma_data = {
+        "id": "M_COPY",
+        "umaResolutionStatus": "resolved",
+        "outcomes": ["Yes", "No"],
+        "outcomePrices": ["1", "0"],
+        "closed": True,
+    }
+
+    mock_clob = MagicMock()
+    mock_clob.get_balance_allowance.return_value = {"balance": "100000000"}
+
+    class MockResponse:
+        def __init__(self, status_code: int, data: dict[str, Any]) -> None:
+            self.status_code = status_code
+            self._data = data
+
+        def json(self) -> dict[str, Any]:
+            return self._data
+
+    async def mock_get(_self: Any, url: str, **kwargs: Any) -> MockResponse:
+        return MockResponse(200, mock_gamma_data)
+
+    async def fake_get_client_pt() -> MockSupabaseClient:
+        return mock_supabase_client
+
+    with patch("execution.reconciliation.get_polymarket_client", return_value=mock_clob), \
+         patch("httpx.AsyncClient.get", mock_get), \
+         patch("config.PAPER_TRADING", True), \
+         patch("copytrade.performance_tracker.get_client", fake_get_client_pt):
+        await reconcile_on_startup()
+
+    # Position closed
+    assert len(db_state["open_positions"]) == 0
+    assert len(db_state["closed_trades"]) == 1
+    assert db_state["closed_trades"][0]["outcome"] == "win"
+
+    # copytrade_log row closed by resolve_copy_trade (status "won")
+    log_rows = db_state.get("copytrade_log", [])
+    assert len(log_rows) == 1
+    assert log_rows[0]["status"] == "won", (
+        "copytrade_log status should be 'won' after resolution. "
+        "resolve_copy_trade() was NOT called -- trust-score wiring is broken."
+    )
+
+    # tracked_wallets updated -- this is the key regression check
+    wallet_rows = db_state.get("tracked_wallets", [])
+    assert len(wallet_rows) == 1
+    w = wallet_rows[0]
+    assert w["wins_count"] == 1, (
+        f"wins_count should be 1, got {w['wins_count']}. "
+        "resolve_copy_trade() did not update tracked_wallets."
+    )
+    assert w["resolved_trades_count"] == 1
+    # Bayesian formula: (wins + 5) / (wins + losses + 10) = (1+5)/(1+0+10) = 6/11
+    expected_trust = (1 + 5) / (1 + 0 + 10)
+    assert abs(w["trust_score"] - expected_trust) < 0.001, (
+        f"trust_score should be ~{expected_trust:.4f} (Bayesian), got {w['trust_score']}."
+    )

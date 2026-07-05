@@ -341,12 +341,20 @@ async def resolve_copy_trade(
     exit_price: float,
     entry_price: float,
     size_usdc: float,
+    idempotency_uuid: Optional[str] = None,
 ) -> None:
     """
     Called when a copy-traded position is closed (won or lost).
 
+    Args:
+        idempotency_uuid: When supplied (e.g. from reconciliation.py), the
+            copytrade_log row is looked up by this UUID instead of
+            market_id+direction.  This avoids attributing a resolution to
+            the wrong wallet when two wallets copied the same market.
+
     Steps:
-        1. Find the open copytrade_log row for this market/direction.
+        1. Find the open copytrade_log row (by idempotency_uuid if given,
+           else by market_id+direction for backward compatibility).
         2. Compute PnL and pnl_percent.
         3. Update copytrade_log with outcome.
         4. Update tracked_wallets: wins/losses/avg_roi/trust_score/is_priority/state.
@@ -362,17 +370,29 @@ async def resolve_copy_trade(
     outcome = "won" if won else "lost"
 
     # ── Step 1: Find open copytrade_log row ───────────────────────────────────
+    # Prefer idempotency_uuid lookup (precise — no multi-wallet ambiguity).
+    # Fall back to market_id+direction for backward compatibility.
     async def _find_open():
         client = await get_client()
-        res = (
-            client.table("copytrade_log")
-            .select("id,wallet_address,trader_name")
-            .eq("market_id", market_id)
-            .eq("direction", direction)
-            .eq("status", "open")
-            .limit(1)
-            .execute()
-        )
+        if idempotency_uuid:
+            res = (
+                client.table("copytrade_log")
+                .select("id,wallet_address,trader_name")
+                .eq("idempotency_uuid", idempotency_uuid)
+                .eq("status", "open")
+                .limit(1)
+                .execute()
+            )
+        else:
+            res = (
+                client.table("copytrade_log")
+                .select("id,wallet_address,trader_name")
+                .eq("market_id", market_id)
+                .eq("direction", direction)
+                .eq("status", "open")
+                .limit(1)
+                .execute()
+            )
         return res.data[0] if res.data else None
 
     try:

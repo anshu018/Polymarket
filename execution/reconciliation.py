@@ -17,6 +17,7 @@ from monitoring.telegram_alerts import (
     alert_reconciliation_failure,
     alert_system_halt,
 )
+from copytrade.performance_tracker import resolve_copy_trade as _resolve_copy_trade
 
 # Try importing CLOB types safely
 try:
@@ -254,6 +255,30 @@ async def reconcile_on_startup() -> None:
                     outcome = "win" if exit_price == 1.0 else "loss"
                     logger.info(f"[RECONCILIATION] [PAPER_TRADING] Market {market_id} resolved (exit price={exit_price}). Closing position.")
                     await _supabase_move_to_closed(pos, exit_price, outcome)
+
+                    # Wire trust-score update for copy-trade positions.
+                    # Only fires for copy_edge_class_a / copy_edge_class_b strategy tags.
+                    # Uses idempotency_uuid (not market_id) to avoid attributing the
+                    # resolution to the wrong wallet when two wallets copied the same market.
+                    if pos.get("strategy", "").startswith("copy_edge_class_"):
+                        try:
+                            await _resolve_copy_trade(
+                                market_id=market_id,
+                                direction=direction,
+                                exit_price=exit_price,
+                                entry_price=entry_price,
+                                size_usdc=size_usdc,
+                                idempotency_uuid=pos.get("idempotency_uuid"),
+                            )
+                            logger.info(
+                                "[RECONCILIATION] [PAPER_TRADING] Trust score updated for copy-trade %s",
+                                market_id,
+                            )
+                        except Exception as ct_err:
+                            logger.error(
+                                "[RECONCILIATION] [PAPER_TRADING] resolve_copy_trade failed for %s: %s",
+                                market_id, ct_err,
+                            )
                 else:
                     logger.info(f"[RECONCILIATION] [PAPER_TRADING] Market {market_id} is active. Keeping position.")
                 continue

@@ -283,12 +283,12 @@ async def _execute_class_a(signal: dict) -> None:
     wallet_state = get_wallet_state(wallet_address)
     state_multiplier = compute_state_multiplier(wallet_state)
     raw_size = config.COPY_CLASS_A_MAX_SIZE_USDC * state_multiplier * trust_score
-    # Clamp to the single-trade percentage cap, then to the absolute ceiling
-    trade_cap = min(
-        config.COPY_CLASS_A_MAX_SIZE_USDC,
-        portfolio_value * config.MAX_SINGLE_TRADE_PCT,
-    )
-    final_size = min(raw_size, trade_cap)
+    # Apply class-specific absolute ceiling (copy-trade business logic — stays here).
+    class_capped = min(raw_size, config.COPY_CLASS_A_MAX_SIZE_USDC)
+    # Route the portfolio-percentage cap through the single authoritative function,
+    # matching coordinator/pipeline.py:733.  "copy_trade" falls through the else-branch
+    # in position_size_check() to the standard MAX_SINGLE_TRADE_PCT (5%) cap.
+    final_size = risk_engine.position_size_check(class_capped, portfolio_value, strategy="copy_trade")
 
     logger.info(
         "[COPY_EXECUTOR][CLASS_A] Sizing | trust=%.3f state=%s multiplier=%.1f "

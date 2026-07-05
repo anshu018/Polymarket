@@ -3,7 +3,7 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: active
-last_updated: "2026-06-15T16:35:00.000Z"
+last_updated: "2026-07-05T13:09:00.000Z"
 progress:
   total_phases: 9
   completed_phases: 8
@@ -67,11 +67,19 @@ Recent decisions affecting current work:
 - [Phase 5]: Local project isolated GSD commands copies chosen over Windows junctions to prevent accidental global data loss and clean git trees.
 - [Phase 8]: Cache-based market discovery module implemented to map signals using in-memory entity overlap scoring and real-time CLOB midpoint pricing checks.
 - [Phase 9]: Wired ingestion pipeline to coordination/trading pipeline. Resolved pipeline disconnect bug, end-to-end routing active, model IDs corrected, startup validation added. First live signals confirmed 2026-06-15, pipeline end-to-end verified.
+- [Strategy 5 / Copy Trade — Phase 2, commit 142bc53, 2026-07-05]: Trust scoring, wallet state machine, and Priority conflict resolution implemented and committed. Key details:
+  - Bayesian trust formula: `(wins + 5) / (wins + losses + 10)` — weak prior dampens small-sample luck.
+  - 4-state wallet lifecycle: NEW (0.5× size) → ACTIVE (full size) → PROBATION (0.5× size) → RETIRED (is_active=false, audit trail kept).
+  - `is_priority` derived flag: trust_score ≥ 0.80 AND resolved_trades_count ≥ 30 — wins conflicts automatically in classifier.
+  - Schema migration applied live: `tracked_wallets` +10 columns (state, resolved_trades_count, wins_count, losses_count, trust_score, avg_roi_per_trade, is_priority, probation_entered_at, probation_resolved_at_entry, last_updated_at); `copytrade_log` +3 columns (was_priority_pick, pnl_percent, wallet_address). 13 new columns total.
+  - Files rewritten: `copytrade/performance_tracker.py`, `copytrade/executor.py`, `copytrade/classifier.py`, `copytrade/poller.py`, `tests/test_copytrade_trust.py`.
+  - Test suite: 75/75 pass — `test_copytrade.py` (25 tests) + `test_copytrade_trust.py` (50 tests).
+  - Single source of truth: `tracked_wallets` only (trader_performance table kept as dead code — never read or written, preserved to avoid breaking Railway migration runner).
 
 
 ### Pending Todos
 
-None yet.
+- **Phase 3 paper validation (Copy Trade)** — gated on 20 resolved copy-trades before any live execution work begins. Must confirm: (1) state transitions fire correctly at 20-trade boundaries, (2) Brier score < 0.20 on resolved copy-trades, (3) at least one wallet reaches ACTIVE state, (4) zero circuit-breaker fires from copy-trade logic errors, (5) paper-mode fills confirmed logged to open_positions/closed_trades.
 
 ### Blockers/Concerns
 
@@ -102,7 +110,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-19 23:30
-Stopped at: Concurrent market discovery fetching, fail-fast routing integration, and test suite optimizations completed and verified. All 32 unit and integration tests pass successfully.
+Last session: 2026-07-05
+Stopped at: Copy Trade Phase 2 complete (commit 142bc53). Trust scoring, 4-state wallet lifecycle, Priority conflict resolution, and schema migration applied to live Supabase. 75/75 tests pass. Phase 3 paper validation is the next gate before any live execution work.
 Resume file: None
-
