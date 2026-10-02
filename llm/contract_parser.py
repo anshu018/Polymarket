@@ -315,29 +315,29 @@ async def _call_deepseek(
             logger.info(f"[CONTRACT_PARSER] Calling primary TokenRouter ({model})...")
             res = await asyncio.wait_for(
                 _execute_parser_call(url, tr_key, model, user_prompt, "TokenRouter", is_openrouter=False),
-                timeout=8.0
+                timeout=18.0
             )
             if res is not None:
                 return res
         except LLMFailFastError as e:
             logger.warning(f"[CONTRACT_PARSER] Primary TokenRouter auth/quota error: {e}. Proceeding immediately to fallback.")
         except asyncio.TimeoutError:
-            logger.warning("[CONTRACT_PARSER] Primary TokenRouter call timed out (limit=8s).")
+            logger.warning("[CONTRACT_PARSER] Primary TokenRouter call timed out (limit=18s).")
         except Exception as e:
             logger.error(f"[CONTRACT_PARSER] Primary TokenRouter call failed: {e}")
 
-        # TokenRouter Fallback: 100% Free Nemotron Reasoning model
-        model_free = getattr(config, "MODEL_CONTRACT_PARSER_FALLBACK_TR", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")
+        # TokenRouter Fallback: qwen/qwen3.5-flash (verified fast & reliable)
+        model_fallback = getattr(config, "MODEL_CONTRACT_PARSER_FALLBACK_TR", "qwen/qwen3.5-flash")
         try:
-            logger.info(f"[CONTRACT_PARSER] Calling fallback TokenRouter ({model_free})...")
+            logger.info(f"[CONTRACT_PARSER] Calling fallback TokenRouter ({model_fallback})...")
             res = await asyncio.wait_for(
-                _execute_parser_call(url, tr_key, model_free, user_prompt, "TokenRouter Free", is_openrouter=False),
-                timeout=5.0
+                _execute_parser_call(url, tr_key, model_fallback, user_prompt, "TokenRouter Fallback", is_openrouter=False),
+                timeout=18.0
             )
             if res is not None:
                 return res
         except Exception as e:
-            logger.warning(f"[CONTRACT_PARSER] Fallback TokenRouter Free call failed: {e}")
+            logger.warning(f"[CONTRACT_PARSER] Fallback TokenRouter call failed: {e}")
 
     # 2. Secondary: OpenRouter
     or_key = os.environ.get("OPENROUTER_API_KEY")
