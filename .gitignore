@@ -104,3 +104,7 @@ docker-compose.prod.yml
 scratch/
 temp_*.py
 memory/supabase_mcp.py
+
+# Proprietary Strategy & PRD Documents
+IDEA.md
+SmartInvest_PRD.md

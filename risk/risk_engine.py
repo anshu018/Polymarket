@@ -328,3 +328,53 @@ def interpret_health_score(
         )
         return "DEFENSIVE_MODE"
     return "NORMAL"
+
+
+def check_cash_reserve(
+    proposed_size: float,
+    available_cash: float,
+    portfolio_value: float,
+) -> str:
+    """Check if the proposed trade size would violate the minimum cash reserve requirement.
+
+    Args:
+        proposed_size: Proposed trade size in USDC.
+        available_cash: Current available cash (USDC balance) in wallet.
+        portfolio_value: Total portfolio value (cash + positions value) in USDC.
+
+    Returns:
+        'BLOCK' if the trade would violate the 20% cash reserve rule, else 'ALLOW'.
+    """
+    reserve_limit = portfolio_value * config.MIN_CASH_RESERVE_PCT
+    if (available_cash - proposed_size) < reserve_limit:
+        logger.warning(
+            "[RISK_ENGINE] Cash reserve violation: Cash=%.2f, Proposed=%.2f, Reserve Limit=%.2f — BLOCK",
+            available_cash,
+            proposed_size,
+            reserve_limit,
+        )
+        return "BLOCK"
+    return "ALLOW"
+
+
+def check_deadline_risk(
+    market_price: float,
+    days_to_resolution: int,
+) -> str:
+    """Gate to block high-priced contracts close to strict resolution deadlines.
+
+    Args:
+        market_price: Price of the target contract (0.0-1.0).
+        days_to_resolution: Number of days remaining until the resolution deadline.
+
+    Returns:
+        'BLOCK' if contract is high-priced and close to deadline, else 'ALLOW'.
+    """
+    if market_price > 0.90 and days_to_resolution < 30:
+        logger.warning(
+            "[RISK_ENGINE] Asymmetric deadline risk: price=%.4f, days=%d — BLOCK",
+            market_price,
+            days_to_resolution,
+        )
+        return "BLOCK"
+    return "ALLOW"

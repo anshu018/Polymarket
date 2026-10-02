@@ -31,6 +31,8 @@ from risk.risk_engine import (
     check_correlation_exposure,
     compute_health_score,
     interpret_health_score,
+    check_cash_reserve,
+    check_deadline_risk,
 )
 
 
@@ -485,3 +487,86 @@ class TestInterpretHealthScore:
         """Boundary: exactly 65 (not strictly less) → NORMAL."""
         result = interpret_health_score(65.0)
         assert result == "NORMAL", f"65 exactly should be NORMAL, got {result}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# check_cash_reserve
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCheckCashReserve:
+    """Tests for check_cash_reserve()."""
+
+    def test_cash_reserve_allows_when_sufficient(self) -> None:
+        """Normal: available cash is $500, proposed trade $100 on $1000 portfolio (reserve is 20% = $200). $500 - $100 = $400 >= $200 -> ALLOW."""
+        result = check_cash_reserve(
+            proposed_size=100.0,
+            available_cash=500.0,
+            portfolio_value=1000.0,
+        )
+        assert result == "ALLOW"
+
+    def test_cash_reserve_blocks_when_violates(self) -> None:
+        """Boundary: available cash is $250, proposed trade $100 on $1000 portfolio (reserve is 20% = $200). $250 - $100 = $150 < $200 -> BLOCK."""
+        result = check_cash_reserve(
+            proposed_size=100.0,
+            available_cash=250.0,
+            portfolio_value=1000.0,
+        )
+        assert result == "BLOCK"
+
+    def test_cash_reserve_exactly_at_limit(self) -> None:
+        """Boundary: available cash is $300, proposed trade $100 on $1000 portfolio (reserve is 20% = $200). $300 - $100 = $200 == $200 -> ALLOW."""
+        result = check_cash_reserve(
+            proposed_size=100.0,
+            available_cash=300.0,
+            portfolio_value=1000.0,
+        )
+        assert result == "ALLOW"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# check_deadline_risk
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCheckDeadlineRisk:
+    """Tests for check_deadline_risk()."""
+
+    def test_deadline_risk_allows_low_price_close_deadline(self) -> None:
+        """Normal: contract price is 0.60 (<= 0.90) and 5 days to resolution -> ALLOW."""
+        result = check_deadline_risk(
+            market_price=0.60,
+            days_to_resolution=5,
+        )
+        assert result == "ALLOW"
+
+    def test_deadline_risk_allows_high_price_far_deadline(self) -> None:
+        """Normal: contract price is 0.95 (> 0.90) and 45 days to resolution -> ALLOW."""
+        result = check_deadline_risk(
+            market_price=0.95,
+            days_to_resolution=45,
+        )
+        assert result == "ALLOW"
+
+    def test_deadline_risk_blocks_high_price_close_deadline(self) -> None:
+        """Boundary: contract price is 0.95 (> 0.90) and 15 days to resolution (< 30) -> BLOCK."""
+        result = check_deadline_risk(
+            market_price=0.95,
+            days_to_resolution=15,
+        )
+        assert result == "BLOCK"
+
+    def test_deadline_risk_exactly_30_days_allows(self) -> None:
+        """Boundary: contract price is 0.95 and exactly 30 days to resolution -> ALLOW."""
+        result = check_deadline_risk(
+            market_price=0.95,
+            days_to_resolution=30,
+        )
+        assert result == "ALLOW"
+
+    def test_deadline_risk_exactly_90pct_allows(self) -> None:
+        """Boundary: contract price is exactly 0.90 and 15 days to resolution -> ALLOW."""
+        result = check_deadline_risk(
+            market_price=0.90,
+            days_to_resolution=15,
+        )
+        assert result == "ALLOW"

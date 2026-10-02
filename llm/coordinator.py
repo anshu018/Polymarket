@@ -185,17 +185,48 @@ async def escalate_to_llm_coordinator(
     t_start = time.perf_counter()
 
     async def _do_escalation() -> Optional[CoordinatorOutput]:
-        # 1. NVIDIA NIM (Primary) with strict 18s timeout wrapper
-        nv_key = os.environ.get("NVIDIA_API_KEY")
-        if nv_key and nv_key != "placeholder":
-            url = f"{config.PROVIDER_NVIDIA}/chat/completions"
+        # 1. TokenRouter (Primary) with strict 18s timeout wrapper
+        tr_key = os.environ.get("TOKENROUTER_API_KEY")
+        if tr_key and tr_key != "placeholder":
+            url = f"{config.PROVIDER_TOKENROUTER}/v1/chat/completions"
             model = config.MODEL_COORDINATOR
             
             try:
-                logger.info("[COORDINATOR] Calling primary NVIDIA NIM for escalation...")
+                logger.info(f"[COORDINATOR] Calling primary TokenRouter ({model}) for escalation...")
                 result = await asyncio.wait_for(
-                    _execute_llm_call(url, nv_key, model, messages, is_fallback=False),
+                    _execute_llm_call(url, tr_key, model, messages, is_fallback=False),
                     timeout=config.LLM_TIMEOUT_SECONDS
+                )
+                if result is not None:
+                    return result
+                
+                logger.warning("[COORDINATOR] TokenRouter call returned None, initiating failover...")
+            except asyncio.TimeoutError:
+                latency_ms = int((time.perf_counter() - t_start) * 1000)
+                logger.error(
+                    f"[COORDINATOR] Primary TokenRouter timed out after {latency_ms}ms (limit={config.LLM_TIMEOUT_SECONDS}s)."
+                )
+                asyncio.create_task(
+                    alert_siliconflow_failover(latency_ms, "NVIDIA/OpenRouter")
+                )
+            except LLMFailFastError as e:
+                logger.warning(
+                    f"[COORDINATOR] Catching LLMFailFastError {e.status} on {e.provider} inside TokenRouter primary attempt. Falling through to fallback."
+                )
+            except Exception as e:
+                logger.error(f"[COORDINATOR] TokenRouter call failed: {e}, initiating failover...")
+
+        # 2. NVIDIA NIM (Secondary Fallback) with strict 18s timeout wrapper
+        nv_key = os.environ.get("NVIDIA_API_KEY")
+        if nv_key and nv_key != "placeholder":
+            url = f"{config.PROVIDER_NVIDIA}/chat/completions"
+            model = "meta/llama-3.1-8b-instruct"
+            
+            try:
+                logger.info("[COORDINATOR] Calling secondary NVIDIA NIM for escalation...")
+                result = await asyncio.wait_for(
+                    _execute_llm_call(url, nv_key, model, messages, is_fallback=True),
+                    timeout=10.0
                 )
                 if result is not None:
                     return result
@@ -204,20 +235,16 @@ async def escalate_to_llm_coordinator(
             except asyncio.TimeoutError:
                 latency_ms = int((time.perf_counter() - t_start) * 1000)
                 logger.error(
-                    f"[COORDINATOR] Primary NVIDIA NIM timed out after {latency_ms}ms (limit={config.LLM_TIMEOUT_SECONDS}s)."
-                )
-                # Send Telegram alert
-                asyncio.create_task(
-                    alert_siliconflow_failover(latency_ms, "OpenRouter")
+                    f"[COORDINATOR] Secondary NVIDIA NIM timed out after {latency_ms}ms."
                 )
             except LLMFailFastError as e:
                 logger.warning(
-                    f"[COORDINATOR] Catching LLMFailFastError {e.status} on {e.provider} inside NVIDIA NIM primary attempt. Falling through to fallback immediately."
+                    f"[COORDINATOR] Catching LLMFailFastError {e.status} on {e.provider} inside NVIDIA NIM attempt. Falling through."
                 )
             except Exception as e:
                 logger.error(f"[COORDINATOR] NVIDIA NIM call failed: {e}, initiating failover...")
         else:
-            logger.warning("[COORDINATOR] NVIDIA API key missing, bypassing primary...")
+            logger.warning("[COORDINATOR] NVIDIA API key missing, bypassing secondary...")
 
         # 2. OpenRouter (Fallback) with 15s timeout
         or_key = os.environ.get("OPENROUTER_API_KEY")

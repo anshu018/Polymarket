@@ -10,28 +10,32 @@ PROVIDER_OPENROUTER = "https://openrouter.ai/api/v1"
 PROVIDER_NVIDIA = "https://integrate.api.nvidia.com/v1"
 PROVIDER_DEEPSEEK = "https://api.deepseek.com/v1"
 PROVIDER_SILICONFLOW = "https://api.siliconflow.com/v1"
+PROVIDER_TOKENROUTER = "https://api.tokenrouter.com"
 
 FAIL_FAST_HTTP_CODES = [401, 402, 403, 429]
 
 # News Analyst
-MODEL_NEWS_ANALYST = "Qwen/Qwen3-32B"           # SiliconFlow exact slug (case-sensitive)
+MODEL_NEWS_ANALYST = "typesafe/jev-1.13"                      # Primary via TokenRouter / OpenRouter
+MODEL_NEWS_ANALYST_FALLBACK_SF = "Qwen/Qwen3-32B"            # SiliconFlow fallback
 MODEL_NEWS_ANALYST_FALLBACK = "meta/llama-3.3-70b-instruct"  # NVIDIA NIM
 MODEL_NEWS_ANALYST_FALLBACK_2 = "gemini-2.0-flash"           # Google Gemini (free tier)
 
 
 # Contract Parser
-MODEL_CONTRACT_PARSER = "meta-llama/llama-3.3-70b-instruct:free"
+MODEL_CONTRACT_PARSER = "qwen/qwen3.8-flash"                  # Primary via TokenRouter
+MODEL_CONTRACT_PARSER_FALLBACK_TR = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"  # TokenRouter 100% Free
 MODEL_CONTRACT_PARSER_FALLBACK_DS = "deepseek-chat"
 MODEL_CONTRACT_PARSER_FALLBACK_NV = "meta/llama-3.1-8b-instruct"
 MODEL_CONTRACT_PARSER_FALLBACK_OR = "qwen/qwen3-next-80b-a3b-instruct:free"
 
 
 # Trade Decision
-MODEL_TRADE_DECISION = "qwen/qwen3-next-80b-a3b-instruct"
-MODEL_TRADE_DECISION_FALLBACK = "qwen/qwen3-235b-a22b"
+MODEL_TRADE_DECISION = "qwen/qwen3.5-flash"                   # Primary via TokenRouter
+MODEL_TRADE_DECISION_FALLBACK = "qwen/qwen3.8-flash"          # Fallback via TokenRouter
+MODEL_TRADE_DECISION_FALLBACK_OR = "qwen/qwen3-235b-a22b"
 
 # Coordinator
-MODEL_COORDINATOR = "meta/llama-3.3-70b-instruct"
+MODEL_COORDINATOR = "qwen/qwen3.5-flash"                      # Primary via TokenRouter
 
 # LLM HARD LIMITS
 MAX_TOKENS_TRADE_DECISION = 900
@@ -92,6 +96,7 @@ AUTO_EXIT_LIQUIDITY_FLOOR_USDC = 3000
 DAILY_DRAWDOWN_HALT_PCT = 0.08
 WEEKLY_DRAWDOWN_HALT_PCT = 0.15
 MONTHLY_DRAWDOWN_SHUTDOWN_PCT = 0.25
+MIN_CASH_RESERVE_PCT = 0.20
 HEALTH_SCORE_DEFENSIVE_THRESHOLD = 65
 HEALTH_SCORE_HALT_THRESHOLD = 40
 RESOLUTION_CACHE_TTL_HOURS = 24
@@ -144,18 +149,16 @@ POLYMARKET_PRIVATE_KEY = os.environ.get("POLYMARKET_PRIVATE_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY")
+TOKENROUTER_API_KEY = os.environ.get("TOKENROUTER_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")  # Optional: free tier fallback (1M tokens/day)
 
 _required_vars = [
     "SUPABASE_URL",
     "SUPABASE_KEY",
-    "OPENROUTER_API_KEY",
-    "NVIDIA_API_KEY",
-    "DEEPSEEK_API_KEY",
+    "TOKENROUTER_API_KEY",
     "POLYMARKET_PRIVATE_KEY",
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID",
-    "SILICONFLOW_API_KEY"
 ]
 
 _PLACEHOLDER_VALUES = {"placeholder", "your_polygon_wallet_private_key_here", "", None}

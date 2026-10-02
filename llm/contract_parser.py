@@ -306,13 +306,46 @@ async def _call_deepseek(
         f"Parse this into structured JSON."
     )
 
-    # 1. Primary: OpenRouter
+    # 1. Primary: TokenRouter (ultra-low cost / verified live)
+    tr_key = os.environ.get("TOKENROUTER_API_KEY")
+    if tr_key and tr_key != "placeholder":
+        url = f"{config.PROVIDER_TOKENROUTER}/v1/chat/completions"
+        model = getattr(config, "MODEL_CONTRACT_PARSER", "qwen/qwen3.5-flash")
+        try:
+            logger.info(f"[CONTRACT_PARSER] Calling primary TokenRouter ({model})...")
+            res = await asyncio.wait_for(
+                _execute_parser_call(url, tr_key, model, user_prompt, "TokenRouter", is_openrouter=False),
+                timeout=8.0
+            )
+            if res is not None:
+                return res
+        except LLMFailFastError as e:
+            logger.warning(f"[CONTRACT_PARSER] Primary TokenRouter auth/quota error: {e}. Proceeding immediately to fallback.")
+        except asyncio.TimeoutError:
+            logger.warning("[CONTRACT_PARSER] Primary TokenRouter call timed out (limit=8s).")
+        except Exception as e:
+            logger.error(f"[CONTRACT_PARSER] Primary TokenRouter call failed: {e}")
+
+        # TokenRouter Fallback: 100% Free Nemotron Reasoning model
+        model_free = getattr(config, "MODEL_CONTRACT_PARSER_FALLBACK_TR", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")
+        try:
+            logger.info(f"[CONTRACT_PARSER] Calling fallback TokenRouter ({model_free})...")
+            res = await asyncio.wait_for(
+                _execute_parser_call(url, tr_key, model_free, user_prompt, "TokenRouter Free", is_openrouter=False),
+                timeout=5.0
+            )
+            if res is not None:
+                return res
+        except Exception as e:
+            logger.warning(f"[CONTRACT_PARSER] Fallback TokenRouter Free call failed: {e}")
+
+    # 2. Secondary: OpenRouter
     or_key = os.environ.get("OPENROUTER_API_KEY")
     if or_key and or_key != "placeholder":
         url = f"{config.PROVIDER_OPENROUTER}/chat/completions"
         model = getattr(config, "MODEL_CONTRACT_PARSER", "meta-llama/llama-3.3-70b-instruct:free")
         try:
-            logger.info(f"[CONTRACT_PARSER] Calling primary OpenRouter ({model})...")
+            logger.info(f"[CONTRACT_PARSER] Calling secondary OpenRouter ({model})...")
             res = await asyncio.wait_for(
                 _execute_parser_call(url, or_key, model, user_prompt, "OpenRouter", is_openrouter=True),
                 timeout=8.0

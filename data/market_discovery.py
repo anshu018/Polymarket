@@ -350,7 +350,8 @@ async def get_market_metadata(market_id: str) -> dict:
             return {
                 "question": market.get("question", ""),
                 "description": market.get("description", ""),
-                "resolution_criteria": market.get("resolutionCriteria") or market.get("description", "")
+                "resolution_criteria": market.get("resolutionCriteria") or market.get("description", ""),
+                "end_date_iso": market.get("endDate") or market.get("resolveBy")
             }
 
     try:

@@ -1,0 +1,40 @@
+# .dockerignore — Container build exclusion list
+
+# Git & Version Control
+.git/
+.github/
+.gitignore
+
+# Environment & Secrets (NEVER bake secrets into images)
+.env
+.env.*
+*.env
+*.key
+*.pem
+*.pfx
+
+# Python Virtual Environments & Bytecode
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Test Caches & Logs
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+*.log.*
+railway_raw_logs*
+
+# Local Scratch, Debugging & Internal Documentation
+scratch/
+temp_*.py
+IDEA.md
+SmartInvest_PRD.md

@@ -243,6 +243,7 @@ def mock_llm_apis() -> Generator[dict[str, Any], None, None]:
     api_state = {
         "news_analyst_confidence": 0.88,
         "news_analyst_direction": "YES",
+        "news_analyst_category": "politics",
         "trade_decision_confidence": 0.85,
         "trade_decision_direction": "YES",
         "coordinator_direction": "YES",
@@ -252,8 +253,10 @@ def mock_llm_apis() -> Generator[dict[str, Any], None, None]:
         "openrouter_delay": 0.0,
         "sf_calls": 0,
         "or_calls": 0,
+        "jev_calls": 0,
         "prompts": [],
         "news_analyst_status": 200,
+        "jev_status": 200,
         "contract_parser_status": 200,
         "trade_decision_status": 200,
         "coordinator_status": 200,
@@ -274,8 +277,37 @@ def mock_llm_apis() -> Generator[dict[str, Any], None, None]:
         delay = 0.0
         choice_content = {}
 
+        # Handle Jev Decision API calls (TokenRouter & OpenRouter) — separate from generative LLM
+        if "api/alpha/decisions" in url:
+            api_state["jev_calls"] = api_state.get("jev_calls", 0) + 1
+            jev_status = api_state.get("jev_status", 200)
+            if jev_status != 200:
+                return MockResponse(jev_status, {"error": "Mocked Jev error"})
+            jev_response = {
+                "model": "typesafe/jev-1.13",
+                "answers": {
+                    "event_category": {"choice": api_state.get("news_analyst_category", "politics")},
+                    "direction": {
+                        "choice": api_state["news_analyst_direction"],
+                        "confidence": api_state["news_analyst_confidence"]
+                    }
+                },
+                "usage": {"input_tokens": 100}
+            }
+            return MockResponse(200, jev_response)
+
         # Increment call counters and set delays based on provider
-        if "integrate.api.nvidia.com" in url or "nvidia" in url:
+        if "api.tokenrouter.com" in url:
+            if "resolution criteria parser" in sys_prompt:
+                api_state["or_calls"] += 1
+                delay = api_state.get("openrouter_delay", 0.0)
+            else:
+                api_state["sf_calls"] += 1
+                if "prediction market trading agent" in sys_prompt or model == config.MODEL_TRADE_DECISION:
+                    delay = api_state["siliconflow_delay"] or api_state.get("nvidia_delay", 0.0)
+                else:
+                    delay = 0.0
+        elif "integrate.api.nvidia.com" in url or "nvidia" in url:
             api_state["sf_calls"] += 1
             if "prediction market trading agent" in sys_prompt or model == config.MODEL_TRADE_DECISION:
                 delay = api_state["nvidia_delay"] or api_state["siliconflow_delay"]
@@ -296,16 +328,16 @@ def mock_llm_apis() -> Generator[dict[str, Any], None, None]:
         # Check status code overrides for testing fail-fast HTTP codes (only fail primary models)
         status_code = 200
         if "prediction market signal classifier" in sys_prompt or user_content == "Reply OK":
-            if model == getattr(config, "MODEL_NEWS_ANALYST", "qwen/qwen3-32b"):
+            if model == getattr(config, "MODEL_NEWS_ANALYST", "typesafe/jev-1.13"):
                 status_code = api_state.get("news_analyst_status", 200)
         elif "resolution criteria parser" in sys_prompt:
-            if model == getattr(config, "MODEL_CONTRACT_PARSER", "moonshotai/kimi-k2.6:free"):
+            if model == getattr(config, "MODEL_CONTRACT_PARSER", "qwen/qwen3.8-flash"):
                 status_code = api_state.get("contract_parser_status", 200)
         elif "prediction market trading agent" in sys_prompt or model == config.MODEL_TRADE_DECISION:
-            if model == getattr(config, "MODEL_TRADE_DECISION", "qwen/qwen3-235b-a22b"):
+            if model == getattr(config, "MODEL_TRADE_DECISION", "qwen/qwen3.5-flash"):
                 status_code = api_state.get("trade_decision_status", 200)
         elif "prediction market trading coordinator" in sys_prompt or model == config.MODEL_COORDINATOR:
-            if model == getattr(config, "MODEL_COORDINATOR", "meta/llama-3.3-70b-instruct"):
+            if model == getattr(config, "MODEL_COORDINATOR", "qwen/qwen3.5-flash"):
                 status_code = api_state.get("coordinator_status", 200)
 
         if status_code != 200:
@@ -342,7 +374,7 @@ def mock_llm_apis() -> Generator[dict[str, Any], None, None]:
 
         # Handle Trade Decision
         elif "prediction market trading agent" in sys_prompt or model == config.MODEL_TRADE_DECISION:
-            provider_name = "NVIDIA NIM" if ("integrate.api.nvidia.com" in url or "nvidia" in url) else "OpenRouter"
+            provider_name = "OpenRouter" if "openrouter" in url.lower() else ("TokenRouter" if "api.tokenrouter.com" in url else "NVIDIA NIM")
             choice_content = {
                 "direction": api_state["trade_decision_direction"],
                 "confidence_score": api_state["trade_decision_confidence"],
@@ -445,8 +477,8 @@ async def test_6_2_fast_path_under_5_seconds(
     assert res["status"] == "success"
     assert duration < 5.0
     
-    # Confirm Trade Decision was completely skipped (sf_calls = 1, since only news analyst was called)
-    assert mock_llm_apis["sf_calls"] == 1
+    # Confirm Trade Decision was completely skipped (sf_calls = 0: Jev handled news analyst, TD skipped)
+    assert mock_llm_apis["sf_calls"] == 0
 
 
 @pytest.mark.anyio
@@ -474,8 +506,8 @@ async def test_6_3_full_pipeline_under_22_seconds(
     assert res is not None
     assert res["status"] == "success"
     assert duration < 22.0
-    # Confirm Trade Decision was evaluated (sf_calls = 2: news analyst + trade decision)
-    assert mock_llm_apis["sf_calls"] == 2
+    # Confirm Trade Decision was evaluated (sf_calls = 1: trade decision only, Jev handled news analyst)
+    assert mock_llm_apis["sf_calls"] == 1
 
 
 @pytest.mark.anyio
@@ -553,8 +585,8 @@ async def test_6_5_conflict_detection(
         current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
     )
     assert res1 is not None
-    # Calls: 1 (News Analyst) + 1 (Contract Parser) + 1 (Trade Decision) + 1 (Coordinator)
-    assert (mock_llm_apis["or_calls"] + mock_llm_apis["sf_calls"]) >= 4
+    # Calls: Jev(news, not counted) + 1 (Contract Parser) + 1 (Trade Decision) + 1 (Coordinator)
+    assert (mock_llm_apis["or_calls"] + mock_llm_apis["sf_calls"]) >= 3
 
     # Case 2: Low News Analyst confidence (<=0.70) + Disagreement
     mock_llm_apis["news_analyst_confidence"] = 0.65
@@ -703,8 +735,8 @@ async def test_6_9_cache_timeout_fallback_to_full_pipeline(
     mock_llm_apis["news_analyst_confidence"] = 0.95
     mock_llm_apis["sf_calls"] = 0
 
-    # Call #2: get_cached_keywords will time out!
-    mock_supabase_client.timeout_on_calls = {2}
+    # Call #1: get_cached_keywords will time out! (Jev skips _log_to_supabase, so cache read is Call 1)
+    mock_supabase_client.timeout_on_calls = {1}
 
     res = await run_pipeline(
         headline="Donald Trump impeachment",
@@ -720,8 +752,8 @@ async def test_6_9_cache_timeout_fallback_to_full_pipeline(
 
     assert res is not None
     assert res["status"] == "success"
-    # Full pipeline evaluated Trade Decision Agent because fast path check timed out (sf_calls = 2)
-    assert mock_llm_apis["sf_calls"] == 2
+    # Full pipeline evaluated Trade Decision Agent because fast path check timed out (sf_calls = 1: TD only, Jev handled news)
+    assert mock_llm_apis["sf_calls"] == 1
 
 
 @pytest.mark.anyio
@@ -733,11 +765,11 @@ async def test_6_9_memory_timeout_proceeds_memoryless(
     # Full pipeline
     mock_llm_apis["news_analyst_confidence"] = 0.80
     
-    # Call 1: _log_to_supabase in news_analyst (succeeds)
-    # Call 2: _read in contract_parser (no hit)
-    # Call 3: _write in contract_parser (succeeds)
-    # Call 4: fetch_relevant_lessons (times out)
-    mock_supabase_client.timeout_on_calls = {4}
+    # Jev handles news (no _log_to_supabase), so Supabase call sequence shifts by -1:
+    # Call 1: _check_cache in contract_parser (no hit)
+    # Call 2: _write_cache in contract_parser (succeeds)
+    # Call 3: fetch_relevant_lessons (times out!)
+    mock_supabase_client.timeout_on_calls = {3}
 
     res = await run_pipeline(
         headline="Donald Trump impeachment",
@@ -766,13 +798,13 @@ async def test_6_9_idempotency_timeout_fails_closed(
     # Full pipeline
     mock_llm_apis["news_analyst_confidence"] = 0.80
     
-    # Call 1: get_cached_keywords (no hit)
-    # Call 2: _check_cache (no hit)
+    # Jev handles news (no _log_to_supabase), so Supabase call sequence shifts by -1:
+    # Call 1: _check_cache (no hit)
+    # Call 2: _write_cache (succeeds)
     # Call 3: fetch_relevant_lessons (succeeds)
-    # Call 4: _write_cache (succeeds)
-    # Call 5: fetch_open_positions_exposure (succeeds)
-    # Call 6: check_pre_order_idempotency (times out!)
-    mock_supabase_client.timeout_on_calls = {6}
+    # Call 4: fetch_open_positions_exposure (succeeds)
+    # Call 5: check_pre_order_idempotency (times out!)
+    mock_supabase_client.timeout_on_calls = {5}
 
     with pytest.raises(RuntimeError, match="Trading halted due to idempotency (check|write) timeout"):
         await run_pipeline(
@@ -815,8 +847,8 @@ async def test_6_10_siliconflow_failover(
 
     assert res is not None
     assert res["status"] == "success"
-    # Confirm that primary NVIDIA NIM was attempted (sf_calls = 2: news analyst + trade decision attempt)
-    assert mock_llm_apis["sf_calls"] == 2
+    # Confirm that primary NVIDIA NIM was attempted for trade decision (sf_calls = 1: Jev handled news)
+    assert mock_llm_apis["sf_calls"] == 1
     # Confirm that OpenRouter fallback was triggered and succeeded (or_calls = 2: parser + trade decision fallback)
     assert mock_llm_apis["or_calls"] == 2
     assert "OpenRouter reasoning" in res["reasoning"]
@@ -828,6 +860,7 @@ async def test_news_analyst_fail_fast(
     mock_llm_apis: dict[str, Any],
 ) -> None:
     """Verify that a 401 response on primary SiliconFlow triggers immediate News Analyst fallback to NVIDIA NIM."""
+    mock_llm_apis["jev_status"] = 401          # Force Jev to fail so generative fallback is reached
     mock_llm_apis["news_analyst_status"] = 401
     mock_llm_apis["sf_calls"] = 0
     mock_llm_apis["or_calls"] = 0
@@ -875,8 +908,8 @@ async def test_trade_decision_fail_fast(
 
     assert res is not None
     assert res["status"] == "success"
-    # Primary NVIDIA NIM was called
-    assert mock_llm_apis["sf_calls"] >= 2  # news analyst + trade decision primary
+    # Primary NVIDIA NIM was called for trade decision (Jev handled news)
+    assert mock_llm_apis["sf_calls"] >= 1  # trade decision primary
     # Fallback OpenRouter was called
     assert mock_llm_apis["or_calls"] >= 2  # contract parser + trade decision fallback
 

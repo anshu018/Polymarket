@@ -113,13 +113,149 @@ async def _execute_news_call(
         logger.error(f"[NEWS_ANALYST] {resolved_provider} request failed: {e}")
         return None
 
+async def _execute_jev_call(
+    url: str,
+    api_key: str,
+    model: str,
+    headline: str,
+    source: str,
+    market_question: Optional[str] = None,
+    provider_name: str = "TokenRouter",
+) -> Optional[NewsAnalystOutput]:
+    """Execute decision call to TypeSafe Jev via TokenRouter or OpenRouter."""
+    start_time = time.time()
+    state = f"Headline: {headline}\nSource: {source}"
+    if market_question:
+        state += f"\nTarget Prediction Market Question: {market_question}"
+
+    payload = {
+        "model": model,
+        "state": state,
+        "questions": {
+            "event_category": {
+                "type": "choice",
+                "instructions": "What is the primary category of this prediction market event?",
+                "criteria": {
+                    "politics": "Elections, political leaders, legislation, government policy",
+                    "crypto": "Bitcoin, Ethereum, cryptocurrency, tokens, blockchain, DeFi",
+                    "sports": "Athletics, games, matches, tournaments",
+                    "legal": "Court rulings, Supreme Court, lawsuits, trials, indictments, regulatory decisions",
+                    "economics": "Federal Reserve, inflation, interest rates, GDP, jobs, unemployment",
+                    "science": "FDA approvals, space missions, technology, medical trials",
+                    "other": "General news or unclassified events"
+                }
+            },
+            "direction": {
+                "type": "choice",
+                "instructions": "Does this headline make the target prediction market question resolve to YES or NO, or is this headline unrelated (ABSTAIN)?",
+                "criteria": {
+                    "YES": "Headline directly supports or increases likelihood of target market question resolving YES",
+                    "NO": "Headline directly refutes or decreases likelihood of target market question resolving YES (or resolves NO)",
+                    "ABSTAIN": "Headline has zero causal connection or relevance to the target market question"
+                }
+            }
+        }
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/zeroalpha",
+        "X-Title": "Zero Alpha Agent"
+    }
+
+    try:
+        session = await _get_session()
+        async with session.post(url, json=payload, headers=headers) as response:
+            latency_ms = (time.time() - start_time) * 1000
+            if response.status in config.FAIL_FAST_HTTP_CODES:
+                logger.error(f"[LLM] Auth/quota error {response.status} on {provider_name} — immediate failover")
+                raise LLMFailFastError(response.status, provider_name)
+            if response.status != 200:
+                text = await response.text()
+                logger.error(f"[NEWS_ANALYST] {provider_name} Jev returned {response.status}: {text} (latency={latency_ms:.0f}ms)")
+                return None
+
+            data = await response.json()
+            answers = data.get("answers", {})
+            cat_data = answers.get("event_category", {})
+            dir_data = answers.get("direction", {})
+
+            category = cat_data.get("choice", "other")
+            if category not in ["politics", "crypto", "sports", "legal", "economics", "science", "other"]:
+                category = "other"
+
+            direction = dir_data.get("choice", "ABSTAIN")
+            if direction not in ["YES", "NO", "ABSTAIN"]:
+                direction = "ABSTAIN"
+
+            raw_confidence = float(dir_data.get("confidence") or dir_data.get("probabilities", {}).get(direction, 0.5))
+            usage = data.get("usage", {})
+            logger.info(
+                f"[NEWS_ANALYST] Jev decision via {provider_name}: {category} -> {direction} "
+                f"(raw_conf={raw_confidence:.2f}) | latency={latency_ms:.0f}ms | usage={usage}"
+            )
+
+            return NewsAnalystOutput(
+                event_category=category,
+                affected_market_ids=[],
+                confidence_score=raw_confidence,
+                direction=direction,
+                reasoning=f"Jev ({provider_name}): {category} {direction} conf={raw_confidence:.2f}"
+            )
+    except LLMFailFastError:
+        raise
+    except Exception as e:
+        logger.error(f"[NEWS_ANALYST] {provider_name} Jev request failed: {e}")
+        return None
+
 async def classify_signal(headline: str, source: str, market_question: Optional[str] = None) -> Optional[NewsAnalystOutput]:
     """
     Classify a news headline into a trading action.
     Returns None on timeout or failure.
     """
     try:
-        # A2: Rewritten system prompt — clearer schema, calibration examples, better direction definitions
+        # 0. Attempt Primary: TokenRouter Jev (Sub-200ms System 1 Decision Model)
+        tr_key = getattr(config, "TOKENROUTER_API_KEY", "") or os.environ.get("TOKENROUTER_API_KEY", "")
+        if tr_key and tr_key != "placeholder":
+            url = f"{getattr(config, 'PROVIDER_TOKENROUTER', 'https://api.tokenrouter.com')}/api/alpha/decisions"
+            model = getattr(config, "MODEL_NEWS_ANALYST", "typesafe/jev-1.13")
+            try:
+                logger.info(f"[NEWS_ANALYST] Calling primary TokenRouter Jev ({model})...")
+                jev_res = await asyncio.wait_for(
+                    _execute_jev_call(url, tr_key, model, headline, source, market_question, provider_name="TokenRouter"),
+                    timeout=10.0
+                )
+                if jev_res is not None:
+                    return jev_res
+            except LLMFailFastError as e:
+                logger.warning(f"[NEWS_ANALYST] TokenRouter Jev auth/quota error: {e}. Proceeding to fallback.")
+            except asyncio.TimeoutError:
+                logger.warning("[NEWS_ANALYST] TokenRouter Jev call timed out (limit=10s).")
+            except Exception as e:
+                logger.error(f"[NEWS_ANALYST] TokenRouter Jev failed: {e}")
+
+        # 0.1 Attempt Fallback: OpenRouter Jev
+        or_key = os.environ.get("OPENROUTER_API_KEY")
+        if or_key and or_key != "placeholder":
+            url = "https://openrouter.ai/api/alpha/decisions"
+            model = "typesafe/jev-1.13"
+            try:
+                logger.info(f"[NEWS_ANALYST] Calling fallback OpenRouter Jev ({model})...")
+                jev_res = await asyncio.wait_for(
+                    _execute_jev_call(url, or_key, model, headline, source, market_question, provider_name="OpenRouter-Jev"),
+                    timeout=10.0
+                )
+                if jev_res is not None:
+                    return jev_res
+            except LLMFailFastError as e:
+                logger.warning(f"[NEWS_ANALYST] OpenRouter Jev auth/quota error: {e}. Proceeding to generative fallbacks.")
+            except asyncio.TimeoutError:
+                logger.warning("[NEWS_ANALYST] OpenRouter Jev call timed out (limit=10s).")
+            except Exception as e:
+                logger.error(f"[NEWS_ANALYST] OpenRouter Jev failed: {e}")
+
+        # Generative Fallbacks
         system_content = """You are a prediction market signal classifier.
 Classify news headlines for relevance to binary prediction markets (YES/NO outcomes).
 Respond ONLY in valid JSON. No preamble. No explanation. No markdown. JSON only.
@@ -139,16 +275,6 @@ Rules:
 - direction NO: headline makes a binary outcome LESS likely to resolve YES
 - direction ABSTAIN: ONLY when headline has zero relation to any binary market outcome
 - affected_market_ids: always empty list []
-
-Confidence calibration guide:
-- 0.80-0.88: Direct named outcome ("X wins", "FDA approves Y", "Fed cuts by 25bps")
-- 0.70-0.79: Clear causal signal ("polls show X leading by 10 points")
-- 0.60-0.69: Indirect or background signal ("X campaign reports fundraising record")
-- Below 0.60: Weak/ambiguous — still classify YES/NO if any market plausibly affected
-- ABSTAIN: administrative notices, local news, sports scores with no market context
-
-Examples:
-- "Local city council meets Tuesday" → direction: ABSTAIN, confidence_score: 0.0, event_category: other
 """
 
         start_time = time.time()
@@ -157,13 +283,13 @@ Examples:
             prompt += f"\nTarget Prediction Market Question: {market_question}"
         choice_content = None
 
-        # 1. Attempt Primary: SiliconFlow (Qwen3-32B)
+        # 1. Attempt Fallback: SiliconFlow (Qwen3-32B)
         sf_key = os.environ.get("SILICONFLOW_API_KEY")
         if sf_key and sf_key != "placeholder":
             url = f"{config.PROVIDER_SILICONFLOW}/chat/completions"
-            model = getattr(config, "MODEL_NEWS_ANALYST", "qwen/qwen3-32b")
+            model = getattr(config, "MODEL_NEWS_ANALYST_FALLBACK_SF", "qwen/qwen3-32b")
             try:
-                logger.info(f"[NEWS_ANALYST] Calling primary SiliconFlow ({model})...")
+                logger.info(f"[NEWS_ANALYST] Calling SiliconFlow fallback ({model})...")
                 choice_content = await asyncio.wait_for(
                     _execute_news_call(url, sf_key, model, system_content, prompt, is_fallback=False),
                     timeout=config.NEWS_ANALYST_TIMEOUT_SECONDS
@@ -318,17 +444,51 @@ async def validate_models() -> None:
     if not nv_key_check or nv_key_check == "placeholder":
         logger.warning("[NEWS_ANALYST] NVIDIA_API_KEY is not set — fallback provider unavailable. Strongly recommended.")
 
-    # 1. Probe Primary: SiliconFlow
-    sf_key = os.environ.get("SILICONFLOW_API_KEY")
+    # 0. Probe Primary: TokenRouter Jev
+    tr_key = os.environ.get("TOKENROUTER_API_KEY", "")
     primary_ok = False
     primary_err = "API Key Missing"
-    primary_model = getattr(config, "MODEL_NEWS_ANALYST", "qwen/qwen3-32b")
+    primary_model = getattr(config, "MODEL_NEWS_ANALYST", "typesafe/jev-1.13")
 
+    if tr_key and tr_key != "placeholder":
+        url = f"{getattr(config, 'PROVIDER_TOKENROUTER', 'https://api.tokenrouter.com')}/api/alpha/decisions"
+        try:
+            payload = {
+                "model": primary_model,
+                "state": "Probe ping",
+                "questions": {
+                    "is_test": {
+                        "type": "noul",
+                        "instructions": "Is this a test?"
+                    }
+                }
+            }
+            headers = {
+                "Authorization": f"Bearer {tr_key}",
+                "Content-Type": "application/json"
+            }
+            async with asyncio.timeout(10.0):
+                session = await _get_session()
+                async with session.post(url, json=payload, headers=headers) as response:
+                    if response.status == 200:
+                        logger.info(f"[NEWS_ANALYST] Model validated via TokenRouter: {primary_model}")
+                        _models_validated = True
+                        return
+                    else:
+                        primary_err = f"Status {response.status}: {await response.text()}"
+        except Exception as e:
+            primary_err = f"Exception: {type(e).__name__}: {e}"
+
+    logger.warning(f"[NEWS_ANALYST] TokenRouter Jev validation probe failed: {primary_err}")
+
+    # 1. Probe Fallback: SiliconFlow
+    sf_key = os.environ.get("SILICONFLOW_API_KEY")
+    sf_model = getattr(config, "MODEL_NEWS_ANALYST_FALLBACK_SF", "qwen/qwen3-32b")
     if sf_key and sf_key != "placeholder":
         url = f"{config.PROVIDER_SILICONFLOW}/chat/completions"
         try:
             payload = {
-                "model": primary_model,
+                "model": sf_model,
                 "messages": [{"role": "user", "content": "Reply OK"}],
                 "max_tokens": 5
             }
@@ -337,26 +497,17 @@ async def validate_models() -> None:
                 "Content-Type": "application/json",
             }
             async with asyncio.timeout(25.0):
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(url, json=payload, headers=headers) as response:
-                        if response.status in config.FAIL_FAST_HTTP_CODES:
-                            logger.error(f"[LLM] Auth/quota error {response.status} on SiliconFlow — immediate failover")
-                            raise LLMFailFastError(response.status, "SiliconFlow")
-                        if response.status == 200:
-                            primary_ok = True
-                            logger.info(f"[NEWS_ANALYST] Model validated: {primary_model}")
-                            _models_validated = True
-                            return
-                        else:
-                            primary_err = f"Status {response.status}: {await response.text()}"
-        except LLMFailFastError as fail_fast:
-            primary_err = f"FailFast: {fail_fast}"
-        except asyncio.TimeoutError:
-            primary_err = "Timeout after 25 seconds"
+                session = await _get_session()
+                async with session.post(url, json=payload, headers=headers) as response:
+                    if response.status in config.FAIL_FAST_HTTP_CODES:
+                        logger.error(f"[LLM] Auth/quota error {response.status} on SiliconFlow — immediate failover")
+                        raise LLMFailFastError(response.status, "SiliconFlow")
+                    if response.status == 200:
+                        logger.info(f"[NEWS_ANALYST] Model validated: {sf_model}")
+                        _models_validated = True
+                        return
         except Exception as e:
-            primary_err = f"Exception: {type(e).__name__}: {e}"
-
-    logger.warning(f"[NEWS_ANALYST] Primary model validation failed: {primary_err}")
+            logger.warning(f"[NEWS_ANALYST] SiliconFlow validation probe failed: {e}")
 
     # 2. Probe Fallback: NVIDIA NIM
     nv_key = os.environ.get("NVIDIA_API_KEY")

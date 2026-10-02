@@ -312,26 +312,26 @@ async def decide_trade(
 
     t_start = time.perf_counter()
 
-    # 4. NVIDIA NIM (Primary) with strict 18s timeout wrapper (RULE 6)
-    nv_key = os.environ.get("NVIDIA_API_KEY")
-    if nv_key and nv_key != "placeholder":
-        url = f"{config.PROVIDER_NVIDIA}/chat/completions"
+    # 4. TokenRouter (Primary) with strict 18s timeout wrapper (RULE 6)
+    tr_key = os.environ.get("TOKENROUTER_API_KEY")
+    if tr_key and tr_key != "placeholder":
+        url = f"{config.PROVIDER_TOKENROUTER}/v1/chat/completions"
         model = config.MODEL_TRADE_DECISION
         
         try:
-            logger.info(f"[TRADE_DECISION] Calling primary NVIDIA NIM for {market_id}...")
+            logger.info(f"[TRADE_DECISION] Calling primary TokenRouter ({model}) for {market_id}...")
             result = await asyncio.wait_for(
-                _execute_llm_call(url, nv_key, model, messages, is_fallback=False),
+                _execute_llm_call(url, tr_key, model, messages, is_fallback=False),
                 timeout=config.LLM_TIMEOUT_SECONDS
             )
             if result is not None:
                 return result, was_memoryless
             
-            logger.warning("[TRADE_DECISION] NVIDIA NIM call returned None, initiating failover...")
+            logger.warning("[TRADE_DECISION] TokenRouter call returned None, initiating failover...")
         except asyncio.TimeoutError:
             latency_ms = int((time.perf_counter() - t_start) * 1000)
             logger.error(
-                f"[TRADE_DECISION] Primary NVIDIA NIM timed out after {latency_ms}ms (limit={config.LLM_TIMEOUT_SECONDS}s)."
+                f"[TRADE_DECISION] Primary TokenRouter timed out after {latency_ms}ms (limit={config.LLM_TIMEOUT_SECONDS}s)."
             )
             # Send Telegram alert
             asyncio.create_task(
@@ -339,22 +339,21 @@ async def decide_trade(
             )
         except LLMFailFastError as e:
             logger.warning(
-                f"[TRADE_DECISION] Catching LLMFailFastError {e.status} on {e.provider} inside NVIDIA NIM primary attempt. Falling through to fallback immediately."
+                f"[TRADE_DECISION] Catching LLMFailFastError {e.status} on {e.provider} inside TokenRouter primary attempt. Falling through to fallback immediately."
             )
         except Exception as e:
-            logger.error(f"[TRADE_DECISION] NVIDIA NIM call failed: {e}, initiating failover...")
+            logger.error(f"[TRADE_DECISION] TokenRouter call failed: {e}, initiating failover...")
     else:
-        logger.warning("[TRADE_DECISION] NVIDIA API key missing, bypassing primary...")
+        logger.warning("[TRADE_DECISION] TokenRouter API key missing, bypassing primary...")
 
-    # 5. OpenRouter (Fallback)
+    # 5. OpenRouter (Fallback per RULE 6)
     or_key = os.environ.get("OPENROUTER_API_KEY")
     if or_key and or_key != "placeholder":
         url = f"{config.PROVIDER_OPENROUTER}/chat/completions"
-        model = config.MODEL_TRADE_DECISION_FALLBACK
+        model = getattr(config, "MODEL_TRADE_DECISION_FALLBACK_OR", "qwen/qwen3-235b-a22b")
         
         try:
             logger.info(f"[TRADE_DECISION] Calling fallback OpenRouter for {market_id}...")
-            # Fallback timeout also mapped to standard OpenRouter completion limits (~15 seconds)
             result = await asyncio.wait_for(
                 _execute_llm_call(url, or_key, model, messages, is_fallback=True),
                 timeout=15.0
@@ -372,5 +371,5 @@ async def decide_trade(
         logger.error("[TRADE_DECISION] OpenRouter API key missing, fallback unavailable.")
 
     # Both failed
-    logger.error("[TRADE_DECISION] CRITICAL: Both NVIDIA NIM and OpenRouter failed.")
+    logger.error("[TRADE_DECISION] CRITICAL: Both TokenRouter and OpenRouter failed.")
     return None, was_memoryless
