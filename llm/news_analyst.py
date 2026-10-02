@@ -283,21 +283,40 @@ Rules:
             prompt += f"\nTarget Prediction Market Question: {market_question}"
         choice_content = None
 
-        # 1. Attempt Fallback: SiliconFlow (Qwen3-32B)
-        sf_key = os.environ.get("SILICONFLOW_API_KEY")
-        if sf_key and sf_key != "placeholder":
-            url = f"{config.PROVIDER_SILICONFLOW}/chat/completions"
-            model = getattr(config, "MODEL_NEWS_ANALYST_FALLBACK_SF", "qwen/qwen3-32b")
+        # 0.5. Attempt Fallback: TokenRouter Qwen 3.5 Flash (ultra-reliable & budget-safe)
+        tr_key = os.environ.get("TOKENROUTER_API_KEY")
+        if tr_key and tr_key != "placeholder":
+            url = f"{getattr(config, 'PROVIDER_TOKENROUTER', 'https://api.tokenrouter.com')}/v1/chat/completions"
+            model = getattr(config, "MODEL_TRADE_DECISION", "qwen/qwen3.5-flash")
             try:
-                logger.info(f"[NEWS_ANALYST] Calling SiliconFlow fallback ({model})...")
+                logger.info(f"[NEWS_ANALYST] Calling TokenRouter generative fallback ({model})...")
                 choice_content = await asyncio.wait_for(
-                    _execute_news_call(url, sf_key, model, system_content, prompt, is_fallback=False),
+                    _execute_news_call(url, tr_key, model, system_content, prompt, is_fallback=True, provider_name="TokenRouter"),
                     timeout=config.NEWS_ANALYST_TIMEOUT_SECONDS
                 )
             except LLMFailFastError as e:
-                logger.warning(f"[NEWS_ANALYST] Primary SiliconFlow auth/quota error: {e}. Proceeding immediately to fallback.")
+                logger.warning(f"[NEWS_ANALYST] TokenRouter auth/quota error: {e}. Proceeding to secondary fallbacks.")
             except asyncio.TimeoutError:
-                logger.warning(f"[NEWS_ANALYST] Primary SiliconFlow call timed out (limit={config.NEWS_ANALYST_TIMEOUT_SECONDS}s).")
+                logger.warning("[NEWS_ANALYST] TokenRouter generative call timed out.")
+            except Exception as e:
+                logger.warning(f"[NEWS_ANALYST] TokenRouter generative call failed: {e}")
+
+        # 1. Attempt Fallback: SiliconFlow (Qwen3-32B)
+        if not choice_content:
+            sf_key = os.environ.get("SILICONFLOW_API_KEY")
+            if sf_key and sf_key != "placeholder":
+                url = f"{config.PROVIDER_SILICONFLOW}/chat/completions"
+                model = getattr(config, "MODEL_NEWS_ANALYST_FALLBACK_SF", "qwen/qwen3-32b")
+                try:
+                    logger.info(f"[NEWS_ANALYST] Calling SiliconFlow fallback ({model})...")
+                    choice_content = await asyncio.wait_for(
+                        _execute_news_call(url, sf_key, model, system_content, prompt, is_fallback=False),
+                        timeout=config.NEWS_ANALYST_TIMEOUT_SECONDS
+                    )
+                except LLMFailFastError as e:
+                    logger.warning(f"[NEWS_ANALYST] Primary SiliconFlow auth/quota error: {e}. Proceeding immediately to fallback.")
+                except asyncio.TimeoutError:
+                    logger.warning(f"[NEWS_ANALYST] Primary SiliconFlow call timed out (limit={config.NEWS_ANALYST_TIMEOUT_SECONDS}s).")
 
         # 2. Attempt Fallback: NVIDIA NIM (Llama-3.3-70B)
         if not choice_content:
@@ -480,6 +499,26 @@ async def validate_models() -> None:
             primary_err = f"Exception: {type(e).__name__}: {e}"
 
     logger.warning(f"[NEWS_ANALYST] TokenRouter Jev validation probe failed: {primary_err}")
+
+    # 0.1 Probe Fallback: TokenRouter Chat Completions (Qwen 3.5 Flash)
+    if tr_key and tr_key != "placeholder":
+        url_chat = f"{getattr(config, 'PROVIDER_TOKENROUTER', 'https://api.tokenrouter.com')}/v1/chat/completions"
+        chat_model = getattr(config, "MODEL_TRADE_DECISION", "qwen/qwen3.5-flash")
+        try:
+            payload_chat = {
+                "model": chat_model,
+                "messages": [{"role": "user", "content": "Reply OK"}],
+                "max_tokens": 5
+            }
+            async with asyncio.timeout(10.0):
+                session = await _get_session()
+                async with session.post(url_chat, json=payload_chat, headers=headers) as response:
+                    if response.status == 200:
+                        logger.info(f"[NEWS_ANALYST] Model validated via TokenRouter Chat: {chat_model}")
+                        _models_validated = True
+                        return
+        except Exception as e:
+            logger.warning(f"[NEWS_ANALYST] TokenRouter Chat validation probe failed: {e}")
 
     # 1. Probe Fallback: SiliconFlow
     sf_key = os.environ.get("SILICONFLOW_API_KEY")
