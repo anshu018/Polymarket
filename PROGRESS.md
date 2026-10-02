@@ -27,7 +27,7 @@ Layer 4 — Risk Engine [ Confirmed ]
 Layer 5 — Contract Parser [ Confirmed ]
 Layer 6 — Integration [ Confirmed ]
 Layer 7 — Deployment [ Confirmed ]
-Paper Trading [ Not Started ]
+Paper Trading [ In Progress ]
 Live Deployment [ Not Started ]
 
 ---
