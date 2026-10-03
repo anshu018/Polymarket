@@ -66,9 +66,9 @@ async def _execute_news_call(
         "max_tokens": 200,
         "temperature": 0.1,
     }
-    # Only add thinking controls for primary (SiliconFlow) calls, not fallback
-    if not is_fallback:
-        payload["enable_thinking"] = False
+    # Always disable thinking mode — qwen3.5-flash defaults to ~950 reasoning tokens if not set
+    # (is_fallback guard was the root cause of $0.18/hr billing on Oct 2)
+    payload["enable_thinking"] = False
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -286,8 +286,8 @@ Rules:
         # 0.5. Attempt Fallback: TokenRouter Qwen 3.5 Flash (ultra-reliable & budget-safe)
         tr_key = os.environ.get("TOKENROUTER_API_KEY")
         if tr_key and tr_key != "placeholder":
-            url = f"{getattr(config, 'PROVIDER_TOKENROUTER', 'https://api.tokenrouter.com')}/v1/chat/completions"
-            model = getattr(config, "MODEL_TRADE_DECISION", "qwen/qwen3.5-flash")
+            url = f"{config.PROVIDER_TOKENROUTER}/v1/chat/completions"
+            model = getattr(config, "MODEL_NEWS_ANALYST_FALLBACK_TR", "qwen/qwen3.5-flash")
             try:
                 logger.info(f"[NEWS_ANALYST] Calling TokenRouter generative fallback ({model})...")
                 choice_content = await asyncio.wait_for(

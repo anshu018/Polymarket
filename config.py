@@ -19,11 +19,12 @@ MODEL_NEWS_ANALYST = "typesafe/jev-1.13"                      # Primary via Toke
 MODEL_NEWS_ANALYST_FALLBACK_SF = "Qwen/Qwen3-32B"            # SiliconFlow fallback
 MODEL_NEWS_ANALYST_FALLBACK = "meta/llama-3.3-70b-instruct"  # NVIDIA NIM
 MODEL_NEWS_ANALYST_FALLBACK_2 = "gemini-2.0-flash"           # Google Gemini (free tier)
+MODEL_NEWS_ANALYST_FALLBACK_TR = "qwen/qwen3.5-flash"        # TokenRouter generative fallback (thinking always OFF)
 
 
 # Contract Parser
 MODEL_CONTRACT_PARSER = "qwen/qwen3.8-flash"                  # Primary via TokenRouter
-MODEL_CONTRACT_PARSER_FALLBACK_TR = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"  # TokenRouter 100% Free
+MODEL_CONTRACT_PARSER_FALLBACK_TR = "qwen/qwen3.5-flash"     # TokenRouter fallback (Nemotron was failing)
 MODEL_CONTRACT_PARSER_FALLBACK_DS = "deepseek-chat"
 MODEL_CONTRACT_PARSER_FALLBACK_NV = "meta/llama-3.1-8b-instruct"
 MODEL_CONTRACT_PARSER_FALLBACK_OR = "qwen/qwen3-next-80b-a3b-instruct:free"
