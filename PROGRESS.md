@@ -271,11 +271,18 @@ Notes:
 
 ## PAPER TRADING GATE
 
-Status: Not Started
-Started: \***\*\_\_\_\*\***
-Completed: \***\*\_\_\_\*\***
+Status: In Progress
+Started: 2026-10-02
+Completed: **********
 
-Prerequisite: Layer 7 Confirmed [ ]
+Prerequisite: Layer 7 Confirmed [x]
+Phase 1 Model Overhaul: Deployed & Verified (Commit f62c90e)
+- Primary News Analyst: TypeSafe Jev via TokenRouter (Active, ~560ms latency, ~$0.000025/call)
+- News Analyst Fallback: Qwen 3.5 Flash (enable_thinking=False hard-cap, max_tokens=200)
+- Contract Parser: Qwen 3.8 Flash (18s timeout per Rule 6)
+- Trade Decision: Qwen 3.5 Flash (Phase 1 budget conservative)
+- All 196 unit & integration tests passing
+
 
 PT.1 — Minimum 2 weeks completed [ ]
 PT.2 — Minimum 20 resolved trades logged [ ]
