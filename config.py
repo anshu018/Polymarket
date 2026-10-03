@@ -31,8 +31,8 @@ MODEL_CONTRACT_PARSER_FALLBACK_OR = "qwen/qwen3-next-80b-a3b-instruct:free"
 
 
 # Trade Decision
-MODEL_TRADE_DECISION = "qwen/qwen3.5-flash"                   # Primary via TokenRouter
-MODEL_TRADE_DECISION_FALLBACK = "qwen/qwen3.8-flash"          # Fallback via TokenRouter
+MODEL_TRADE_DECISION = "deepseek/deepseek-v4.1-flash"         # Primary via TokenRouter
+MODEL_TRADE_DECISION_FALLBACK = "qwen/qwen3.5-flash"          # Fallback via TokenRouter
 MODEL_TRADE_DECISION_FALLBACK_OR = "qwen/qwen3-235b-a22b"
 
 # Coordinator
