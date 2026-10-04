@@ -277,11 +277,14 @@ Completed: **********
 
 Prerequisite: Layer 7 Confirmed [x]
 Phase 1 & Phase 2 Model Overhaul: Deployed & Verified (Commit 39fae2b, Deployment d23496de)
+Cost & Reliability Optimization: Deployed & Verified (Commit 61d5527, Deployment e8b9f4d0)
 - Primary News Analyst: TypeSafe Jev via TokenRouter (Active, ~535ms latency, ~$0.000025/call)
 - News Analyst Fallback: Qwen 3.5 Flash (enable_thinking=False hard-cap, max_tokens=200)
-- Contract Parser: Qwen 3.8 Flash (18s timeout per Rule 6)
-- Primary Trade Decision: DeepSeek v4.1 Flash via TokenRouter (Active, ~2s latency, thinking disabled, 77 tokens output)
+- Early Discard on ABSTAIN: Dropped before Contract Parser & Trade Decision (~60% call reduction)
+- Contract Parser: Qwen 3.8 Flash (enable_thinking=False, 18s timeout per Rule 6)
+- Primary Trade Decision: DeepSeek v4.1 Flash via TokenRouter (Active, ~2s latency, Structured 3-step reasoning, max_tokens=300 hard-cap)
 - Trade Decision Fallback: Qwen 3.5 Flash via TokenRouter (Rule 6 compliant)
+- Monthly Cost Target: Safely under $0.75/month (~$0.35 - $0.45/month projected)
 - All 196 unit & integration tests passing (100% green)
 
 
