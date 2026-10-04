@@ -308,6 +308,21 @@ Thrives: Technical markets (regulatory, legal, economic data releases)
 Fails: Ambiguous or subjective resolution criteria
 Path: Full pipeline, Contract Parser mandatory
 
+### Strategy 5: Copy Edge (Smart Money Tracking)
+
+Core insight: Top-performing prediction market traders possess information
+and execution edges. Agent continuously tracks top on-chain wallets, computes
+Bayesian trust scores based on historical win-rates, and mirrors trades.
+Execution Modes:
+  - Class A (Speed/Alpha): Trust-driven sizing up to $10, limit order priced
+    at tracker_price + 0.005, sub-500ms execution target. Bypasses LLM.
+  - Class B (Macro/Deep Value): Trust-driven sizing up to $50, routed through
+    the full coordinator pipeline for News Analyst validation and risk checks.
+Kelly: Fixed trust-scaled cap (Class A), 0.10 fractional Kelly (Class B)
+Trust formula: (wins + 5) / (wins + losses + 10)
+Wallet states: NEW, ACTIVE, PROBATION, RETIRED
+Path: Direct Fast Order (Class A) / Full Pipeline (Class B)
+
 ---
 
 ## 6. RISK ENGINE
@@ -379,6 +394,31 @@ Human review required before resuming.
 Never trade within 60 minutes before OR after a market category-wide
 shock event (election night, major court ruling, Fed announcement).
 Spreads too wide, prices chaotic.
+
+### 6.8 Per-Market Tranche Gate (Dedupe & Anti-Concentration)
+
+Prevents repeat headline bursts or duplicate signals from over-concentrating
+portfolio capital into single prediction market contracts.
+
+Rules:
+1. Max Tranches: Exactly 2 tranches maximum per market (MAX_MARKET_TRANCHES = 2).
+   A third entry is strictly blocked regardless of confidence or edge.
+2. First Entry: Normal fractional Kelly up to 5% single-trade cap.
+3. Repeat Entry:
+   - Allowed ONLY if confidence >= 0.87 (REPEAT_MIN_CONFIDENCE).
+   - Position size strictly capped at 3% of total portfolio (REPEAT_ENTRY_PCT = 0.03).
+   - Repeat Floor: MIN_ADD_TICKET_USDC = 25.0 applies exclusively to repeat adds
+     to avoid dusting. Does not apply to first entries (e.g. $10 Class A copy trades).
+4. Absolute Market Exposure: Cumulative exposure across all tranches on a single
+   market cannot exceed 8% of total portfolio (MAX_MARKET_TRADE_PCT = 0.08).
+5. Opposite Direction: Entering opposite direction on an active market is blocked
+   (opposite_direction_open). No simultaneous YES and NO positions.
+6. Process-Wide Mutex:
+   - Process-wide asyncio.Lock keyed strictly on market_id alone.
+   - Held across: load_market_state -> risk_engine check -> idempotency pending write ->
+     order execution -> open_positions row insertion.
+7. Path Scope: Enforced across Fast Path, Full Pipeline, Copy Edge Class A, and
+   Copy Edge Class B. Includes pre-checks before LLM invocation to save tokens.
 
 ---
 
@@ -680,6 +720,15 @@ Min edge to trade: 7 cents
 Min confidence to trade: 0.75
 Fast path confidence threshold: 0.87
 Confidence hard ceiling: 0.88
+
+TRANCHE GATE & DEDUPE LIMITS:
+Max tranches per market: 2 (MAX_MARKET_TRANCHES = 2)
+Repeat entry min confidence: 0.87 (REPEAT_MIN_CONFIDENCE = 0.87)
+Repeat entry max size: 3% of portfolio (REPEAT_ENTRY_PCT = 0.03)
+Repeat entry min floor: $25 USDC (MIN_ADD_TICKET_USDC = 25.0, repeats only)
+Max cumulative market exposure: 8% of portfolio (MAX_MARKET_TRADE_PCT = 0.08)
+Opposite direction: Strictly blocked (opposite_direction_open)
+Process lock scope: Keyed on market_id alone, covers check through position log
 
 DRAWDOWN CIRCUIT BREAKERS:
 Daily drawdown > 8%: Halt new trades + Telegram alert

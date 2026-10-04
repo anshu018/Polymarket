@@ -165,12 +165,30 @@ Reference: TESTING.md Criterion 6.2 / 6.3
 
 ---
 
-### [LAYER 6][TIMEOUT] — Integration tests slowness due to rate limit sleep
+### [LAYER 4/6][RISK] — Correlated exposure 20% cap comparison operator semantics
 
-What happened: Integration tests ran very slowly (~100 seconds total) and hit execution timeouts because of `asyncio.sleep(2.0)` rate limits in the coordinator pipeline.
-Why it's wrong: Slow test suites degrade developer velocity and hit hard limits in test runners.
-Correct behavior: Implement a standard `mock_asyncio_sleep` autouse fixture in `tests/test_integration.py` to bypass 1s/2s rate-limit sleeps (speeding them up to 0.001s), reducing execution time to 11 seconds.
-Reference: TESTING.md Layer 6
+What happened: Proposal to change `total > 0.20` to `total >= 0.20` in `risk_engine.check_correlation_exposure`, reasoning that four $500 orders equal 20% and slipped past.
+Why it's wrong: The owner's rule is that exposure may go up to and including 20%; block only when it would go beyond 20%. Changing to `>=` would have silently reduced the ceiling to 15% ($1,500) and broken `test_exactly_20pct_allowed`.
+Correct behavior: Keep `total > 0.20` strictly intact. Single-market concentration is solved by the Per-Market Tranche Gate (max 2 tranches, 8% market cap), not by altering gross correlation thresholds.
+Reference: PLAN.md Section 6.5 / TESTING.md 4.15
+
+---
+
+### [LAYER 6/PT][RECONCILE] — Ad-hoc manual closure of paper positions corrupts permanent ledger
+
+What happened: Proposal to run a one-off script calling `_supabase_move_to_closed` to close 3 of 4 duplicate paper positions.
+Why it's wrong: For an unresolved market, writing `exit_reason="resolved"`, fabricated notes, and invented Brier contributions (e.g. 0.9025 vs 0.0025) pollutes `closed_trades`, which is an immutable audit ledger feeding the go-live Brier score gate.
+Correct behavior: Never execute ad-hoc scripts to close unresolved positions. Open paper positions must remain open until actual market resolution occurs via official reconciliation.
+Reference: PLAN.md Section 14 / GEMINI.md Rule 4
+
+---
+
+### [LAYER 6][CONCURRENCY] — Race conditions in duplicate headline bursts
+
+What happened: Multiple news poller workers or copytrade events arriving within milliseconds on the same contract raced before `open_positions` was written, bypassing exposure checks.
+Why it's wrong: Allows multiple concurrent orders to be submitted before the first order is recorded in the database ledger.
+Correct behavior: Use a process-wide `asyncio.Lock` keyed strictly on `market_id` alone, held continuously across state load -> risk check -> idempotency pending write -> order placement -> `open_positions` insertion.
+Reference: PLAN.md Section 6.8 / TESTING.md 6.14
 
 ---
 

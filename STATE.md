@@ -9,9 +9,10 @@
   - Added new high-signal feeds: BBC News World, Politico, NYT World, WSJ World, The Hill.
 
 ## 2. Test Verification
-- **Total Tests Run**: 136
-- **Passed**: 136
+- **Total Tests Run**: 220
+- **Passed**: 220
 - **Failed**: 0
+- **Coverage**: 100% green across unit and integration tests (83 risk, 12 tranche gate, 15 pipeline integration, 75 copytrade, 35 parser/discovery)
 - **Verification Result**: PASS
 
 ## 3. Fallback Model Update
@@ -59,3 +60,25 @@
   - On resolution: `copytrade_log` row closed (exit_price/pnl_usdc/pnl_percent), `tracked_wallets` atomically updated (wins/losses/trust/state).
 - **dead code**: `memory/migrations.py:219` creates `trader_performance` table at startup but nothing reads or writes it (kept to avoid breaking Railway cold-start migration runner).
 - **Files Created/Modified**: `copytrade/performance_tracker.py` (rewrite), `copytrade/executor.py`, `copytrade/classifier.py`, `copytrade/poller.py`, `tests/test_copytrade_trust.py` (rewrite), `scratch/migration_copytrade_phase1.sql`.
+ 
+## 7. Per-Market Tranche Gate (Dedupe & Anti-Concentration)
+- **Status**: COMPLETE & VERIFIED (Commits `44587de` through `fea3a0a`).
+- **Core Invariants**:
+  - `MAX_MARKET_TRANCHES = 2`: At most 2 entries per market; third entry strictly blocked.
+  - `REPEAT_MIN_CONFIDENCE = 0.87`: High-conviction threshold required for repeat entries.
+  - `REPEAT_ENTRY_PCT = 0.03`: Second entry strictly capped at 3% total portfolio.
+  - `MIN_ADD_TICKET_USDC = 25.0`: Enforces $25 minimum add ticket on repeats only (first entries unaffected).
+  - `MAX_MARKET_TRADE_PCT = 0.08`: Cumulative exposure per market capped at 8%.
+  - `opposite_direction_open`: Blocks opposite-direction trades on existing active markets.
+  - `get_market_lock(market_id)`: Process-wide `asyncio.Lock` keyed strictly on `market_id` alone, held through state query to `open_positions` insertion.
+  - `load_market_state`: Supabase state query offloaded via `asyncio.to_thread` with strict 2-second timeout, failing closed (`None`).
+  - Pre-checks before expensive LLM calls in `coordinator/pipeline.py` and `copytrade/executor.py` (`_execute_class_b`) to eliminate unnecessary token burn.
+- **Paths Protected**: Fast Path, Full Pipeline, Copy Edge Class A, Copy Edge Class B.
+- **Test Coverage**: 12 dedicated unit tests (`TestMarketPositionCheck` in `tests/test_risk.py`) + 12 end-to-end integration tests (`tests/test_dedupe_gate.py`). All 24 tests pass.
+
+## 8. Active AI Model Pipeline & Budget Optimization
+- **News Analyst**: `typesafe/jev-1.13` via TokenRouter primary (~535ms latency, ~$0.000025/call). Fallback: `qwen/qwen3.5-flash` (`enable_thinking=False`, max 200 tokens). Early drop on `ABSTAIN` cuts downstream token burn by ~60%.
+- **Contract Parser**: `qwen/qwen3.8-flash` via TokenRouter (`enable_thinking=False`, 18s timeout, cached 24h in Supabase).
+- **Trade Decision**: `deepseek/deepseek-v4.1-flash` via TokenRouter (`thinking: {"type": "disabled"}`, `max_tokens=300`, structured 3-step reasoning). Fallback: `qwen/qwen3.5-flash`.
+- **Coordinator**: Pure Python weighted aggregation primary (<0.1ms), LLM escalation only on high-confidence conflicts (>0.70).
+- **Burn Rate**: Optimized to ~$0.012 - $0.015/day (~$0.40/month), safely under the $0.75/month hard budget.

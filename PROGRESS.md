@@ -285,7 +285,17 @@ Cost & Reliability Optimization: Deployed & Verified (Commit 61d5527, Deployment
 - Primary Trade Decision: DeepSeek v4.1 Flash via TokenRouter (Active, ~2s latency, Structured 3-step reasoning, max_tokens=300 hard-cap)
 - Trade Decision Fallback: Qwen 3.5 Flash via TokenRouter (Rule 6 compliant)
 - Monthly Cost Target: Safely under $0.75/month (~$0.35 - $0.45/month projected)
-- All 196 unit & integration tests passing (100% green)
+- Per-Market Tranche Gate (Dedupe & Anti-Concentration): Implemented & Verified (Commits 44587de..fea3a0a)
+  - Pure Python market_position_check added to /risk/risk_engine.py (< 1ms deterministic, Rule 1 compliant).
+  - Maximum 2 tranches per market (MAX_MARKET_TRANCHES = 2); 3rd entry strictly blocked.
+  - Repeat entry requires high conviction (REPEAT_MIN_CONFIDENCE = 0.87), capped at 3% portfolio (REPEAT_ENTRY_PCT = 0.03).
+  - Repeat floor $25 USDC (MIN_ADD_TICKET_USDC = 25.0) prevents dusting; first entries unaffected.
+  - Absolute market exposure capped at 8% portfolio (MAX_MARKET_TRADE_PCT = 0.08).
+  - Opposite direction blocked (opposite_direction_open).
+  - Process-wide asyncio.Lock per market_id held across state check to open_positions write.
+  - Fail-closed Supabase state reader load_market_state with asyncio.to_thread and 2s timeout.
+  - Fully wired across Fast Path, Full Pipeline, Copy Edge Class A, and Copy Edge Class B.
+- All 220 unit & integration tests passing (100% green: 83 risk, 12 tranche gate, 15 pipeline integration, 75 copytrade, 35 parser/discovery)
 
 
 

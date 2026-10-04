@@ -469,14 +469,53 @@ Expected: Every function p99 latency < 1ms (1000 microseconds)
 PASS: All functions under 1ms at p99.
 FAIL: Any function exceeds 1ms at p99.
 
-[ ] 4.19 — Every function in risk_engine.py has a unit test
+[x] 4.19 — Every function in risk_engine.py has a unit test
 Test: Count exported functions in risk_engine.py.
 Count test functions in /tests/test_risk.py.
 Expected: test count >= function count. Every function testable in isolation.
 PASS: All functions covered. Tests runnable with pytest.
 FAIL: Any function untested. Test file missing.
 
-LAYER 4 CONFIRMED when: All 19 criteria show PASS
+[x] 4.20 — First entry allowed up to 5% single-trade cap without repeat floor
+Test: market_position_check(existing_market_usdc=0.0, existing_tranches=0, proposed_size=500.0, portfolio_value=10000.0, confidence=0.80)
+Expected: Returns 500.0. Not blocked by repeat floor ($25).
+PASS: Returns 500.0.
+FAIL: Blocked by repeat floor or returns <= 0.0.
+
+[x] 4.21 — Repeat entry allowed only at confidence >= 0.87
+Test: market_position_check(existing_market_usdc=500.0, existing_tranches=1, proposed_size=300.0, portfolio_value=10000.0, confidence=0.86)
+Expected: Returns 0.0 (blocked, confidence < 0.87).
+Test 2: confidence = 0.87
+Expected: Returns 300.0 (allowed).
+PASS: Block at 0.86, allow at 0.87.
+FAIL: Allow at 0.86.
+
+[x] 4.22 — Repeat entry capped at 3% portfolio ($300 at $10k)
+Test: market_position_check(existing_market_usdc=500.0, existing_tranches=1, proposed_size=500.0, portfolio_value=10000.0, confidence=0.88)
+Expected: Returns 300.0 (capped at 3% = $300).
+PASS: Returns 300.0, not 500.0.
+FAIL: Returns > 300.0.
+
+[x] 4.23 — Third entry unconditionally blocked (max 2 tranches)
+Test: market_position_check(existing_market_usdc=600.0, existing_tranches=2, proposed_size=100.0, portfolio_value=10000.0, confidence=0.88)
+Expected: Returns 0.0 (blocked, max tranches reached).
+PASS: Returns 0.0 on tranches >= 2.
+FAIL: Returns > 0.0.
+
+[x] 4.24 — Cumulative market exposure capped at 8% ($800 at $10k)
+Test: market_position_check(existing_market_usdc=700.0, existing_tranches=1, proposed_size=200.0, portfolio_value=10000.0, confidence=0.88)
+Expected: Returns 100.0 (700 + 100 = 800 cap).
+PASS: Returns 100.0.
+FAIL: Returns > 100.0 or 0.0.
+
+[x] 4.25 — Repeat ticket floor enforced ($25 minimum add)
+Test: market_position_check(existing_market_usdc=790.0, existing_tranches=1, proposed_size=100.0, portfolio_value=10000.0, confidence=0.88)
+Remaining room = $10.0 < $25.0 min floor.
+Expected: Returns 0.0 (dust add blocked).
+PASS: Returns 0.0 on repeat addition < $25.
+FAIL: Returns dust addition < $25.
+
+LAYER 4 CONFIRMED when: All criteria show PASS (83/83 unit tests passing in tests/test_risk.py)
 
 ---
 
@@ -652,7 +691,7 @@ idempotency timeout → order NOT submitted, Telegram alert logged
 PASS: All three fallbacks behave as specified.
 FAIL: Any fallback panics, crashes, or behaves incorrectly.
 
-[ ] 6.10 — SiliconFlow failover to OpenRouter works
+[x] 6.10 — SiliconFlow failover to OpenRouter works
 Test: Mock SiliconFlow to delay 19 seconds (beyond 18s timeout).
 Run Trade Decision Agent call.
 Expected: Call cancelled at 18 seconds.
@@ -662,7 +701,79 @@ Total latency < 18 + 15 = 33 seconds.
 PASS: Failover fires at 18s. OpenRouter used. Logged correctly.
 FAIL: Hangs past 18 seconds. No failover. Crash on timeout.
 
-LAYER 6 CONFIRMED when: All 10 criteria show PASS
+[x] 6.11 — Four high-confidence signals produce exactly two orders on single market
+Test: Send 4 signals with confidence = 0.88 for market_id.
+Expected: First 2 succeed; 3rd and 4th blocked with reason 'max_tranches_reached'. Exactly 2 open positions.
+PASS: Confirmed exactly 2 orders placed.
+FAIL: More than 2 orders placed.
+
+[x] 6.12 — Low confidence repeats produce exactly one order
+Test: Send 1st signal at 0.88, next 3 signals at 0.86.
+Expected: 1st succeeds, 2nd-4th blocked with 'low_confidence_for_add'. Exactly 1 open position.
+PASS: Confirmed exactly 1 order placed.
+FAIL: Repeat order placed at 0.86.
+
+[x] 6.13 — Repeat entry at 0.87 capped at 3% portfolio ($300 at $10k)
+Test: 1st entry at 0.88 ($500), 2nd entry at 0.87.
+Expected: 2nd entry size = $300 (3% cap).
+PASS: Exactly $300 allocated to 2nd tranche.
+FAIL: 2nd tranche allocated > $300.
+
+[x] 6.14 — Concurrent workers on same market produce at most 2 orders total
+Test: Run 4 concurrent run_pipeline tasks via asyncio.gather on same market.
+Expected: Mutex prevents race; exactly 2 orders succeed.
+PASS: Exactly 2 positions recorded in open_positions.
+FAIL: 3 or 4 positions opened.
+
+[x] 6.15 — load_market_state None fails closed without idempotency or order write
+Test: Mock load_market_state to return None.
+Expected: Blocked with 'exposure_unavailable', 0 orders placed, 0 idempotency rows written.
+PASS: Fails closed.
+FAIL: Proceeds with trade.
+
+[x] 6.16 — Opposite-direction signal strictly blocked
+Test: Market has open YES position; signal arrives for NO.
+Expected: Blocked with 'opposite_direction_open', no hedge order placed.
+PASS: Blocked.
+FAIL: Opposite direction trade placed.
+
+[x] 6.17 — Pre-check skips Trade Decision LLM when max tranches reached
+Test: Market has 2 open positions; signal arrives.
+Expected: Pre-check drops signal before Contract Parser / Trade Decision. Trade Decision mock call count = 0.
+PASS: Zero LLM calls burned.
+FAIL: LLM called when market is already full.
+
+[x] 6.18 — Universal path enforcement across Fast Path, Full Pipeline, Class A, and Class B
+Test: Seed 2 open positions; execute all 4 order paths.
+Expected: All 4 paths reject entry.
+PASS: All 4 paths drop; 0 new positions added.
+FAIL: Any path slips past the tranche gate.
+
+[x] 6.19 — Class A first entry of $10 permitted without repeat floor block
+Test: Submit Class A signal ($10 ceiling).
+Expected: Order placed successfully; $25 repeat floor does not block first entry.
+PASS: Class A position logged.
+FAIL: Blocked by repeat floor.
+
+[x] 6.20 — Drop counters increment accurately across rejection categories
+Test: Trigger opposite direction, low confidence repeat, and max tranches.
+Expected: risk_gate:opposite_direction, risk_gate:low_confidence_add, and risk_gate:max_market_tranches increment accurately.
+PASS: Counters match drop events.
+FAIL: Counters inaccurate or missing.
+
+[x] 6.21 — Real thread blocking in load_market_state times out near 2s and fails closed
+Test: Execute slow query sleeping 2.5s in thread.
+Expected: asyncio.wait_for times out near 2.0s, returns None.
+PASS: Returns None in 1.9s-2.8s.
+FAIL: Hangs for 2.5s+ or raises unhandled exception.
+
+[x] 6.22 — Shared lock registry resolves to same asyncio.Lock across modules
+Test: Compare get_market_lock in coordinator.pipeline and copytrade.executor.
+Expected: lock1 is lock2. Keyed strictly on market_id without direction suffix.
+PASS: Identical lock instance returned.
+FAIL: Separate locks or direction-suffixed keys.
+
+LAYER 6 CONFIRMED when: All criteria show PASS (All 220 tests passing in test suite)
 
 ---
 
