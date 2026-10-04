@@ -13,15 +13,16 @@ Every function that calls an LLM API must:
 No exceptions to this rule. A function without a timeout
 wrapper is not complete. It is broken.
 
-## RULE 2 — Qwen3-235B-A22B calls have hard parameter limits
+## RULE 2 — Trade Decision calls have hard parameter limits
 
-Every call to Qwen3-235B-A22B must include:
-  max_tokens: 900
-  thinking_budget: 600
+Every call to Trade Decision Agent must include:
+  max_tokens: 300
+  thinking: {"type": "disabled"} (or enable_thinking=False)
+  Structured 3-step reasoning format in JSON
 
 These are not suggestions. They are hard limits that
-prevent latency blowout on complex prompts. Never omit
-them. Never increase them.
+prevent latency blowout and keep monthly token burn <= $0.75/month.
+Never omit them. Never increase them.
 
 ## RULE 3 — agent_memory lessons prepended before every call
 
@@ -40,16 +41,16 @@ If the Supabase query times out (2 second limit):
 ## RULE 4 — Provider routing
 
 Trade Decision Agent:
-  Primary:  SiliconFlow (Qwen3-235B-A22B)
-  Fallback: OpenRouter (at exactly 18 seconds)
+  Primary:  TokenRouter (deepseek/deepseek-v4.1-flash)
+  Fallback: OpenRouter (qwen/qwen3.5-flash at exactly 18 seconds)
 
 News Analyst:
-  Primary:  OpenRouter (Qwen3-32B)
-  Fallback: None — signal dropped on timeout, not critical
+  Primary:  TokenRouter (typesafe/jev-1.13)
+  Fallback: OpenRouter (qwen/qwen3.5-flash, enable_thinking=False, max 200 tokens)
 
 Contract Parser:
-  Primary:  OpenRouter (DeepSeek V3)
-  Fallback: None — not in hot path, retry acceptable
+  Primary:  TokenRouter (qwen/qwen3.8-flash)
+  Fallback: OpenRouter (deepseek/deepseek-chat, cached 24h in Supabase)
 
 ## RULE 5 — No risk logic lives in this folder
 

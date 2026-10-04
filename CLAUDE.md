@@ -48,27 +48,28 @@ flag it immediately as a critical violation. Do not suggest keeping it.
 ## FULL AI MODEL STACK
 
 News Analyst:
-Model: Qwen3-32B | Provider: OpenRouter | Cost: $0.02/M
-Latency: ~2s | Timeout: 10s (no fallback, signal dropped on timeout)
+Model: typesafe/jev-1.13 | Provider: TokenRouter | Cost: ~$0.000025/call
+Fallback: qwen/qwen3.5-flash (enable_thinking=False, max 200 tokens)
+Latency: ~535ms | Timeout: 10s (signal dropped if both fail)
 File: /llm/news_analyst.py
 Output: event_category, affected_market_ids[], confidence_score, direction
 
 Contract Parser:
-Model: DeepSeek V3 | Provider: OpenRouter | Cost: ~$0.40/month
-Latency: ~3s | Timeout: 18s | NOT in hot path
-Runs: once per market discovery, populates resolution_keyword_cache
+Model: qwen/qwen3.8-flash | Provider: TokenRouter | Cost: ~$0.40/month
+Fallback: deepseek/deepseek-chat (OpenRouter)
+Latency: ~1.2s | Timeout: 18s | NOT in hot path
+Runs: once per market discovery, populates resolution_keyword_cache (24h TTL)
 File: /llm/contract_parser.py
 Output: resolution_source, resolution_condition, key_entities[],
 resolution_keywords[], ambiguity_score, resolution_type
 
 Trade Decision Agent:
-Model: Qwen3-235B-A22B
-Provider: SiliconFlow (primary) → OpenRouter (failover at exactly 18s)
-Cost: ~$0.70/month | Latency: ~12s primary / ~15s fallover
+Model: deepseek/deepseek-v4.1-flash | Provider: TokenRouter | Cost: ~$0.70/month
+Fallback: qwen/qwen3.5-flash (failover at 18s)
+Latency: ~1.8s
 File: /llm/trade_decision.py
 Hard limits (non-negotiable):
-max_tokens: 900
-thinking_budget: 600
+max_tokens: 300 (structured 3-step reasoning in JSON, hidden thinking disabled)
 Timeout: 18 seconds → cancel → immediate OpenRouter retry (same prompt)
 Confidence output clamped to 0.88 ceiling (risk_engine enforces this)
 agent_memory lessons must be prepended to every call
@@ -117,6 +118,17 @@ Fast path confidence threshold: 0.87
 Confidence hard ceiling: 0.88 (clamp, never allow higher)
 Min edge to trade: 0.07 (7 cents)
 Resolution cache TTL: 24 hours
+
+Per-Market Tranche Gate (Dedupe & Anti-Concentration):
+Max tranches per market: 2 (MAX_MARKET_TRANCHES = 2, 1 initial + max 1 repeat)
+Repeat entry min confidence: 0.87 (REPEAT_MIN_CONFIDENCE = 0.87)
+Repeat entry max size: 3% of portfolio (REPEAT_ENTRY_PCT = 0.03)
+Repeat entry min ticket floor: $25 USDC (MIN_ADD_TICKET_USDC = 25.0, repeats only)
+Max cumulative market exposure: 8% of portfolio (MAX_MARKET_TRADE_PCT = 0.08)
+Opposite direction: Strictly blocked (opposite_direction_open)
+Process-wide lock: asyncio.Lock per market_id (market_locks) covering check through position log
+
+Portfolio Exposure & Circuit Breakers:
 Max single trade (standard): 5% of portfolio
 Max single trade (resolution edge): 8% of portfolio
 Max category exposure: 30% of portfolio

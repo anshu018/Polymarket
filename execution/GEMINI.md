@@ -8,13 +8,18 @@ Always. Without exception. On every path. On every retry.
 
 ## EXACT SEQUENCE FOR EVERY ORDER — NO DEVIATIONS
 
+Step 0: Acquire process-wide mutex lock (market_locks[market_id]) and verify
+        market_position_check() (max 2 tranches, repeat requires conf >= 0.87,
+        cumulative market exposure <= 8%, no opposite direction).
 Step 1: Generate UUID at trade decision time
 Step 2: Write UUID to idempotency_log with status='pending'
         BEFORE the Polymarket API call goes out
 Step 3: Submit order to Polymarket CLOB API
 Step 4: On confirmation: update idempotency_log
         status = 'confirmed', confirmed_at = now()
-Step 5: On any retry for any reason:
+Step 5: Write position record to open_positions (or copytrade_log)
+Step 6: Release process-wide mutex lock (market_locks[market_id])
+Step 7: On any retry for any reason:
         Query idempotency_log for this UUID first
         If status = 'confirmed': STOP. Do not resubmit.
         If status = 'pending': resubmit is acceptable.

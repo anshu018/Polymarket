@@ -108,6 +108,14 @@ This prints SET or MISSING without exposing
 the actual value.
 This rule applies permanently. No exceptions.
 
+### RULE 10 — Per-Market Tranche Gate & Concurrency Lock is Mandatory
+- Max 2 tranches per market (MAX_MARKET_TRANCHES = 2). Third entry is strictly forbidden.
+- Repeat entries require confidence >= 0.87 and are capped at 3% portfolio size.
+- Every order path (Fast Path, Full Pipeline, Copy Class A, Copy Class B) must acquire
+  the process-wide lock keyed on market_id and pass market_position_check() before order placement.
+- Lock is held continuously until the open_positions row is written.
+- File: /coordinator/market_state.py and /risk/risk_engine.py
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ## WINDOWS TERMINAL OUTPUT — PERMANENT RULE
 
@@ -195,24 +203,24 @@ in this project.
 ## TECH STACK — EXACT MODELS AND PROVIDERS
 
 News Analyst Agent:
-Model: Qwen3-32B
-Provider: OpenRouter
-Cost: $0.02/M tokens
-Latency: ~2s | Timeout: 10s (no fallback, signal dropped)
+Model: typesafe/jev-1.13 (primary via TokenRouter)
+Fallback: qwen/qwen3.5-flash (enable_thinking=False, max 200 tokens)
+Cost: ~$0.000025/call
+Latency: ~535ms | Timeout: 10s (signal dropped if both fail)
 File: /llm/news_analyst.py
 
 Contract Parser Agent:
-Model: DeepSeek V3
-Provider: OpenRouter
+Model: qwen/qwen3.8-flash (via TokenRouter)
+Fallback: deepseek/deepseek-chat (OpenRouter)
 Cost: ~$0.40/month
-Latency: ~3s | NOT in hot path — runs once per market discovery
+Latency: ~1.2s | NOT in hot path — runs once per market discovery, cached 24h
 File: /llm/contract_parser.py
 
 Trade Decision Agent:
-Model: Qwen3-235B-A22B
-Provider: SiliconFlow (primary) → OpenRouter (fallback at 18s)
-Cost: ~$0.70/month
-Latency: ~12s primary / ~15s fallback
+Model: deepseek/deepseek-v4.1-flash (TokenRouter, max_tokens=300, structured 3-step reasoning)
+Fallback: qwen/qwen3.5-flash (OpenRouter fallback at 18s)
+Cost: ~$0.70/month (hard monthly LLM budget cap: $0.75/month, daily burn <= $0.025/day)
+Latency: ~1.8s
 File: /llm/trade_decision.py
 
 Risk Manager:
@@ -249,12 +257,12 @@ AND category is pre-validated
 AND resolution_keyword_cache hit (cached_at < 24 hours)
 AND event entities match resolution keywords
 Skips: Contract Parser, Trade Decision Agent, LLM Coordinator
-Still runs: risk_engine.py (always), Python coordinator
+Still runs: risk_engine.py (always), Python coordinator, market_locks
 
 Full pipeline (17-20 seconds total):
 All other cases
 Order: News Analyst → Contract Parser → Trade Decision → risk_engine.py
-→ Python coordinator → (LLM coordinator if conflict)
+→ Python coordinator → (LLM coordinator if conflict) → market_locks
 
 ---
 
@@ -265,6 +273,17 @@ Fast path confidence threshold: 0.87
 Confidence hard ceiling: 0.88 (clamp, never exceed)
 Min edge to trade: 0.07 (7 cents)
 Resolution cache TTL: 24 hours
+
+Per-Market Tranche Gate:
+- Max tranches per market: 2 (MAX_MARKET_TRANCHES = 2, 1 initial + max 1 repeat)
+- Repeat entry min confidence: 0.87 (REPEAT_MIN_CONFIDENCE = 0.87)
+- Repeat entry max size: 3% of portfolio (REPEAT_ENTRY_PCT = 0.03)
+- Repeat entry min ticket floor: $25 USDC (MIN_ADD_TICKET_USDC = 25.0, repeats only)
+- Max cumulative market exposure: 8% of portfolio (MAX_MARKET_TRADE_PCT = 0.08)
+- Opposite-direction entry: Strictly blocked (opposite_direction_open)
+- Per-market concurrency lock: Process-wide asyncio.Lock per market_id (market_locks)
+
+Portfolio & Risk Limits:
 Max single trade size: 5% of portfolio
 Max resolution edge trade: 8% of portfolio
 Max category exposure: 30% of portfolio
@@ -278,7 +297,7 @@ Health score defensive mode: < 65 (50% sizing, min confidence 0.90)
 Health score full halt: < 40
 Strategy probation trigger: avg edge < 4 cents over 20 trades
 Supabase read timeout: 2 seconds
-SiliconFlow timeout: 18 seconds → immediate failover
+SiliconFlow/TokenRouter timeout: 18 seconds → immediate failover
 
 ---
 

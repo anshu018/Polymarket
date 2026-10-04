@@ -261,6 +261,10 @@ source of truth.
   API call, for both classes, exactly as the audit confirmed already happens.
 - **Risk engine**: unchanged — every sized trade, from both classes, passes through
   `risk_engine.py`'s existing exposure/drawdown/liquidity checks. No bypass.
+- **Per-Market Tranche Gate & Concurrency Lock**: All copy-trade orders (Class A and Class B)
+  acquire the process-wide market_locks[market_id] and evaluate market_position_check(...)
+  before submitting orders or logging simulated paper fills. Repeat copy trades require >= 0.87
+  confidence, maximum 2 tranches per market, and cumulative single-market exposure <= 8%.
 - **Paper trading fix (required, not optional):** the audit found that in paper mode, Class A
   currently **no-ops silently** — it doesn't log a simulated fill anywhere. This must be fixed before
   Copy Trade can ever be evaluated: paper mode must write a simulated fill to `open_positions` /
