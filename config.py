@@ -93,6 +93,11 @@ MAX_SINGLE_TRADE_PCT = 0.05
 MAX_RESOLUTION_TRADE_PCT = 0.08
 MAX_CATEGORY_EXPOSURE_PCT = 0.30
 MAX_CORRELATED_EXPOSURE_PCT = 0.20
+MAX_MARKET_TRADE_PCT = 0.08        # ceiling on cumulative (market_id, direction) exposure
+REPEAT_ENTRY_PCT = 0.03            # max size of a 2nd entry = 3% of TOTAL PORTFOLIO
+REPEAT_MIN_CONFIDENCE = 0.87       # min confidence for a 2nd entry (ceiling is 0.88)
+MAX_MARKET_TRANCHES = 2            # 1st entry + 1 repeat. 3rd always blocked.
+MIN_ADD_TICKET_USDC = 25.0         # floor for REPEAT attempts only — never for 1st entries
 MIN_MARKET_LIQUIDITY_USDC = 5000
 AUTO_EXIT_LIQUIDITY_FLOOR_USDC = 3000
 DAILY_DRAWDOWN_HALT_PCT = 0.08

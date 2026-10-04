@@ -19,6 +19,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
+import config
 from risk.risk_engine import (
     kelly_size,
     position_size_check,
@@ -29,6 +30,7 @@ from risk.risk_engine import (
     check_edge,
     check_category_exposure,
     check_correlation_exposure,
+    market_position_check,
     compute_health_score,
     interpret_health_score,
     check_cash_reserve,
@@ -398,6 +400,112 @@ class TestCheckCorrelationExposure:
         """Boundary: 100% correlated exposure → BLOCK."""
         result = check_correlation_exposure(1.0)
         assert result == "BLOCK"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# market_position_check
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestMarketPositionCheck:
+    """Cumulative per-(market_id, direction) exposure with a one-repeat allowance."""
+
+    def test_first_entry_gets_full_single_trade_cap(self) -> None:
+        """No existing exposure → normal sizing passes through untouched."""
+        assert market_position_check(
+            existing_market_usdc=0.0, existing_tranches=0,
+            proposed_size=500.0, portfolio_value=10_000.0, confidence=0.88,
+        ) == 500.0
+
+    def test_small_first_entry_is_not_floored(self) -> None:
+        """$10 first entry (Class A ceiling) must be permitted.
+
+        MIN_ADD_TICKET_USDC must not apply to first entries — a $25 floor here
+        would block every Class A copy-trade.
+        """
+        assert market_position_check(
+            existing_market_usdc=0.0, existing_tranches=0,
+            proposed_size=10.0, portfolio_value=10_000.0, confidence=0.88,
+        ) == 10.0
+
+    def test_third_entry_is_blocked(self) -> None:
+        """Two tranches exist → the third never opens, at any confidence."""
+        assert market_position_check(
+            existing_market_usdc=800.0, existing_tranches=2,
+            proposed_size=500.0, portfolio_value=10_000.0, confidence=0.88,
+        ) == 0.0
+
+    def test_repeat_allowed_at_high_confidence_capped_at_3pct_of_portfolio(self) -> None:
+        """One tranche at max confidence → repeat capped at 3% of PORTFOLIO ($300).
+
+        Pins that 3% means 3% of the book, not 3% of the first trade ($15).
+        """
+        assert market_position_check(
+            existing_market_usdc=500.0, existing_tranches=1,
+            proposed_size=500.0, portfolio_value=10_000.0, confidence=0.88,
+        ) == 300.0
+
+    def test_repeat_blocked_below_confidence_gate(self) -> None:
+        """0.86 is below the 0.87 gate → repeat blocked."""
+        assert market_position_check(
+            existing_market_usdc=500.0, existing_tranches=1,
+            proposed_size=500.0, portfolio_value=10_000.0, confidence=0.86,
+        ) == 0.0
+
+    def test_repeat_allowed_exactly_at_confidence_gate(self) -> None:
+        """0.87 exactly → ALLOW. Pins the boundary as a number."""
+        assert market_position_check(
+            existing_market_usdc=500.0, existing_tranches=1,
+            proposed_size=500.0, portfolio_value=10_000.0, confidence=0.87,
+        ) == 300.0
+
+    def test_nan_confidence_fails_closed(self) -> None:
+        """NaN must block, not allow. `nan < 0.87` is False, so the comparison
+        must be written `not (confidence >= threshold)`."""
+        assert market_position_check(
+            existing_market_usdc=500.0, existing_tranches=1,
+            proposed_size=500.0, portfolio_value=10_000.0, confidence=float("nan"),
+        ) == 0.0
+
+    def test_repeat_gap_is_unreachable_documented(self) -> None:
+        """Documents WHY the gate is 0.87 and not the requested 0.90."""
+        assert config.CONFIDENCE_CEILING < 0.90, (
+            "Confidence ceiling raised. The owner's original 0.90 request is now "
+            "reachable — revisit REPEAT_MIN_CONFIDENCE."
+        )
+
+    def test_resolution_first_entry_at_ceiling_is_not_an_error(self) -> None:
+        """A resolution-strategy first entry is 8%, which equals the ceiling.
+
+        existing >= ceiling is true here on a perfectly normal position. It must
+        block the ADD without logging an alarming 'gate bug' warning, and the
+        caller must treat this as a normal full-cap outcome.
+        """
+        assert market_position_check(
+            existing_market_usdc=800.0, existing_tranches=1,
+            proposed_size=100.0, portfolio_value=10_000.0, confidence=0.88,
+        ) == 0.0
+
+    def test_dust_repeat_is_blocked(self) -> None:
+        """$790 existing leaves $10 against the $800 ceiling — below the $25 floor."""
+        assert market_position_check(
+            existing_market_usdc=790.0, existing_tranches=1,
+            proposed_size=500.0, portfolio_value=10_000.0, confidence=0.88,
+        ) == 0.0
+
+    def test_headroom_just_above_floor_allowed(self) -> None:
+        """$770 existing leaves $30, above the $25 floor → permitted."""
+        assert market_position_check(
+            existing_market_usdc=770.0, existing_tranches=1,
+            proposed_size=500.0, portfolio_value=10_000.0, confidence=0.88,
+        ) == 30.0
+
+    def test_scales_with_portfolio(self) -> None:
+        """$50k book: ceiling $4000, repeat $1500, single trade $2500."""
+        assert market_position_check(
+            existing_market_usdc=0.0, existing_tranches=0,
+            proposed_size=2500.0, portfolio_value=50_000.0, confidence=0.88,
+        ) == 2500.0
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
