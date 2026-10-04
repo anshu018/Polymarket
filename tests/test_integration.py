@@ -765,11 +765,12 @@ async def test_6_9_memory_timeout_proceeds_memoryless(
     # Full pipeline
     mock_llm_apis["news_analyst_confidence"] = 0.80
     
-    # Jev handles news (no _log_to_supabase), so Supabase call sequence shifts by -1:
-    # Call 1: _check_cache in contract_parser (no hit)
-    # Call 2: _write_cache in contract_parser (succeeds)
-    # Call 3: fetch_relevant_lessons (times out!)
-    mock_supabase_client.timeout_on_calls = {3}
+    # Supabase call sequence with market tranche pre-check:
+    # Call 1: load_market_state pre-check (succeeds)
+    # Call 2: _check_cache in contract_parser (no hit)
+    # Call 3: _write_cache in contract_parser (succeeds)
+    # Call 4: fetch_relevant_lessons (times out!)
+    mock_supabase_client.timeout_on_calls = {4}
 
     res = await run_pipeline(
         headline="Donald Trump impeachment",
@@ -798,13 +799,15 @@ async def test_6_9_idempotency_timeout_fails_closed(
     # Full pipeline
     mock_llm_apis["news_analyst_confidence"] = 0.80
     
-    # Jev handles news (no _log_to_supabase), so Supabase call sequence shifts by -1:
-    # Call 1: _check_cache (no hit)
-    # Call 2: _write_cache (succeeds)
-    # Call 3: fetch_relevant_lessons (succeeds)
-    # Call 4: fetch_open_positions_exposure (succeeds)
-    # Call 5: check_pre_order_idempotency (times out!)
-    mock_supabase_client.timeout_on_calls = {5}
+    # Supabase call sequence with market tranche checks:
+    # Call 1: load_market_state pre-check (succeeds)
+    # Call 2: _check_cache (no hit)
+    # Call 3: _write_cache (succeeds)
+    # Call 4: fetch_relevant_lessons (succeeds)
+    # Call 5: fetch_open_positions_exposure (succeeds)
+    # Call 6: load_market_state inside market_lock (succeeds)
+    # Call 7: check_pre_order_idempotency (times out!)
+    mock_supabase_client.timeout_on_calls = {7}
 
     with pytest.raises(RuntimeError, match="Trading halted due to idempotency (check|write) timeout"):
         await run_pipeline(

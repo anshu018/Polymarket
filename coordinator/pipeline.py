@@ -30,6 +30,7 @@ from monitoring.telegram_alerts import (
     alert_circuit_breaker,
     alert_reconciliation_failure,
 )
+from coordinator.market_state import load_market_state, get_market_lock
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,12 @@ _drop_counters: dict[str, int] = {
     "risk_gate:max_correlated_exposure": 0,
     "risk_gate:cash_reserve": 0,
     "risk_gate:deadline_risk": 0,
+    "risk_gate:max_market_tranches": 0,
+    "risk_gate:opposite_direction": 0,
+    "risk_gate:low_confidence_add": 0,
+    "risk_gate:exposure_unavailable": 0,
+    "risk_gate:portfolio_capacity": 0,
+    "risk_gate:max_market_exposure": 0,
 }
 
 def _increment_drop(reason: str) -> None:
@@ -606,6 +613,24 @@ async def run_pipeline(
     else:
         # Full Pipeline: Contract Parser -> Trade Decision -> risk_engine -> Python Coordinator -> LLM Coordinator
         logger.info(f"[PIPELINE] FULL PIPELINE ROUTE selected for market {market_id}.")
+
+        # Cheap pre-check before expensive Contract Parser / Trade Decision LLM calls
+        pre_state = await load_market_state(market_id, news_output.direction)
+        if pre_state is not None:
+            if pre_state.opposite_direction_open:
+                logger.info(
+                    "[PIPELINE][PRECHECK] Opposite direction already open for market %s | conf=%.4f dir=%s — dropping before LLM",
+                    market_id, news_output.confidence_score, news_output.direction,
+                )
+                _increment_drop("risk_gate:opposite_direction")
+                return {"status": "blocked", "reason": "opposite_direction_open"}
+            if pre_state.tranches >= config.MAX_MARKET_TRANCHES:
+                logger.info(
+                    "[PIPELINE][PRECHECK] Market %s reached max tranches (%d >= %d) | conf=%.4f dir=%s — dropping before LLM",
+                    market_id, pre_state.tranches, config.MAX_MARKET_TRANCHES, news_output.confidence_score, news_output.direction,
+                )
+                _increment_drop("risk_gate:max_market_tranches")
+                return {"status": "blocked", "reason": "max_tranches_reached"}
         
         # If we discovered the market dynamically, fetch metadata
         if matching_markets:
@@ -769,16 +794,22 @@ async def run_pipeline(
     proposed_pct = final_trade_size / portfolio_value
 
     if risk_engine.check_category_exposure(cat_exp, proposed_pct) == "BLOCK":
-        logger.warning(f"[PIPELINE] Risk check: category exposure would exceed 30% cap. Blocking.")
+        logger.warning(
+            f"[PIPELINE] Risk check: category exposure would exceed 30%% cap | conf={clamped_conf:.4f} size=${final_trade_size:.2f}. Blocking."
+        )
         _increment_drop("risk_gate:max_category_exposure")
+        _increment_drop("risk_gate:portfolio_capacity")
         logger.info(f"[PIPELINE][DROP:risk_gate:max_category_exposure] market_id={market_id}")
-        return {"status": "blocked", "reason": "max_category_exposure"}
+        return {"status": "blocked", "reason": "portfolio_capacity_full"}
 
     if risk_engine.check_correlation_exposure(corr_exp + proposed_pct) == "BLOCK":
-        logger.warning(f"[PIPELINE] Risk check: correlated exposure would exceed 20% cap. Blocking.")
+        logger.warning(
+            f"[PIPELINE] Risk check: correlated exposure would exceed 20%% cap | conf={clamped_conf:.4f} size=${final_trade_size:.2f}. Blocking."
+        )
         _increment_drop("risk_gate:max_correlated_exposure")
+        _increment_drop("risk_gate:portfolio_capacity")
         logger.info(f"[PIPELINE][DROP:risk_gate:max_correlated_exposure] market_id={market_id}")
-        return {"status": "blocked", "reason": "max_correlated_exposure"}
+        return {"status": "blocked", "reason": "portfolio_capacity_full"}
 
     # Cash reserve gate
     if config.PAPER_TRADING:
@@ -820,50 +851,118 @@ async def run_pipeline(
         return {"status": "blocked", "reason": "deadline_risk"}
 
     # All risk gates PASSED!
-    logger.info(f"[PIPELINE] All risk gates passed! Size approved: ${final_trade_size:.2f} USDC.")
+    logger.info(f"[PIPELINE] Initial risk gates passed! Checking per-market tranche gate...")
 
-    # 6. IDEMPOTENT ORDER EXECUTION (Rule 2)
-    # Step A: Generate unique UUID at trade decision time
-    order_uuid = str(uuid.uuid4())
-    logger.info(f"[PIPELINE] Pre-order idempotency UUID generated: {order_uuid}")
+    # ── Per-Market Tranche Gate & Concurrency Lock ──────────────────────────
+    market_lock = get_market_lock(market_id)
+    async with market_lock:
+        state = await load_market_state(market_id, decision_direction)
+        if state is None:
+            logger.warning("[PIPELINE] Could not load market state for market %s — fail closed", market_id)
+            _increment_drop("risk_gate:exposure_unavailable")
+            return {"status": "blocked", "reason": "exposure_unavailable"}
 
-    # Step B: Check Supabase idempotency table first (2s timeout, halts on failure)
-    existing_log = await check_pre_order_idempotency(order_uuid)
-    if existing_log and existing_log.get("status") == "confirmed":
-        logger.critical(f"[PIPELINE] UUID {order_uuid} already confirmed! Blocking submission.")
-        asyncio.create_task(
-            alert_idempotency_duplicate(order_uuid, market_id, decision_direction)
+        if state.opposite_direction_open:
+            logger.warning("[PIPELINE] Opposite direction already open for market %s — BLOCK", market_id)
+            _increment_drop("risk_gate:opposite_direction")
+            return {"status": "blocked", "reason": "opposite_direction_open"}
+
+        if state.tranches >= config.MAX_MARKET_TRANCHES:
+            logger.warning(
+                "[PIPELINE] Market %s reached max tranches (%d >= %d) — BLOCK",
+                market_id, state.tranches, config.MAX_MARKET_TRANCHES,
+            )
+            _increment_drop("risk_gate:max_market_tranches")
+            return {"status": "blocked", "reason": "max_tranches_reached"}
+
+        permitted_size = risk_engine.market_position_check(
+            existing_market_usdc=state.existing_usdc,
+            existing_tranches=state.tranches,
+            proposed_size=final_trade_size,
+            portfolio_value=portfolio_value,
+            confidence=clamped_conf,
         )
-        return {"status": "blocked", "reason": "duplicate_idempotency_uuid"}
 
-    # Step C: Write UUID to log as pending BEFORE hitting the Polymarket L2 API (2s timeout, halts on failure)
-    await insert_idempotency_log(order_uuid, market_id, decision_direction, final_trade_size)
+        if permitted_size <= 0.0:
+            if state.tranches == 1 and not (clamped_conf >= config.REPEAT_MIN_CONFIDENCE):
+                reason = "low_confidence_for_add"
+                _increment_drop("risk_gate:low_confidence_add")
+            elif state.tranches >= config.MAX_MARKET_TRANCHES:
+                reason = "max_tranches_reached"
+                _increment_drop("risk_gate:max_market_tranches")
+            else:
+                reason = "max_market_exposure"
+                _increment_drop("risk_gate:max_market_exposure")
+            logger.warning(
+                "[PIPELINE] market_position_check blocked trade on market %s | reason=%s tranches=%d existing=$%.2f conf=%.4f size=$%.2f",
+                market_id, reason, state.tranches, state.existing_usdc, clamped_conf, final_trade_size,
+            )
+            return {"status": "blocked", "reason": reason}
 
-    # Step D: Submit order to Polymarket CLOB (Mocked for safety during Layer 6 Integration)
-    logger.info(f"[PIPELINE] Submitting {decision_direction} order of ${final_trade_size:.2f} to Polymarket CLOB...")
-    
-    # Simulate blockchain/network latency
-    await asyncio.sleep(1.0)
-    mock_order_id = f"mock-order-{int(time.time())}"
-    logger.info(f"[PIPELINE] Polymarket CLOB order placed successfully. Order ID: {mock_order_id}")
+        # Telemetry: Log raw Kelly vs capped size, and repeat entry intervals/price delta
+        if state.tranches >= 1:
+            time_gap = -1.0
+            if state.last_opened_at:
+                try:
+                    dt = datetime.fromisoformat(state.last_opened_at.replace("Z", "+00:00"))
+                    time_gap = (datetime.now(timezone.utc) - dt).total_seconds()
+                except Exception:
+                    pass
+            price_delta = abs(market_price - state.last_entry_price) if state.last_entry_price is not None else 0.0
+            logger.info(
+                "[OBSERVABILITY][REPEAT_ENTRY] market=%s dir=%s time_gap=%.1fs price_delta=%.4f raw_kelly=$%.2f capped_size=$%.2f",
+                market_id, decision_direction, time_gap, price_delta, raw_size, permitted_size,
+            )
+        else:
+            logger.info(
+                "[OBSERVABILITY][FIRST_ENTRY] market=%s dir=%s raw_kelly=$%.2f capped_size=$%.2f",
+                market_id, decision_direction, raw_size, permitted_size,
+            )
 
-    # Step E: Confirm idempotency record in DB
-    await confirm_idempotency_log(order_uuid, mock_order_id)
+        final_trade_size = permitted_size
 
-    # Step F: Write newly opened position to the open_positions table
-    await log_to_open_positions(
-        market_id=market_id,
-        market_question=market_question,
-        direction=decision_direction,
-        entry_price=market_price,
-        size_usdc=final_trade_size,
-        strategy=strategy_for_check,
-        agent_estimate=estimated_probability,
-        confidence=clamped_conf,
-        kelly_fraction=kelly_fraction,
-        category=category,
-        idempotency_uuid=order_uuid
-    )
+        # 6. IDEMPOTENT ORDER EXECUTION (Rule 2)
+        # Step A: Generate unique UUID at trade decision time
+        order_uuid = str(uuid.uuid4())
+        logger.info(f"[PIPELINE] Pre-order idempotency UUID generated: {order_uuid}")
+
+        # Step B: Check Supabase idempotency table first (2s timeout, halts on failure)
+        existing_log = await check_pre_order_idempotency(order_uuid)
+        if existing_log and existing_log.get("status") == "confirmed":
+            logger.critical(f"[PIPELINE] UUID {order_uuid} already confirmed! Blocking submission.")
+            asyncio.create_task(
+                alert_idempotency_duplicate(order_uuid, market_id, decision_direction)
+            )
+            return {"status": "blocked", "reason": "duplicate_idempotency_uuid"}
+
+        # Step C: Write UUID to log as pending BEFORE hitting the Polymarket L2 API (2s timeout, halts on failure)
+        await insert_idempotency_log(order_uuid, market_id, decision_direction, final_trade_size)
+
+        # Step D: Submit order to Polymarket CLOB (Mocked for safety during Layer 6 Integration)
+        logger.info(f"[PIPELINE] Submitting {decision_direction} order of ${final_trade_size:.2f} to Polymarket CLOB...")
+        
+        # Simulate blockchain/network latency
+        await asyncio.sleep(1.0)
+        mock_order_id = f"mock-order-{int(time.time())}"
+        logger.info(f"[PIPELINE] Polymarket CLOB order placed successfully. Order ID: {mock_order_id}")
+
+        # Step E: Confirm idempotency record in DB
+        await confirm_idempotency_log(order_uuid, mock_order_id)
+
+        # Step F: Write newly opened position to the open_positions table
+        await log_to_open_positions(
+            market_id=market_id,
+            market_question=market_question,
+            direction=decision_direction,
+            entry_price=market_price,
+            size_usdc=final_trade_size,
+            strategy=strategy_for_check,
+            agent_estimate=estimated_probability,
+            confidence=clamped_conf,
+            kelly_fraction=kelly_fraction,
+            category=category,
+            idempotency_uuid=order_uuid
+        )
 
     # Log to copytrade_log for trust scoring and audit trail (Class B)
     if strategy_override == "copy_edge_class_b" and wallet_address:

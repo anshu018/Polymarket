@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict
 
 import config
-from memory.supabase_client import get_client
+from memory import supabase_client
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ async def load_market_state(market_id: str, direction: str) -> Optional[MarketSt
     opp_dir = "NO" if target_dir == "YES" else "YES"
 
     try:
-        client = await get_client()
+        client = await supabase_client.get_client()
 
         def _query():
             return (

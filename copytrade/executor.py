@@ -41,6 +41,7 @@ import config
 from memory.supabase_client import get_client
 from risk import risk_engine
 from monitoring.telegram_alerts import alert_circuit_breaker, alert_supabase_degradation
+from coordinator.market_state import load_market_state, get_market_lock
 from copytrade.performance_tracker import (
     log_copy_trade as _tracker_log_trade,
     get_trust_score,
@@ -309,66 +310,97 @@ async def _execute_class_a(signal: dict) -> None:
         logger.warning("[COPY_EXECUTOR][CLASS_A][DROP:correlated_exposure] market=%s", market_id[:12])
         return
 
-    # ── Limit order pricing ───────────────────────────────────────────────────
-    limit_price = round(tracker_price + config.COPY_LIMIT_PRICE_BUFFER, 4)
+    # ── Risk Gate 4: Per-market tranche gate & concurrency lock ───────────────
+    market_lock = get_market_lock(market_id)
+    async with market_lock:
+        state = await load_market_state(market_id, direction)
+        if state is None:
+            logger.warning("[COPY_EXECUTOR][CLASS_A][DROP:exposure_unavailable] market=%s", market_id[:12])
+            return
+        if state.opposite_direction_open:
+            logger.warning("[COPY_EXECUTOR][CLASS_A][DROP:opposite_direction] market=%s", market_id[:12])
+            return
+        if state.tranches >= config.MAX_MARKET_TRANCHES:
+            logger.warning("[COPY_EXECUTOR][CLASS_A][DROP:max_market_tranches] market=%s", market_id[:12])
+            return
 
-    # ── Idempotency ───────────────────────────────────────────────────────────
-    order_uuid = str(uuid.uuid4())
-    existing = await _check_idempotency(order_uuid)
-    if existing and existing.get("status") == "confirmed":
-        logger.critical(
-            "[COPY_EXECUTOR][CLASS_A] UUID %s already confirmed — blocking duplicate", order_uuid
+        class_a_conf = float(signal.get("confidence") or trust_score)
+        permitted = risk_engine.market_position_check(
+            existing_market_usdc=state.existing_usdc,
+            existing_tranches=state.tranches,
+            proposed_size=final_size,
+            portfolio_value=portfolio_value,
+            confidence=class_a_conf,
         )
-        return
+        if permitted <= 0.0:
+            logger.warning(
+                "[COPY_EXECUTOR][CLASS_A][DROP:tranche_gate] market=%s tranches=%d existing=$%.2f conf=%.4f size=$%.2f",
+                market_id[:12], state.tranches, state.existing_usdc, class_a_conf, final_size,
+            )
+            return
 
-    await _write_idempotency_pending(order_uuid, market_id, direction, final_size)
+        final_size = permitted
 
-    # ── Order submission ──────────────────────────────────────────────────────
-    if config.PAPER_TRADING:
-        # PAPER MODE FIX (CopyTrade.md §8): simulate fill — no silent no-op.
-        # This makes Class A trades visible to the Brier score and paper gate.
-        mock_order_id = f"copy_a_paper_{int(time.time())}"
-        logger.info(
-            "[COPY_EXECUTOR][CLASS_A][PAPER] Simulated LIMIT %s $%.2f @ %.4f | "
-            "trust=%.3f state=%s order=%s",
-            direction, final_size, limit_price,
-            trust_score, wallet_state, mock_order_id,
+        # ── Limit order pricing ───────────────────────────────────────────────────
+        limit_price = round(tracker_price + config.COPY_LIMIT_PRICE_BUFFER, 4)
+
+        # ── Idempotency ───────────────────────────────────────────────────────────
+        order_uuid = str(uuid.uuid4())
+        existing = await _check_idempotency(order_uuid)
+        if existing and existing.get("status") == "confirmed":
+            logger.critical(
+                "[COPY_EXECUTOR][CLASS_A] UUID %s already confirmed — blocking duplicate", order_uuid
+            )
+            return
+
+        await _write_idempotency_pending(order_uuid, market_id, direction, final_size)
+
+        # ── Order submission ──────────────────────────────────────────────────────
+        if config.PAPER_TRADING:
+            # PAPER MODE FIX (CopyTrade.md §8): simulate fill — no silent no-op.
+            # This makes Class A trades visible to the Brier score and paper gate.
+            mock_order_id = f"copy_a_paper_{int(time.time())}"
+            logger.info(
+                "[COPY_EXECUTOR][CLASS_A][PAPER] Simulated LIMIT %s $%.2f @ %.4f | "
+                "trust=%.3f state=%s order=%s",
+                direction, final_size, limit_price,
+                trust_score, wallet_state, mock_order_id,
+            )
+            order_id = mock_order_id
+        else:
+            # TODO: Real CLOB limit order via execution.polymarket_auth (Phase 3 gate).
+            logger.warning(
+                "[COPY_EXECUTOR][CLASS_A] Live order submission not yet wired. "
+                "Set PAPER_TRADING=true until Phase 3 integration is complete."
+            )
+            order_id = f"copy_a_noop_{int(time.time())}"
+
+        # ── Confirm idempotency and log position ──────────────────────────────────
+        await _confirm_idempotency(order_uuid, order_id)
+        # Always log to open_positions (both paper and live) — CopyTrade.md §8 fix
+        await _log_open_position(
+            market_id=market_id,
+            direction=direction,
+            entry_price=limit_price,
+            size_usdc=final_size,
+            class_type="A",
+            trader_name=trader_name,
+            idempotency_uuid=order_uuid,
         )
-        order_id = mock_order_id
-    else:
-        # TODO: Real CLOB limit order via execution.polymarket_auth (Phase 3 gate).
-        logger.warning(
-            "[COPY_EXECUTOR][CLASS_A] Live order submission not yet wired. "
-            "Set PAPER_TRADING=true until Phase 3 integration is complete."
+
+        # Log to copytrade_log for trust score tracking and priority audit trail
+        await _tracker_log_trade(
+            wallet_address=wallet_address,
+            trader_name=trader_name,
+            market_id=market_id,
+            direction=direction,
+            class_type="A",
+            entry_price=limit_price,
+            size_usdc=final_size,
+            slippage=signal.get("slippage", 0.0),
+            idempotency_uuid=order_uuid,
+            was_priority_pick=was_priority_pick,
         )
-        order_id = f"copy_a_noop_{int(time.time())}"
-
-    # ── Confirm idempotency and log position ──────────────────────────────────
-    await _confirm_idempotency(order_uuid, order_id)
-    # Always log to open_positions (both paper and live) — CopyTrade.md §8 fix
-    await _log_open_position(
-        market_id=market_id,
-        direction=direction,
-        entry_price=limit_price,
-        size_usdc=final_size,
-        class_type="A",
-        trader_name=trader_name,
-        idempotency_uuid=order_uuid,
-    )
-
-    # Log to copytrade_log for trust score tracking and priority audit trail
-    await _tracker_log_trade(
-        wallet_address=wallet_address,
-        trader_name=trader_name,
-        market_id=market_id,
-        direction=direction,
-        class_type="A",
-        entry_price=limit_price,
-        size_usdc=final_size,
-        slippage=signal.get("slippage", 0.0),
-        idempotency_uuid=order_uuid,
-        was_priority_pick=was_priority_pick,
-    )
 
     elapsed_ms = (time.monotonic() - start_ts) * 1000
     logger.info(
@@ -407,6 +439,17 @@ async def _execute_class_b(signal: dict, session: aiohttp.ClientSession) -> None
     outcome: str = signal.get("outcome", "Yes")
     trader_name: str = signal.get("trader_name", "unknown")
     live_ask: float = signal["live_ask"]
+
+    # Pre-check before expensive metadata fetch and coordinator pipeline
+    direction = "YES" if outcome.upper() in ("YES", "Y") else "NO"
+    pre_state = await load_market_state(market_id, direction)
+    if pre_state is not None:
+        if pre_state.opposite_direction_open:
+            logger.info("[COPY_EXECUTOR][CLASS_B][PRECHECK] Opposite direction already open | market=%s", market_id[:12])
+            return
+        if pre_state.tranches >= config.MAX_MARKET_TRANCHES:
+            logger.info("[COPY_EXECUTOR][CLASS_B][PRECHECK] Max tranches reached (%d >= %d) | market=%s", pre_state.tranches, config.MAX_MARKET_TRANCHES, market_id[:12])
+            return
 
     # Fetch market question for coordinator context
     market_question = await _fetch_market_question(session, market_id)
