@@ -55,14 +55,14 @@ Required schema:
 {
   "direction": "YES|NO|ABSTAIN",
   "confidence_score": 0.0,
-  "reasoning": "max 50 words"
+  "reasoning": "Step 1: Event/timing check. Step 2: Edge vs price. Step 3: Conclusion."
 }
 Rules:
 - direction YES: execute YES trade
 - direction NO: execute NO trade
 - direction ABSTAIN: do not execute trade
 - confidence_score: 0.0 to 0.88 maximum. Clamped at 0.88 to enforce epistemic humility.
-- reasoning: why this decision is optimal and any key risks.
+- reasoning: concise 3-step evaluation under 50 words: (1) verify event match and resolution date/timing, (2) compare market price against true probability to determine edge, (3) justify final direction.
 - Be extremely conservative. Wrong trades lose capital. Missed trades cost nothing."""
 
 
@@ -188,6 +188,7 @@ async def _execute_llm_call(
         "response_format": {"type": "json_object"},
     }
     if "deepseek" in model.lower():
+        payload["max_tokens"] = getattr(config, "MAX_TOKENS_DEEPSEEK_TRADE", 300)
         payload["thinking"] = {"type": "disabled"}
     elif "qwen" in model.lower():
         payload["enable_thinking"] = False

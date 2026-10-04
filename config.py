@@ -41,7 +41,7 @@ MODEL_COORDINATOR = "qwen/qwen3.5-flash"                      # Primary via Toke
 # LLM HARD LIMITS
 MAX_TOKENS_TRADE_DECISION = 900
 THINKING_BUDGET_TRADE_DECISION = 600          # For Qwen3-235B (coordinator/fallback), NOT DeepSeek
-DEEPSEEK_THINKING_BUDGET_TOKENS = 200         # Constrained thinking budget for DeepSeek (prevents token runaway)
+MAX_TOKENS_DEEPSEEK_TRADE = 300               # Hard cap for DeepSeek trade decision (structured prompt reasoning)
 NEWS_ANALYST_TIMEOUT_SECONDS = 25  # Raised from 15: non-thinking Qwen3 needs ~2-6s; buffer for cold start
 
 # TELEGRAM
