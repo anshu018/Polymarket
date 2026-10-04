@@ -559,6 +559,13 @@ async def run_pipeline(
         logger.warning(f"[PIPELINE][DROP:low_confidence] score={news_output.confidence_score:.3f} threshold={config.MIN_CONFIDENCE_THRESHOLD} headline='{headline[:80]}'")
         return {"status": "blocked", "reason": "low_confidence"}
 
+    # Early discard if News Analyst determined ABSTAIN (prevents downstream Contract Parser & Trade Decision token burn)
+    if news_output.direction == "ABSTAIN":
+        logger.info(f"[PIPELINE] News Analyst direction is ABSTAIN for market {market_id}. Discarding signal early.")
+        _increment_drop("abstain")
+        logger.info(f"[PIPELINE][DROP:abstain] market_id={market_id} confidence={news_output.confidence_score:.3f}")
+        return {"status": "blocked", "reason": "abstain"}
+
     # Update category based on analyst decision
     category = news_output.event_category
 

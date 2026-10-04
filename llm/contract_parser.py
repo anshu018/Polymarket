@@ -222,6 +222,10 @@ async def _execute_parser_call(
         "response_format": {"type": "json_object"},
         "temperature": 0.1,
     }
+    if "deepseek" in model.lower():
+        payload["thinking"] = {"type": "disabled"}
+    elif "qwen" in model.lower():
+        payload["enable_thinking"] = False
 
     headers = {
         "Authorization": f"Bearer {api_key}",

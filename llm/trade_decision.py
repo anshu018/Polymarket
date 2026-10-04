@@ -184,12 +184,11 @@ async def _execute_llm_call(
         "model": model,
         "messages": messages,
         "max_tokens": config.MAX_TOKENS_TRADE_DECISION,
-        "thinking_budget": config.THINKING_BUDGET_TRADE_DECISION,
         "temperature": 0.1,
         "response_format": {"type": "json_object"},
     }
     if "deepseek" in model.lower():
-        payload["thinking"] = {"type": "enabled", "budget_tokens": config.DEEPSEEK_THINKING_BUDGET_TOKENS}
+        payload["thinking"] = {"type": "disabled"}
     elif "qwen" in model.lower():
         payload["enable_thinking"] = False
 

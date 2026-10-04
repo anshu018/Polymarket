@@ -82,6 +82,10 @@ async def _execute_llm_call(
         "temperature": 0.1,
         "response_format": {"type": "json_object"},
     }
+    if "deepseek" in model.lower():
+        payload["thinking"] = {"type": "disabled"}
+    elif "qwen" in model.lower():
+        payload["enable_thinking"] = False
 
     headers = {
         "Authorization": f"Bearer {api_key}",
