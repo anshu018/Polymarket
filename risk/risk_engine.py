@@ -258,6 +258,85 @@ def check_correlation_exposure(
     return "ALLOW"
 
 
+def market_position_check(
+    existing_market_usdc: float,
+    existing_tranches: int,
+    proposed_size: float,
+    portfolio_value: float,
+    confidence: float,
+) -> float:
+    """Bound cumulative exposure on a single (market_id, direction).
+
+    Idempotency only prevents resubmitting the same order UUID; it cannot stop
+    several distinct signals each opening a position on one market. This gate
+    permits a first entry plus exactly one small, high-confidence repeat, and
+    blocks everything after that.
+
+    The opposite-direction check is the caller's responsibility — it needs the
+    direction strings, which this pure function never sees. Tranche count and
+    confidence are enforced here.
+
+    Args:
+        existing_market_usdc: Capital already committed to this market in this
+            direction, summed from open_positions.
+        existing_tranches: Number of open entries on this (market_id, direction).
+        proposed_size: Incoming order size in USDC, already capped by
+            position_size_check for this strategy.
+        portfolio_value: Total portfolio value in USDC.
+        confidence: Confidence for THIS signal, already clamped by
+            apply_confidence_ceiling.
+
+    Returns:
+        Permitted incremental size in USDC. 0.0 means block the order.
+    """
+    # Note: Ceiling is evaluated per (market_id, direction). If the opposite_direction_open
+    # block is ever relaxed, this scope must be revisited.
+    ceiling = portfolio_value * config.MAX_MARKET_TRADE_PCT
+
+    if existing_market_usdc >= ceiling:
+        # Legitimate for a resolution-strategy first entry (8% cap == ceiling).
+        logger.info(
+            "[RISK_ENGINE] Cumulative market exposure %.2f at/over %.2f ceiling — "
+            "no further room on this market",
+            existing_market_usdc, ceiling,
+        )
+        return 0.0
+
+    if existing_tranches >= config.MAX_MARKET_TRANCHES:
+        logger.info(
+            "[RISK_ENGINE] Tranche count %d >= %d — BLOCK",
+            existing_tranches, config.MAX_MARKET_TRANCHES,
+        )
+        return 0.0
+
+    if existing_tranches == 1:
+        # NaN-safe: any non-comparable confidence fails closed.
+        if not (confidence >= config.REPEAT_MIN_CONFIDENCE):
+            logger.info(
+                "[RISK_ENGINE] Repeat blocked: confidence %r below %.4f",
+                confidence, config.REPEAT_MIN_CONFIDENCE,
+            )
+            return 0.0
+        permitted = min(
+            proposed_size,
+            portfolio_value * config.REPEAT_ENTRY_PCT,
+            ceiling - existing_market_usdc,
+        )
+    else:
+        permitted = min(proposed_size, ceiling - existing_market_usdc)
+
+    if existing_tranches >= 1 and permitted < config.MIN_ADD_TICKET_USDC:
+        # Floor applies to REPEAT attempts only. Applying it to a first entry
+        # would block every Class A copy-trade (ceiling is $10).
+        logger.info(
+            "[RISK_ENGINE] Permitted %.2f below %.2f floor — BLOCK",
+            permitted, config.MIN_ADD_TICKET_USDC,
+        )
+        return 0.0
+
+    return permitted
+
+
 def compute_health_score(
     win_rate_score: float,
     brier_score_score: float,
