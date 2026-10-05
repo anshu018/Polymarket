@@ -441,6 +441,13 @@ class TestMarketPositionCheck:
             proposed_size=500.0, portfolio_value=10_000.0, confidence=0.88,
         ) == 0.0
 
+    def test_third_entry_blocked_by_count_alone_below_dollar_ceiling(self) -> None:
+        """Two tranches exist totaling $200 (well below $800 ceiling) -> blocked by count alone."""
+        assert market_position_check(
+            existing_market_usdc=200.0, existing_tranches=2,
+            proposed_size=100.0, portfolio_value=10_000.0, confidence=0.88,
+        ) == 0.0
+
     def test_repeat_allowed_at_high_confidence_capped_at_3pct_of_portfolio(self) -> None:
         """One tranche at max confidence → repeat capped at 3% of PORTFOLIO ($300).
 
