@@ -334,7 +334,7 @@ def market_position_check(
         )
         return 0.0
 
-    return permitted
+    return max(0.0, permitted)
 
 
 def compute_health_score(

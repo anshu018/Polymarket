@@ -427,6 +427,13 @@ class TestMarketPositionCheck:
             proposed_size=10.0, portfolio_value=10_000.0, confidence=0.88,
         ) == 10.0
 
+    def test_negative_proposed_size_first_entry_returns_zero(self) -> None:
+        """First entry with negative proposed_size must return 0.0 (block), not negative."""
+        assert market_position_check(
+            existing_market_usdc=0.0, existing_tranches=0,
+            proposed_size=-50.0, portfolio_value=10_000.0, confidence=0.88,
+        ) == 0.0
+
     def test_third_entry_is_blocked(self) -> None:
         """Two tranches exist → the third never opens, at any confidence."""
         assert market_position_check(
