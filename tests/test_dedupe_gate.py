@@ -807,3 +807,77 @@ async def test_real_blocking_callable_times_out():
 
     assert state is None, "Should fail closed and return None on timeout"
     assert 1.9 <= elapsed <= 2.8, f"Expected timeout near 2.0s, took {elapsed:.2f}s"
+
+
+@pytest.mark.anyio
+async def test_repeat_entry_price_delta_signed(mock_db, caplog):
+    """Test repeat entry telemetry records signed price_delta (positive when price rises, negative when drops)."""
+    import logging
+    caplog.set_level(logging.INFO)
+    market_id = "test-mkt-signed-price-delta"
+
+    async def fake_classify(*args, **kwargs):
+        return NewsAnalystOutput(
+            event_category="politics",
+            direction="YES",
+            confidence_score=0.88,
+            reasoning="Valid",
+        )
+
+    async def fake_parse(*args, **kwargs):
+        return ContractParserOutput(
+            resolution_source="AP",
+            resolution_condition="Condition",
+            key_entities=["Trump"],
+            resolution_keywords=["trump", "win", "president"],
+            ambiguity_score=0.1,
+            resolution_type="binary",
+        )
+
+    async def fake_decide(*args, **kwargs):
+        return TradeDecisionOutput(
+            direction="YES",
+            confidence_score=0.88,
+            reasoning="Edge",
+        ), False
+
+    with patch("coordinator.pipeline.classify_signal", fake_classify), \
+         patch("coordinator.pipeline.parse_contract", fake_parse), \
+         patch("coordinator.pipeline.decide_trade", fake_decide), \
+         patch("asyncio.sleep", AsyncMock()):
+
+        # 1st entry at price 0.50
+        await run_pipeline(
+            headline="Initial entry", source="AP", market_id=market_id,
+            market_question="Will Trump win?", market_price=0.50, portfolio_value=10_000.0,
+            starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+            current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+        )
+
+        # 2nd entry at lower price 0.45 -> price_delta should be 0.45 - 0.50 = -0.0500
+        await run_pipeline(
+            headline="Repeat entry lower", source="AP", market_id=market_id,
+            market_question="Will Trump win?", market_price=0.45, portfolio_value=10_000.0,
+            starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+            current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+        )
+
+        # Higher price run on market_id_up: 0.50 -> 0.55 -> price_delta should be 0.55 - 0.50 = +0.0500
+        market_id_up = "test-mkt-signed-price-delta-up"
+        await run_pipeline(
+            headline="Initial entry 2", source="AP", market_id=market_id_up,
+            market_question="Will Trump win?", market_price=0.50, portfolio_value=10_000.0,
+            starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+            current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+        )
+        await run_pipeline(
+            headline="Repeat entry higher", source="AP", market_id=market_id_up,
+            market_question="Will Trump win?", market_price=0.55, portfolio_value=10_000.0,
+            starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+            current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+        )
+
+    # Verifies negative when lower (would fail if abs() was used) and positive when higher
+    assert "price_delta=-0.0500" in caplog.text
+    assert "price_delta=0.0500" in caplog.text
+

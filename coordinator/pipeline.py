@@ -908,7 +908,7 @@ async def run_pipeline(
                     time_gap = (datetime.now(timezone.utc) - dt).total_seconds()
                 except Exception:
                     pass
-            price_delta = abs(market_price - state.last_entry_price) if state.last_entry_price is not None else 0.0
+            price_delta = (market_price - state.last_entry_price) if state.last_entry_price is not None else 0.0
             logger.info(
                 "[OBSERVABILITY][REPEAT_ENTRY] market=%s dir=%s time_gap=%.1fs price_delta=%.4f raw_kelly=$%.2f capped_size=$%.2f",
                 market_id, decision_direction, time_gap, price_delta, raw_size, permitted_size,
