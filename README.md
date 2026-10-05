@@ -121,11 +121,11 @@ Hard budget target: **$\le \$0.75$ USD/month** on TokenRouter / OpenRouter ($1.0
 ├── monitoring/
 │   └── telegram_alerts.py    # Real-time Telegram alerting & circuit breaker notices
 ├── tests/
-│   ├── test_risk.py          # Unit tests for pure Python risk engine (83 tests)
-│   ├── test_dedupe_gate.py   # Integration tests for per-market tranche gate (12 tests)
+│   ├── test_risk.py          # Unit tests for pure Python risk engine (85 tests)
+│   ├── test_dedupe_gate.py   # Integration tests for per-market tranche gate (14 tests)
 │   ├── test_integration.py   # End-to-end integration tests for pipeline (15 tests)
 │   ├── test_copytrade*.py    # Copy trade trust & execution suites (75 tests)
-│   └── test_*.py             # Full test suite (220 tests total, 100% green)
+│   └── test_*.py             # Full test suite (224 tests total, 100% green)
 ├── PLAN.md                   # Complete system architecture specification
 ├── PROGRESS.md               # Phase & layer milestone progress tracker
 ├── TESTING.md                # Pass/fail acceptance criteria per layer
@@ -169,7 +169,7 @@ Key environment variables:
 - `PAPER_TRADING`: Set to `true` for paper simulation (default), `false` for live capital.
 
 ### 3. Running the Test Suite
-The repository includes a comprehensive 220-test test suite:
+The repository includes a comprehensive 224-test test suite:
 ```bash
 pytest tests/ -v
 ```

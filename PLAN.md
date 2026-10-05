@@ -52,6 +52,9 @@ Infrastructure:
 
 Operator: student budget, maximum $5/month LLM spend.
 
+> [!NOTE] Current implementation (Oct 2026) — Hosting Environment
+> Infrastructure is currently deployed and operated on Railway ephemeral containers in addition to Hetzner CX22 server specifications (`deferred-items.md:7`, `.planning/STATE.md:76`, `config.py:5`). All persistence is strictly remote via Supabase.
+
 ---
 
 ## 2. SEVEN BUILD LAYERS
@@ -103,6 +106,10 @@ Outputs: event category, affected markets, confidence score.
 Rules: - max_tokens: 500 (output is classification, not prose) - 10-second timeout, no fallback (if News Analyst fails, signal is dropped,
 not a critical path failure)
 
+> [!NOTE] Current implementation (Oct 2026) — News Analyst Routing & Timeout
+> Primary model: `typesafe/jev-1.13` via TokenRouter / OpenRouter (`config.py:18`, `llm/news_analyst.py:185`). Fallback: `qwen/qwen3.5-flash` (`enable_thinking=False`, max 200 tokens, `config.py:22`, `llm/news_analyst.py:192`).
+> Timeout: `NEWS_ANALYST_TIMEOUT_SECONDS = 25` (`config.py:45`), raised from 15s to provide cold-start buffer; signal is dropped if both primary and fallback fail.
+
 ### 3.2 Contract Parser Agent
 
 Model: DeepSeek V3
@@ -123,6 +130,9 @@ Output format (exact):
 "resolution_type": string
 }
 
+> [!NOTE] Current implementation (Oct 2026) — Contract Parser Routing
+> Primary model: `qwen/qwen3.8-flash` via TokenRouter (`config.py:26`, `llm/contract_parser.py:58`). Fallback: `deepseek-chat` via OpenRouter (`config.py:28`). Cached in Supabase `resolution_keyword_cache` for 24h.
+
 ### 3.3 Trade Decision Agent
 
 Model: Qwen3-235B-A22B
@@ -134,6 +144,10 @@ Receives: signal summary, agent_memory lessons prepended,
 market data, own probability estimate vs market price.
 HARD RULES — never override: - max_tokens: 900 - thinking_budget: 600 - Timeout: 18 seconds → immediate failover to OpenRouter - Always prepend agent_memory lessons before every call - Confidence hard cap: 0.88 (agent cannot express higher confidence
 than this regardless of model output)
+
+> [!NOTE] Current implementation (Oct 2026) — Trade Decision Routing & Limits
+> Primary model: `deepseek/deepseek-v4.1-flash` via TokenRouter (`config.py:34`, `llm/trade_decision.py:161`). Fallback: `qwen/qwen3.5-flash` via OpenRouter at 18s (`config.py:35`).
+> Hard limits: `MAX_TOKENS_DEEPSEEK_TRADE = 300` (`config.py:44`), hidden thinking disabled (`thinking: {"type": "disabled"}` or `enable_thinking=False`), using structured 3-step reasoning format in JSON (`llm/trade_decision.py:27-31, 165`).
 
 ### 3.4 Risk Manager
 
@@ -343,6 +357,9 @@ Resolution edge trades: 0.35 × Kelly
 Rationale: Fractional Kelly reduces variance while sacrificing
 modest expected returns. Protects against imperfect
 probability estimates.
+
+> [!NOTE] Current implementation (Oct 2026) — Kelly Net Odds Calculation
+> The runtime pipeline (`coordinator/pipeline.py:760, 785`) computes real net decimal odds `b = (1.0 - market_price) / market_price` for binary contracts. Note that the legacy docstring in `risk/risk_engine.py:37` recommending `odds=1.0` applies strictly to even-money (50/50) contracts and is not used for arbitrary market prices.
 
 ### 6.2 Hard Position Limits (NEVER OVERRIDDEN)
 
@@ -1012,3 +1029,21 @@ Below 1.8 sustained over 30 days: edge does not justify operational complexity.
 END OF PLAN.md
 Version: Final (post all architecture reviews)
 All decisions locked. Do not deviate without updating this document.
+
+---
+
+## 22. KNOWN LIMITATIONS & PRODUCTION GAPS (PRE-LIVE CAPITAL BLOCKERS)
+
+1. **Synthetic Probability**: The pipeline sets `agent_estimate = market_price + 0.10` (`coordinator/pipeline.py:747, 664`), hardcoding an artificial 10-cent edge; the calibration model is disconnected from live trade evaluation.
+2. **Calibration Model Disconnected**: `strategies/calibration.py` is not imported or called in the live pipeline path (`coordinator/pipeline.py`).
+3. **Trade Decision Output Constraints**: The Trade Decision LLM outputs only `direction` and `confidence_score` (`llm/trade_decision.py:27-31`); its own internal probability estimate is not returned or evaluated (`coordinator/pipeline.py:657-670`).
+4. **Uncalibrated Kelly Probability**: Fractional Kelly sizing directly passes subjective LLM confidence (`clamped_conf`) as `win_probability` (`coordinator/pipeline.py:766, 785`), which is uncalibrated.
+5. **Synthetic Brier Gate Evaluation**: The Brier calibration gate (PT.3) evaluates the synthetic `market_price + 0.10` estimate rather than empirical predictive accuracy (`coordinator/pipeline.py:747`).
+6. **Health Score Disconnected**: `daily_performance.health_score` is never written or evaluated at runtime (`coordinator/pipeline.py`); defensive sizing mode (< 65) is not wired.
+7. **Inert Drawdown Breakers**: Drawdown circuit breakers pass `starting_balance` equal to `current_balance` in both news pipeline (`coordinator/pipeline.py:716-724`) and copy trading (`copytrade/executor.py:284-287`), causing calculated drawdown to remain permanently 0%.
+8. **In-Flight Order Invisibility**: `load_market_state` queries `open_positions` only (`coordinator/market_state.py:29-37`); pending or unconfirmed orders in `idempotency_log` are invisible to the tranche gate until reconciliation.
+9. **Process-Wide Lock Scope & Timeout**: `market_locks` uses in-process Python `asyncio.Lock` (`coordinator/market_state.py:15`) protecting only a single process/container; the lock is held across network CLOB calls and Supabase writes for up to ~20s worst-case (`coordinator/pipeline.py:867-966`).
+10. **Taker Repeat Execution**: Repeat tranche entries cross the spread immediately as market/taker orders (`coordinator/pipeline.py:942-947`) rather than posting passive resting limit orders.
+11. **Gross Exposure Correlated Cap**: The 20% "correlated" limit computes gross sum across all active positions indiscriminately (`risk/risk_engine.py:133-145`, `coordinator/pipeline.py:260-264`) rather than evaluating a mathematical cross-market covariance matrix.
+12. **Copy Edge Discards Unpersisted**: Discarded Copy Edge signals log rejections via logger (`copytrade/executor.py:330-341`) but write no records to `market_signals` or Supabase audit logs.
+13. **Autonomous Exit Engine Missing**: Position monitoring and automated take-profit / stop-loss exits (`PLAN.md:730-745`, `config.py:60-64`) are not wired into an active background loop in `main.py` or `coordinator/pipeline.py`.
