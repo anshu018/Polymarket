@@ -36,7 +36,15 @@ class TradeDecisionOutput(BaseModel):
 
     direction: Literal["YES", "NO", "ABSTAIN"]
     confidence_score: float = Field(ge=0.0, le=1.0)
-    reasoning: str = Field(max_length=300)
+    reasoning: str = Field(default="")
+
+    @field_validator("reasoning")
+    @classmethod
+    def sanitize_reasoning(cls, v: str) -> str:
+        """Keep reasoning safe for DB/logs without crashing on thorough 3-step CoT."""
+        if len(v) > 1000:
+            return v[:997] + "..."
+        return v
 
     @field_validator("confidence_score")
     @classmethod
@@ -306,7 +314,7 @@ async def decide_trade(
         f"- Current Price (USDC): {market_price:.4f}\n"
         f"- Calibration Model Probability Estimate: {agent_estimate:.4f}\n"
         f"- Total Portfolio Value: ${portfolio_value:.2f}\n"
-        f"Determine if a YES or NO trade is optimal."
+        f"Determine if a YES or NO trade is optimal using the 3-step reasoning format (Event/timing check, Edge vs price, Conclusion)."
     )
 
     messages = [
