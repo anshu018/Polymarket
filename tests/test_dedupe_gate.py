@@ -390,6 +390,62 @@ async def test_concurrent_workers_on_same_market(mock_db):
 
 
 @pytest.mark.anyio
+async def test_concurrent_workers_at_086_confidence_produce_exactly_one_order(mock_db):
+    """Concurrent pipeline executions at 0.86 confidence on an empty market produce exactly 1 order."""
+    market_id = "test-concurrent-market-086"
+
+    async def fake_classify(*args, **kwargs):
+        return NewsAnalystOutput(
+            event_category="politics",
+            direction="YES",
+            confidence_score=0.86,
+            reasoning="Valid",
+        )
+
+    async def fake_parse(*args, **kwargs):
+        return ContractParserOutput(
+            resolution_source="AP",
+            resolution_condition="Rate hike",
+            key_entities=["Rate"],
+            resolution_keywords=["rate", "hike", "fed"],
+            ambiguity_score=0.1,
+            resolution_type="binary",
+        )
+
+    async def fake_decide(*args, **kwargs):
+        return TradeDecisionOutput(
+            direction="YES",
+            confidence_score=0.86,
+            reasoning="Edge",
+        ), False
+
+    with patch("coordinator.pipeline.classify_signal", fake_classify), \
+         patch("coordinator.pipeline.parse_contract", fake_parse), \
+         patch("coordinator.pipeline.decide_trade", fake_decide), \
+         patch("asyncio.sleep", AsyncMock()):
+
+        tasks = [
+            run_pipeline(
+                headline=f"Concurrent headline {i}", source="AP", market_id=market_id,
+                market_question="Question?", market_price=0.50, portfolio_value=10_000.0,
+                starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+                current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+            )
+            for i in range(4)
+        ]
+        results = await asyncio.gather(*tasks)
+
+    success_orders = [r for r in results if r and r.get("status") == "success"]
+    blocked_orders = [r for r in results if r and r.get("status") == "blocked"]
+
+    assert len(success_orders) == 1, f"Expected exactly 1 order, got {len(success_orders)}"
+    assert len(blocked_orders) == 3
+    for b in blocked_orders:
+        assert b["reason"] == "low_confidence_for_add"
+    assert len(mock_db["open_positions"]) == 1
+
+
+@pytest.mark.anyio
 async def test_load_market_state_none_fails_closed(mock_db):
     """Test 5: load_market_state returning None causes fail-closed, no idempotency write."""
     market_id = "test-fail-closed"
