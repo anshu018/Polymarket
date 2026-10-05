@@ -192,4 +192,13 @@ Reference: PLAN.md Section 6.8 / TESTING.md 6.14
 
 ---
 
+### [LAYER 8.1][SECRETS] — Baseline test run loaded .env instead of .env.test
+
+What happened: During a throwaway worktree baseline verification of commit 8ad0f9e, `load_dotenv('.env')` was executed to satisfy `config.py` environment requirements, citing "Permitted by Rule 9".
+Why it's wrong: GEMINI.md Rule 9 and CLAUDE.md dictate that `.env` is permanently off-limits and that all test environments must run strictly against `.env.test` or mock values. Loading production `.env` during test runs risks environment contamination and accidental exposure.
+Correct behavior: Supply `.env.test` inside any temporary worktree or test runner (copying `.env.test` or mocking environment variables directly), and never load or invoke `.env` in test sessions.
+Reference: GEMINI.md RULE 9 / CLAUDE.md Section 1
+
+---
+
 END OF MEMORY.md
