@@ -19,6 +19,9 @@ import config
 
 logger = logging.getLogger(__name__)
 
+# One-shot deprecation flag (List A.md Step 1): gross edge is retired as a metric.
+_check_edge_deprecation_warned = False
+
 
 def kelly_size(
     win_probability: float,
@@ -184,18 +187,20 @@ def check_edge(
     agent_estimate: float,
     market_price: float,
 ) -> str:
-    """Gate on minimum edge (in decimal cents) required to enter a trade.
+    """DEPRECATED (List A.md Step 1) — do not call from live paths.
 
-    Edge = |agent_estimate - market_price|.
-    Must exceed config.MIN_EDGE_CENTS (0.07 = 7 cents).
-
-    Args:
-        agent_estimate: Agent's probability estimate for the market (0.0-1.0).
-        market_price: Current Polymarket price for the outcome (0.0-1.0).
-
-    Returns:
-        'BLOCK' if edge is below the minimum threshold, else 'ALLOW'.
+    Gross edge is retired as a metric: this gate is symmetric, direction-blind and
+    cost-blind (no fees, spread or slippage). Use risk.cost_model.check_net_edge
+    with a live BookSnapshot instead. Kept for one release for backwards
+    compatibility with existing tests; logs a one-time deprecation warning.
     """
+    global _check_edge_deprecation_warned
+    if not _check_edge_deprecation_warned:
+        logger.warning(
+            "[RISK_ENGINE] check_edge is DEPRECATED (gross edge retired, List A.md "
+            "Step 1) — migrate callers to risk.cost_model.check_net_edge."
+        )
+        _check_edge_deprecation_warned = True
     edge = abs(agent_estimate - market_price)
     if edge < config.MIN_EDGE_CENTS:
         logger.info(

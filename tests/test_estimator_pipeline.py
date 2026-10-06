@@ -24,12 +24,13 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import config
-import risk.risk_engine as risk_engine
+from risk import cost_model
 from coordinator.pipeline import run_pipeline, get_drop_counters, _drop_counters
 from coordinator.market_state import reset_market_locks
 from llm.news_analyst import NewsAnalystOutput
 from llm.contract_parser import ContractParserOutput
 from llm.trade_decision import TradeDecisionOutput
+from risk.cost_model import BookSnapshot
 
 
 # ── Mock Supabase (same pattern as tests/test_dedupe_gate.py) ─────────────────
@@ -116,11 +117,17 @@ def mock_db():
     async def fake_get_client():
         return client
 
+    # Sane live book for the Step 1 net-edge gate (harmless for the dormant-path
+    # tests that drop before the gate; needed by the copy_class_b flow tests).
+    async def fake_book(token_id: str):
+        return BookSnapshot(best_bid=0.48, best_ask=0.52, depth_usd=5000.0)
+
     with patch("memory.supabase_client.get_client", fake_get_client), \
          patch("coordinator.pipeline.get_client", fake_get_client), \
          patch("llm.contract_parser.get_client", fake_get_client), \
          patch("strategies.estimator.get_client", fake_get_client), \
-         patch("copytrade.performance_tracker.get_client", fake_get_client):
+         patch("copytrade.performance_tracker.get_client", fake_get_client), \
+         patch("coordinator.pipeline.get_market_book", fake_book):
         yield state
 
 
@@ -236,17 +243,17 @@ async def test_copy_class_b_uses_real_laplace_estimate_not_constant(mock_db):
         return TradeDecisionOutput(
             direction="YES", confidence_score=0.80, reasoning="Edge confirmed"), False
 
-    edge_calls: list[tuple[float, float]] = []
-    real_check_edge = risk_engine.check_edge
+    breakdown_calls: list[dict] = []
+    real_breakdown = cost_model.compute_cost_breakdown
 
-    def spy_check_edge(estimated_probability: float, market_price: float) -> str:
-        edge_calls.append((estimated_probability, market_price))
-        return real_check_edge(estimated_probability, market_price)
+    def spy_breakdown(**kwargs):
+        breakdown_calls.append(kwargs)
+        return real_breakdown(**kwargs)
 
     with patch("coordinator.pipeline.classify_signal", make_classify(0.80)), \
          patch("coordinator.pipeline.parse_contract", fake_parse), \
          patch("coordinator.pipeline.decide_trade", fake_decide), \
-         patch.object(risk_engine, "check_edge", spy_check_edge), \
+         patch.object(cost_model, "compute_cost_breakdown", spy_breakdown), \
          patch("asyncio.sleep", AsyncMock()):
         result = await run_pipeline(
             headline="Smart money trader whale_1 entered YES position on Will the bill pass?",
@@ -273,9 +280,9 @@ async def test_copy_class_b_uses_real_laplace_estimate_not_constant(mock_db):
     assert kwargs["estimate_method"] == "copy_wallet_hitrate"
     assert kwargs["estimate_sample_size"] == 20
 
-    # The edge gate consumes the same value.
-    assert len(edge_calls) == 1
-    assert edge_calls[0][0] == pytest.approx(expected_p)
+    # The net-edge gate consumes the same measured value (List A.md Step 1).
+    assert len(breakdown_calls) == 1
+    assert breakdown_calls[0]["p_model"] == pytest.approx(expected_p)
 
     # The open_positions row records the measured estimate as agent_estimate.
     assert len(mock_db["open_positions"]) == 1

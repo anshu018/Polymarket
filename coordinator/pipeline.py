@@ -22,9 +22,11 @@ from llm.coordinator import coordinate_decision, CoordinatorOutput
 from data.market_discovery import (
     find_matching_markets,
     get_market_price,
+    get_market_book,
     get_market_metadata,
 )
 from strategies.estimator import get_estimate
+from risk import cost_model
 from monitoring.telegram_alerts import (
     alert_supabase_degradation,
     alert_idempotency_duplicate,
@@ -51,6 +53,9 @@ _drop_counters: dict[str, int] = {
     "risk_gate:low_liquidity": 0,
     "risk_gate:low_confidence": 0,
     "risk_gate:low_edge": 0,
+    "risk_gate:low_net_edge": 0,
+    "risk_gate:price_band": 0,
+    "risk_gate:book_unavailable": 0,
     "risk_gate:max_category_exposure": 0,
     "risk_gate:max_correlated_exposure": 0,
     "risk_gate:cash_reserve": 0,
@@ -529,12 +534,14 @@ async def run_pipeline(
     matching_markets = find_matching_markets(signal_entities)
 
     end_date_iso = None
+    book_token_id: Optional[str] = None  # CLOB key for the net-edge gate's book fetch
     if matching_markets:
         best_match = matching_markets[0]
         market_id = best_match["market_id"]
         token_id = best_match["token_id"]
         market_question = best_match["question"]
         end_date_iso = best_match.get("end_date_iso")
+        book_token_id = token_id
         try:
             market_price = await get_market_price(token_id)
         except Exception as e:
@@ -557,6 +564,11 @@ async def run_pipeline(
             return {"status": "blocked", "reason": "no_matching_markets"}
         # Backward compatibility fallback for tests
         token_id = f"mock-token-{market_id}"
+        # List A.md Step 1: non-cache signals (copy Class B) resolve their book with
+        # the same key the copytrade classifier uses for live_ask — signal market_id.
+        # The classifier drops signals whose book fetch fails, so this key is proven
+        # for every Class B signal that reaches the pipeline.
+        book_token_id = market_id
         if market_price is None and not token_id.startswith("mock-token-"):
             try:
                 market_price = await get_market_price(token_id)
@@ -824,11 +836,64 @@ async def run_pipeline(
         logger.warning(f"[PIPELINE][DROP:estimate:no_data] market_id={market_id} (post-decision guard)")
         return {"status": "blocked", "reason": "estimate_no_data"}
     estimated_probability = estimate.p_point
-    if risk_engine.check_edge(estimated_probability, market_price) == "BLOCK":
-        logger.info(f"[PIPELINE] Risk check: edge below minimum. Blocking.")
-        _increment_drop("risk_gate:low_edge")
-        logger.info(f"[PIPELINE][DROP:risk_gate:low_edge] market_id={market_id}")
-        return {"status": "blocked", "reason": "low_edge"}
+
+    # Net-edge gate (List A.md Step 1 — A2): replaces the retired direction-blind,
+    # cost-blind gross-edge gate (risk_engine.check_edge, deprecated). Every entry
+    # evaluation decides maker/taker, prices the full entry costs from the live book,
+    # logs the mandatory cost breakdown, and must pass BOTH the net-edge minimum and
+    # (takers only) the tradeable price band.
+    strategy_for_check = strategy_override if strategy_override else ("velocity" if is_fast_path else "recalibration")
+    order_type = cost_model.decide_order_type(strategy_for_check)
+
+    book = await get_market_book(book_token_id)
+    if book is None:
+        _increment_drop("risk_gate:book_unavailable")
+        logger.warning(
+            f"[PIPELINE][DROP:risk_gate:book_unavailable] market_id={market_id} "
+            f"book_token_id={str(book_token_id)[:16]}"
+        )
+        return {"status": "blocked", "reason": "book_unavailable"}
+
+    fee_cfg = cost_model.fee_config_for(category)
+    # Kelly sizing happens later in the pipeline; gate on the worst-case size (the
+    # max single trade cap). If even the cap keeps net edge positive, any smaller
+    # size passes a fortiori — slippage is monotone in size.
+    worst_case_size = portfolio_value * config.MAX_SINGLE_TRADE_PCT
+    breakdown = cost_model.compute_cost_breakdown(
+        p_model=estimated_probability,
+        price=book.mid,
+        side=decision_direction,
+        order_type=order_type,
+        book=book,
+        fee_cfg=fee_cfg,
+        size_usd=worst_case_size,
+    )
+    band_low, band_high = config.TRADEABLE_PRICE_BAND
+    price_band_ok = band_low <= book.mid <= band_high
+    logger.info(
+        "[OBSERVABILITY][NET_EDGE] market=%s strategy=%s gross_edge=%.4f fee_units=%.4f "
+        "spread_units=%.4f slippage_units=%.4f haircut_units=%.4f net_edge=%.4f "
+        "order_type=%s price_band_ok=%s book_bid=%.4f book_ask=%.4f",
+        market_id, strategy_for_check, breakdown.gross_edge, breakdown.fee_units,
+        breakdown.spread_units, breakdown.slippage_units, breakdown.haircut_units,
+        breakdown.net_edge, order_type, price_band_ok, book.best_bid, book.best_ask,
+    )
+
+    gate_result = cost_model.check_net_edge(breakdown.net_edge, book.mid, order_type)
+    if gate_result == "BLOCK_NET_EDGE":
+        _increment_drop("risk_gate:low_net_edge")
+        logger.info(
+            f"[PIPELINE][DROP:risk_gate:low_net_edge] market_id={market_id} "
+            f"net_edge={breakdown.net_edge:.4f} min={config.MIN_NET_EDGE_CENTS}"
+        )
+        return {"status": "blocked", "reason": "low_net_edge"}
+    if gate_result == "BLOCK_PRICE_BAND":
+        _increment_drop("risk_gate:price_band")
+        logger.info(
+            f"[PIPELINE][DROP:risk_gate:price_band] market_id={market_id} "
+            f"mid={book.mid:.4f} band={config.TRADEABLE_PRICE_BAND} order_type={order_type}"
+        )
+        return {"status": "blocked", "reason": "price_band"}
 
     # D. Portfolio exposure gates
     # Fetch exposure under 2s timeout (Rule 5 handles halting on failure)
@@ -867,7 +932,7 @@ async def run_pipeline(
             portfolio_value=portfolio_value
         )
         
-    strategy_for_check = strategy_override if strategy_override else ("velocity" if is_fast_path else "recalibration")
+    # strategy_for_check was resolved at the net-edge gate above (maker/taker rule).
     final_trade_size = max(0.0, risk_engine.position_size_check(raw_size, portfolio_value, strategy=strategy_for_check))
     
     proposed_pct = final_trade_size / portfolio_value

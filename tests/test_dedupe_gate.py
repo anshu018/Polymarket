@@ -37,6 +37,7 @@ from llm.contract_parser import ContractParserOutput
 from llm.trade_decision import TradeDecisionOutput
 from llm.coordinator import CoordinatorOutput
 from strategies.estimator import EstimateResult
+from risk.cost_model import BookSnapshot
 
 
 @pytest.fixture(autouse=True)
@@ -52,21 +53,31 @@ def clean_test_environment():
 @pytest.fixture
 def estimator_has_data():
     """
-    List A.md Step 0: the main-pipeline estimators are fail-closed stubs, so every
-    news signal would drop at 'estimate:no_data' before the gates. The tests below
+    List A.md Steps 0-1: the main-pipeline estimators are fail-closed stubs and the
+    net-edge gate needs a live book, so every news signal would drop at
+    'estimate:no_data' / 'book_unavailable' before the gates. The tests below
     exercise tranche-gate / order-flow / telemetry logic — not estimation — so feed
-    the pipeline a data-bearing estimate (0.65 vs price 0.50 = 15¢ edge, same as the
-    pre-Step-0 fake) to reach the behavior under test.
+    the pipeline a data-bearing estimate (0.65 vs mid 0.50) and a sane book (net
+    edge ≈ 0.072 > 0.02, in band) to reach the behavior under test.
     """
     async def fake_get_estimate(*args, **kwargs):
+        # Direction-aware: the fake estimate always favors the proposed side so both
+        # YES and NO flows pass the Step 1 net-edge gate (like the pre-Step-0 fake did
+        # under the direction-blind gross gate).
+        side = kwargs.get("side", "YES")
+        p_point = 0.65 if side == "YES" else 0.35
         return EstimateResult(
-            p_point=0.65,
+            p_point=p_point,
             sample_size=100,
             method="recalibration_base_rate",
             computed_at=datetime.now(timezone.utc),
         )
 
-    with patch("coordinator.pipeline.get_estimate", fake_get_estimate):
+    async def fake_book(token_id: str):
+        return BookSnapshot(best_bid=0.48, best_ask=0.52, depth_usd=5000.0)
+
+    with patch("coordinator.pipeline.get_estimate", fake_get_estimate), \
+         patch("coordinator.pipeline.get_market_book", fake_book):
         yield
 
 

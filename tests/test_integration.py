@@ -24,6 +24,7 @@ from llm.trade_decision import TradeDecisionOutput
 from llm.coordinator import CoordinatorOutput
 from coordinator.pipeline import run_pipeline
 from strategies.estimator import EstimateResult
+from risk.cost_model import BookSnapshot
 import data.market_discovery
 
 @pytest.fixture(autouse=True)
@@ -214,21 +215,31 @@ def mock_supabase_client(db_state: dict[str, list[dict[str, Any]]]) -> Generator
 @pytest.fixture
 def estimator_has_data() -> Generator[None, None, None]:
     """
-    List A.md Step 0: the main-pipeline estimators are fail-closed stubs, so every
-    news signal would drop at 'estimate:no_data' before the LLM stages. The tests
-    below exercise LLM routing, timing, risk, and idempotency behavior — not
-    estimation — so feed the pipeline a data-bearing estimate (0.65 vs price 0.55 =
-    10¢ edge, same as the pre-Step-0 fake) to reach the behavior under test.
+    List A.md Steps 0-1: the main-pipeline estimators are fail-closed stubs and the
+    net-edge gate needs a live book, so every news signal would drop at
+    'estimate:no_data' / 'book_unavailable' before the gates. The tests below
+    exercise LLM routing, timing, risk, and idempotency behavior — not estimation —
+    so feed the pipeline a data-bearing estimate (0.65 vs mid 0.50) and a sane book
+    (net edge ≈ 0.072 > 0.02, in band) to reach the behavior under test.
     """
     async def fake_get_estimate(*args, **kwargs):
+        # Direction-aware: the fake estimate always favors the proposed side so both
+        # YES and NO flows pass the Step 1 net-edge gate (like the pre-Step-0 fake did
+        # under the direction-blind gross gate).
+        side = kwargs.get("side", "YES")
+        p_point = 0.65 if side == "YES" else 0.35
         return EstimateResult(
-            p_point=0.65,
+            p_point=p_point,
             sample_size=100,
             method="recalibration_base_rate",
             computed_at=datetime.now(timezone.utc),
         )
 
-    with patch("coordinator.pipeline.get_estimate", fake_get_estimate):
+    async def fake_book(token_id: str):
+        return BookSnapshot(best_bid=0.48, best_ask=0.52, depth_usd=5000.0)
+
+    with patch("coordinator.pipeline.get_estimate", fake_get_estimate), \
+         patch("coordinator.pipeline.get_market_book", fake_book):
         yield
 
 
@@ -616,13 +627,25 @@ async def test_6_5_conflict_detection(
     # Calls: Jev(news, not counted) + 1 (Contract Parser) + 1 (Trade Decision) + 1 (Coordinator)
     assert (mock_llm_apis["or_calls"] + mock_llm_apis["sf_calls"]) >= 3
 
-    # Case 2: Low News Analyst confidence (<=0.70) + Disagreement
+    # Case 2: Low News Analyst confidence (<=0.70) + Disagreement.
+    # The estimator fixture is overridden to favor NO here: the trade decision (NO)
+    # wins over the YES news signal, and the honest net-edge gate (List A.md Step 1)
+    # only lets a trade through when the estimate favors the traded side.
     mock_llm_apis["news_analyst_confidence"] = 0.65
     mock_llm_apis["news_analyst_direction"] = "YES"
     mock_llm_apis["trade_decision_direction"] = "NO"
     mock_llm_apis["or_calls"] = 0
-    
-    with patch("config.MIN_CONFIDENCE_THRESHOLD", 0.50):
+
+    async def fake_estimate_no_side(*args, **kwargs):
+        return EstimateResult(
+            p_point=0.35,
+            sample_size=100,
+            method="recalibration_base_rate",
+            computed_at=datetime.now(timezone.utc),
+        )
+
+    with patch("config.MIN_CONFIDENCE_THRESHOLD", 0.50), \
+         patch("coordinator.pipeline.get_estimate", fake_estimate_no_side):
         res2 = await run_pipeline(
             headline="Donald Trump impeachment",
             source="AP News",
@@ -958,6 +981,7 @@ async def test_trade_decision_fail_fast(
 async def test_copy_trade_class_b_end_to_end_flow(
     mock_supabase_client: MockSupabaseClient,
     mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
 ) -> None:
     """Integration: Class B copy-trade signal routes through the coordinator pipeline,
     tags strategy='copy_edge_class_b', writes to copytrade_log, and resolves via reconciliation.
