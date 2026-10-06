@@ -212,6 +212,35 @@ SQL_MIGRATIONS = [
         """
     },
     {
+        # List A.md Step 2 (A6): forward-price measurement of every signal that
+        # enters the pipeline. One row per signal at arrival; the forward-price
+        # sampler (data/forward_sampler.py) fills p_m1/p_m5/p_m15/p_m60 at
+        # +1m/+5m/+15m/+60m. Feeds the velocity estimator (Step 6f) and
+        # scripts/signal_drift_report.py. Canonical DDL lives in
+        # scratch/migration_signal_outcomes.sql — keep the two in sync.
+        "table": "signal_outcomes",
+        "sql": """
+        CREATE TABLE IF NOT EXISTS signal_outcomes (
+            id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            signal_id           UUID REFERENCES market_signals(id) ON DELETE SET NULL,
+            market_id           TEXT NOT NULL,
+            strategy            TEXT,
+            headline_hash       TEXT NOT NULL,
+            entities_json       JSONB,
+            t0                  TIMESTAMPTZ NOT NULL,
+            price_t0            DECIMAL(10,4),
+            p_m1                DECIMAL(10,4),
+            p_m5                DECIMAL(10,4),
+            p_m15               DECIMAL(10,4),
+            p_m60               DECIMAL(10,4),
+            confirmed_direction BOOLEAN,
+            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_signal_outcomes_market_t0
+            ON signal_outcomes (market_id, t0 DESC);
+        """
+    },
+    {
         # Strategy 5: Copy Edge -- per-wallet trust score aggregation
         # Recomputed every time a copy trade resolves.
         # trust_score = Bayesian-damped win rate + PnL quality bonus.
@@ -283,6 +312,12 @@ async def test_table(client, table_name: str):
         mock_data = {"id": uid, "market_id": "test_mkt", "direction": "YES"}
     elif table_name == "layer_c_category_versions":
         mock_data = {"category": "politics"}
+    elif table_name == "signal_outcomes":
+        mock_data = {
+            "market_id": f"test_mkt_unique_{uid}",
+            "headline_hash": "test_hash",
+            "t0": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
     else:
         mock_data = {}
 
