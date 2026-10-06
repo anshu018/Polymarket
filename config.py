@@ -112,6 +112,44 @@ RSS_POLL_INTERVAL_SECONDS = 10
 # end_date_iso is missing or unparseable. 720h = 30 days, conservative long horizon.
 # Each fallback use is tagged with the "estimate:ttr_fallback" drop counter (List A.md Step 0).
 DEFAULT_TTR_HOURS = 720
+
+# ── NET-EDGE GATE & COST MODEL (List A.md Step 1 — A2) ───────────────────────
+# Fee schedule VERIFIED 2026-10-06 from the official docs
+# (https://docs.polymarket.com/polymarket-learn/trading/fees):
+#   fee = shares × feeRate × p × (1 − p); makers are NEVER charged (they receive
+#   15-25% rebates); the taker feeRate is per market category. Sanity check:
+#   politics at 2¢ → 0.04 × 0.02 × 0.98 ≈ 3.9% of trade value, matching the
+#   operator's reported figure (Decision Log D-07/D-09). Schedule changes must be
+#   re-verified and updated here only — never hardcoded in modules.
+TAKER_FEE_RATE = 0.05                   # default taker feeRate ("Other / General")
+TAKER_FEE_RATE_BY_CATEGORY = {          # verified per-category taker feeRates
+    "crypto": 0.07,
+    "sports": 0.05,
+    "finance": 0.04,
+    "politics": 0.04,
+    "economics": 0.05,
+    "culture": 0.05,
+    "weather": 0.05,
+    "mentions": 0.04,
+    "tech": 0.04,
+    "geopolitics": 0.0,
+}
+MAKER_FEE_RATE = 0.0                    # docs: "Makers are never charged fees."
+MAKER_FILL_HAIRCUT = 0.01               # queue-risk haircut (probability units) charged
+                                        # against maker entries; conservative initial
+                                        # value — refine with Step 5 decision-vs-fill data.
+MIN_NET_EDGE_CENTS = 0.02               # entry requires net_edge strictly ABOVE 2¢
+TRADEABLE_PRICE_BAND = (0.10, 0.90)     # taker entries must price inside the band;
+                                        # maker orders bypass it (they set their level).
+MAKER_FALLBACK_SECONDS = 20             # unfilled maker order falls back to taker after
+                                        # this window if still net-positive as taker
+                                        # (enforced by the execution layer, Phase 3).
+SLIPPAGE_SPREAD_MULTIPLE = 1.2          # conservative default slippage = full_spread ×
+                                        # this multiple; replaced by the empirical curve
+                                        # from Step 5 decision-vs-fill logs.
+BOOK_DEPTH_TOP_LEVELS = 10              # levels summed per side for book depth (USDC)
+MAKER_ORDER_STRATEGIES = {"recalibration", "resolution", "copy_edge_class_b"}  # rest → taker
+
 KELLY_FRACTION_VELOCITY = 0.15
 KELLY_FRACTION_RECALIBRATION = 0.25
 KELLY_FRACTION_CORRELATION = 0.25
