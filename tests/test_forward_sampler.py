@@ -374,3 +374,41 @@ async def test_apply_signal_direction_db_failure_is_contained():
 
     assert get_sampler_stats()["direction_updates_failed"] == 1
     assert get_sampler_stats()["direction_updates_ok"] == 0
+
+
+# ── 8. Supervisor consumes a queued DirectionUpdate message ──────────────────
+
+@pytest.mark.anyio
+async def test_supervisor_applies_queued_direction_update():
+    db_state: dict[str, list[dict[str, Any]]] = {
+        "signal_outcomes": [{
+            "id": "outcome-9", "market_id": "mkt-1", "signal_id": None,
+            "confirmed_direction": None, "price_t0": 0.5,
+        }],
+        "market_signals": [{
+            "id": "sig-5", "raw_headline": "Fed cuts rates",
+            "source_name": "Reuters", "detected_at": "2026-10-06T00:00:00+00:00",
+        }],
+    }
+    forward_sampler.get_sampler_queue().put_nowait(
+        forward_sampler.DirectionUpdate(
+            outcome_id="outcome-9", headline="Fed cuts rates",
+            source="Reuters", confirmed_yes=True,
+        )
+    )
+
+    with patch_db(db_state):
+        supervisor = asyncio.create_task(run_forward_sampler_supervisor())
+        try:
+            applied = await wait_for(
+                lambda: db_state["signal_outcomes"][0]["confirmed_direction"] is True
+            )
+            assert applied, "supervisor never applied the direction update"
+            assert db_state["signal_outcomes"][0]["signal_id"] == "sig-5"
+            assert get_sampler_stats()["direction_updates_ok"] == 1
+        finally:
+            supervisor.cancel()
+            try:
+                await supervisor
+            except asyncio.CancelledError:
+                pass

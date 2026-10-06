@@ -53,6 +53,7 @@ _sampler_stats: dict[str, int] = {
     "reads_missed": 0,
     "direction_updates_ok": 0,
     "direction_updates_failed": 0,
+    "direction_updates_dropped": 0,
 }
 
 
@@ -146,6 +147,53 @@ def schedule_forward_sampling(job: SamplerJob) -> None:
         )
 
 
+@dataclass(frozen=True)
+class DirectionUpdate:
+    """
+    One signal's asserted direction, queued for the supervisor to apply.
+
+    Kept as a queue message (not a spawned task) so the pipeline hot path
+    makes ZERO extra DB calls and the supervisor applies updates sequentially
+    — deterministic under the sequence-sensitive tests and in production.
+
+    Attributes:
+        outcome_id:    signal_outcomes row id (the SamplerJob's outcome_id).
+        headline:      Raw headline for the market_signals lookup.
+        source:        Source name for the market_signals lookup.
+        confirmed_yes: True = signal asserted YES, False = NO.
+    """
+    outcome_id: str
+    headline: str
+    source: str
+    confirmed_yes: bool
+
+
+def schedule_direction_update(update: DirectionUpdate) -> None:
+    """
+    Enqueue one direction update from the pipeline hook. Never blocks, never
+    raises — a full queue drops the update with a logged stat (the outcome
+    row keeps confirmed_direction NULL, which the report treats as unknown).
+
+    Args:
+        update: Direction message for a signal whose News Analyst returned
+                YES/NO (ABSTAIN asserts no direction and is never queued).
+    """
+    queue = get_sampler_queue()
+    try:
+        queue.put_nowait(update)
+        logger.debug(
+            "[FORWARD_SAMPLER] Direction update queued: outcome_id=%s yes=%s",
+            update.outcome_id, update.confirmed_yes,
+        )
+    except asyncio.QueueFull:
+        _sampler_stats["direction_updates_dropped"] += 1
+        logger.warning(
+            "[FORWARD_SAMPLER][DROP:queue_full] Direction update dropped "
+            "(queue full): outcome_id=%s — confirmed_direction stays NULL",
+            update.outcome_id,
+        )
+
+
 def spawn_background(coro: Coroutine[Any, Any, None], name: str) -> None:
     """
     Spawn a fire-and-forget task with a strong reference (GC-safe).
@@ -165,10 +213,12 @@ async def run_forward_sampler_supervisor() -> None:
     """
     Supervisor loop started once in main.py: consumes the job queue forever.
 
-    Per job: insert the signal_outcomes row (best-effort) and spawn one
-    sampling task. A failed insert skips sampling — without a row the reads
-    could not be recorded anywhere. Every failure is logged and counted; the
-    loop itself never exits on error.
+    Per SamplerJob: insert the signal_outcomes row (best-effort) and spawn one
+    sampling task. Per DirectionUpdate: apply the asserted direction +
+    signal_id backfill inline (sequential — see DirectionUpdate). A failed
+    insert skips sampling — without a row the reads could not be recorded
+    anywhere. Every failure is logged and counted; the loop itself never
+    exits on error.
     """
     queue = get_sampler_queue()
     logger.info(
@@ -179,14 +229,23 @@ async def run_forward_sampler_supervisor() -> None:
         config.FORWARD_SAMPLER_QUEUE_MAXSIZE,
     )
     while True:
-        job: SamplerJob = await queue.get()
+        item: SamplerJob | DirectionUpdate = await queue.get()
         try:
-            inserted = await _insert_outcome_row(job)
+            if isinstance(item, DirectionUpdate):
+                # Applied inline (sequential): a direction update is two small
+                # DB ops; ordering with the job inserts keeps the row's state
+                # easy to reason about, and a 2s-capped slow write cannot
+                # outlast the 60s+ first horizon.
+                await apply_signal_direction(
+                    item.outcome_id, item.headline, item.source, item.confirmed_yes,
+                )
+                continue
+            inserted = await _insert_outcome_row(item)
             if inserted:
                 _sampler_stats["rows_inserted"] += 1
                 spawn_background(
-                    _sample_one_job(job),
-                    name=f"forward_sample_{job.outcome_id[:8]}",
+                    _sample_one_job(item),
+                    name=f"forward_sample_{item.outcome_id[:8]}",
                 )
             else:
                 _sampler_stats["rows_failed"] += 1
@@ -196,7 +255,7 @@ async def run_forward_sampler_supervisor() -> None:
             _sampler_stats["rows_failed"] += 1
             logger.error(
                 "[FORWARD_SAMPLER] Supervisor error on job %s: %s: %s",
-                job.outcome_id, type(exc).__name__, exc,
+                item.outcome_id, type(exc).__name__, exc,
             )
 
 

@@ -790,8 +790,10 @@ async def test_6_9_cache_timeout_fallback_to_full_pipeline(
     mock_llm_apis["news_analyst_confidence"] = 0.95
     mock_llm_apis["sf_calls"] = 0
 
-    # Call #1: get_cached_keywords will time out! (Jev skips _log_to_supabase, so cache read is Call 1)
-    mock_supabase_client.timeout_on_calls = {1}
+    # Call #1: Step 2 novelty window read (coordinator.pipeline hook) — succeeds
+    # Call #2: get_cached_keywords will time out! (Jev skips _log_to_supabase, so
+    #          the cache read is the first DB call after the instrumentation hook)
+    mock_supabase_client.timeout_on_calls = {2}
 
     res = await run_pipeline(
         headline="Donald Trump impeachment",
@@ -821,12 +823,14 @@ async def test_6_9_memory_timeout_proceeds_memoryless(
     # Full pipeline
     mock_llm_apis["news_analyst_confidence"] = 0.80
     
-    # Supabase call sequence with market tranche pre-check:
-    # Call 1: load_market_state pre-check (succeeds)
-    # Call 2: _check_cache in contract_parser (no hit)
-    # Call 3: _write_cache in contract_parser (succeeds)
-    # Call 4: fetch_relevant_lessons (times out!)
-    mock_supabase_client.timeout_on_calls = {4}
+    # Supabase call sequence with market tranche pre-check (Step 2 adds the
+    # novelty window read as Call 1 — the pipeline hook runs before the analyst):
+    # Call 1: novelty window read (succeeds, fail-open on timeout)
+    # Call 2: load_market_state pre-check (succeeds)
+    # Call 3: _check_cache in contract_parser (no hit)
+    # Call 4: _write_cache in contract_parser (succeeds)
+    # Call 5: fetch_relevant_lessons (times out!)
+    mock_supabase_client.timeout_on_calls = {5}
 
     res = await run_pipeline(
         headline="Donald Trump impeachment",
@@ -856,15 +860,17 @@ async def test_6_9_idempotency_timeout_fails_closed(
     # Full pipeline
     mock_llm_apis["news_analyst_confidence"] = 0.80
     
-    # Supabase call sequence with market tranche checks:
-    # Call 1: load_market_state pre-check (succeeds)
-    # Call 2: _check_cache (no hit)
-    # Call 3: _write_cache (succeeds)
-    # Call 4: fetch_relevant_lessons (succeeds)
-    # Call 5: fetch_open_positions_exposure (succeeds)
-    # Call 6: load_market_state inside market_lock (succeeds)
-    # Call 7: check_pre_order_idempotency (times out!)
-    mock_supabase_client.timeout_on_calls = {7}
+    # Supabase call sequence with market tranche checks (Step 2 adds the
+    # novelty window read as Call 1 — the pipeline hook runs before the analyst):
+    # Call 1: novelty window read (succeeds)
+    # Call 2: load_market_state pre-check (succeeds)
+    # Call 3: _check_cache (no hit)
+    # Call 4: _write_cache (succeeds)
+    # Call 5: fetch_relevant_lessons (succeeds)
+    # Call 6: fetch_open_positions_exposure (succeeds)
+    # Call 7: load_market_state inside market_lock (succeeds)
+    # Call 8: check_pre_order_idempotency (times out!)
+    mock_supabase_client.timeout_on_calls = {8}
 
     with pytest.raises(RuntimeError, match="Trading halted due to idempotency (check|write) timeout"):
         await run_pipeline(

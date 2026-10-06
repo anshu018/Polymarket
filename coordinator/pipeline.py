@@ -25,6 +25,8 @@ from data.market_discovery import (
     get_market_book,
     get_market_metadata,
 )
+from data import novelty
+from data import forward_sampler
 from strategies.estimator import get_estimate
 from risk import cost_model
 from monitoring.telegram_alerts import (
@@ -45,6 +47,10 @@ _drop_counters: dict[str, int] = {
     "low_confidence": 0,
     "estimate:no_data": 0,
     "estimate:ttr_fallback": 0,
+    "novelty:novel": 0,
+    "novelty:repeat": 0,
+    "novelty:dup": 0,
+    "novelty:check_failed": 0,  # visibility tag: novelty read failed → fail-open, not a drop
     "contract_parser_none": 0,
     "trade_decision_none": 0,
     "abstain": 0,
@@ -491,6 +497,114 @@ def _parse_end_date(end_date_iso: Optional[str]) -> Optional[datetime]:
         return None
 
 
+# ─────────────────────────────────────────────
+# SIGNAL INSTRUMENTATION (List A.md Step 2 — A6)
+# ─────────────────────────────────────────────
+
+async def _fetch_recent_novelty_rows(market_id: str) -> Optional[list[dict[str, Any]]]:
+    """
+    Fetch in-window prior signal_outcomes rows for one market (RULE 5: 2s timeout).
+
+    Used by the novelty check: the trailing NOVELTY_WINDOW_HOURS history of
+    headline hashes and entity sets for this market, newest first, bounded by
+    NOVELTY_MAX_HISTORY_ROWS so a burst cannot make the read unbounded.
+
+    Returns:
+        Rows list, or None when the read failed (caller fails OPEN — a novelty
+        infrastructure gap must never stop the signal flow; the honest gates
+        downstream still protect capital).
+    """
+    async def _fetch() -> list[dict[str, Any]]:
+        client = await get_client()
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(hours=config.NOVELTY_WINDOW_HOURS)
+        ).isoformat()
+        res = (
+            client.table("signal_outcomes")
+            .select("headline_hash,entities_json")
+            .eq("market_id", market_id)
+            .gte("t0", cutoff)
+            .order("t0", desc=True)
+            .limit(config.NOVELTY_MAX_HISTORY_ROWS)
+            .execute()
+        )
+        return res.data or []
+
+    # asyncio.timeout, not wait_for: wait_for on 3.11 can swallow an external
+    # cancellation that lands after its inner future already completed — the
+    # calling worker would survive a shutdown cancel. Same reasoning as
+    # data/forward_sampler.py.
+    try:
+        async with asyncio.timeout(config.SUPABASE_TIMEOUT_SECONDS):
+            return await _fetch()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning(
+            "[PIPELINE] Novelty history read failed for market %s (fail-open): %s: %s",
+            market_id, type(e).__name__, e,
+        )
+        return None
+
+
+async def _instrument_signal(
+    headline: str,
+    source: str,
+    market_id: str,
+    book_token_id: Optional[str],
+    market_price: float,
+    strategy_override: Optional[str],
+    signal_source: Optional[str],
+    entities: list[str],
+) -> tuple[str, str, Optional[float]]:
+    """
+    Instrument one signal: novelty verdict + forward-sampling job (Step 2).
+
+    Records every signal that reaches the pipeline with a market and an
+    arrival price — INCLUDING signals that will be dropped by the estimator
+    gate — then checks novelty against the market's trailing-window history
+    (pure math from data/novelty.py). The novelty drop decision itself is
+    taken by the caller.
+
+    Returns:
+        (outcome_id, verdict, novelty_factor) — verdict is one of
+        novelty.NOVELTY_NOVEL / NOVELTY_REPEAT / NOVELTY_DUP.
+    """
+    headline_hash = novelty.compute_headline_hash(headline)
+    outcome_id = str(uuid.uuid4())
+
+    prior_rows = await _fetch_recent_novelty_rows(market_id)
+    if prior_rows is None:
+        # Read failed: fail OPEN (treat as novel) and keep the failure visible.
+        _increment_drop("novelty:check_failed")
+        verdict, factor = novelty.NOVELTY_NOVEL, 1.0
+    else:
+        verdict, factor = novelty.novelty_verdict(prior_rows, headline_hash, entities)
+        _increment_drop(f"novelty:{verdict}")
+
+    # strategy = the copy class when overridden, else the signal source
+    # (news_velocity). The per-path velocity/recalibration split happens after
+    # the News Analyst; the source label already tells the estimator story.
+    strategy = strategy_override or signal_source or "news"
+
+    forward_sampler.schedule_forward_sampling(
+        forward_sampler.SamplerJob(
+            outcome_id=outcome_id,
+            market_id=market_id,
+            token_id=book_token_id or market_id,
+            t0_iso=datetime.now(timezone.utc).isoformat(),
+            price_t0=market_price,
+            headline_hash=headline_hash,
+            entities=list(entities),
+            strategy=strategy,
+            headline=headline,
+            source=source,
+        )
+    )
+    return outcome_id, verdict, factor
+
+
 async def run_pipeline(
     headline: str,
     source: str,
@@ -582,6 +696,40 @@ async def run_pipeline(
     if market_price is None:
         market_price = 0.50
 
+    # ── Signal instrumentation (List A.md Step 2 — A6) ────────────────────────
+    # Hooked EARLY — right after the market/price is identified and BEFORE the
+    # estimator gate — so dormant-dropped signals are still measured: the data
+    # clock matters more than the trade decision. Best-effort by design: an
+    # instrumentation failure logs and moves on, it never stops the signal.
+    try:
+        outcome_id, novelty_verdict, novelty_factor = await _instrument_signal(
+            headline=headline,
+            source=source,
+            market_id=market_id,
+            book_token_id=book_token_id,
+            market_price=market_price,
+            strategy_override=strategy_override,
+            signal_source=signal_source,
+            entities=entities,
+        )
+    except Exception as instrument_err:
+        logger.warning(
+            "[PIPELINE] Signal instrumentation failed (non-fatal): %s: %s",
+            type(instrument_err).__name__, instrument_err,
+        )
+        _increment_drop("novelty:check_failed")
+        outcome_id, novelty_verdict, novelty_factor = None, novelty.NOVELTY_NOVEL, None
+
+    if novelty_verdict == novelty.NOVELTY_DUP:
+        # Third+ similar signal for this market inside NOVELTY_WINDOW_HOURS —
+        # dropped BEFORE the News Analyst call (zero token burn). The signal
+        # is still recorded in signal_outcomes for drift measurement.
+        logger.warning(
+            f"[PIPELINE][DROP:novelty:dup] market_id={market_id} "
+            f"strategy={strategy_override or signal_source} headline='{headline[:80]}'"
+        )
+        return {"status": "blocked", "reason": "novelty_dup"}
+
     # 2. News Analyst Agent (now passed market_question for context)
     news_output = await classify_signal(headline, source, market_question=market_question)
     if not news_output:
@@ -589,6 +737,19 @@ async def run_pipeline(
         _increment_drop("news_analyst_none")
         logger.warning(f"[PIPELINE][DROP:news_analyst_none] src={source} headline='{headline[:80]}'")
         return None
+
+    # Record the signal's asserted direction + backfill signal_id (Step 2):
+    # queued for the sampler supervisor (no extra DB calls on the hot path).
+    # ABSTAIN asserts no direction → confirmed_direction stays NULL.
+    if outcome_id is not None and news_output.direction in ("YES", "NO"):
+        forward_sampler.schedule_direction_update(
+            forward_sampler.DirectionUpdate(
+                outcome_id=outcome_id,
+                headline=headline,
+                source=source,
+                confirmed_yes=(news_output.direction == "YES"),
+            )
+        )
     # NOTE: asyncio.sleep(2) removed — was a 2-second dead wait with no purpose (perf fix C1)
 
     # Confidence check
