@@ -108,6 +108,10 @@ HEALTH_SCORE_DEFENSIVE_THRESHOLD = 65
 HEALTH_SCORE_HALT_THRESHOLD = 40
 RESOLUTION_CACHE_TTL_HOURS = 24
 RSS_POLL_INTERVAL_SECONDS = 10
+# Fallback time-to-resolution (hours) for the Trade Decision prompt when a market's
+# end_date_iso is missing or unparseable. 720h = 30 days, conservative long horizon.
+# Each fallback use is tagged with the "estimate:ttr_fallback" drop counter (List A.md Step 0).
+DEFAULT_TTR_HOURS = 720
 KELLY_FRACTION_VELOCITY = 0.15
 KELLY_FRACTION_RECALIBRATION = 0.25
 KELLY_FRACTION_CORRELATION = 0.25

@@ -23,6 +23,7 @@ from llm.news_analyst import NewsAnalystOutput
 from llm.trade_decision import TradeDecisionOutput
 from llm.coordinator import CoordinatorOutput
 from coordinator.pipeline import run_pipeline
+from strategies.estimator import EstimateResult
 import data.market_discovery
 
 @pytest.fixture(autouse=True)
@@ -204,9 +205,31 @@ def mock_supabase_client(db_state: dict[str, list[dict[str, Any]]]) -> Generator
          patch("llm.contract_parser.get_client", fake_get_client), \
          patch("llm.trade_decision.get_client", fake_get_client), \
          patch("strategies.calibration.get_client", fake_get_client), \
+         patch("strategies.estimator.get_client", fake_get_client), \
          patch("copytrade.performance_tracker.get_client", fake_get_client), \
          patch("memory.supabase_client.get_client", fake_get_client):
         yield client
+
+
+@pytest.fixture
+def estimator_has_data() -> Generator[None, None, None]:
+    """
+    List A.md Step 0: the main-pipeline estimators are fail-closed stubs, so every
+    news signal would drop at 'estimate:no_data' before the LLM stages. The tests
+    below exercise LLM routing, timing, risk, and idempotency behavior — not
+    estimation — so feed the pipeline a data-bearing estimate (0.65 vs price 0.55 =
+    10¢ edge, same as the pre-Step-0 fake) to reach the behavior under test.
+    """
+    async def fake_get_estimate(*args, **kwargs):
+        return EstimateResult(
+            p_point=0.65,
+            sample_size=100,
+            method="recalibration_base_rate",
+            computed_at=datetime.now(timezone.utc),
+        )
+
+    with patch("coordinator.pipeline.get_estimate", fake_get_estimate):
+        yield
 
 
 # ─────────────────────────────────────────────
@@ -411,6 +434,7 @@ def mock_llm_apis() -> Generator[dict[str, Any], None, None]:
 async def test_6_1_full_pipeline_end_to_end(
     mock_supabase_client: MockSupabaseClient,
     mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
 ) -> None:
     """Criterion 6.1: Processes high-confidence signals through all stages down to mock order without exceptions."""
     res = await run_pipeline(
@@ -444,6 +468,7 @@ async def test_6_1_full_pipeline_end_to_end(
 async def test_6_2_fast_path_under_5_seconds(
     mock_supabase_client: MockSupabaseClient,
     mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
 ) -> None:
     """Criterion 6.2: Fresh cache hit, pre-validated category, and high confidence routes fast path under 5s."""
     # Seed cache to create fresh cache hit
@@ -485,6 +510,7 @@ async def test_6_2_fast_path_under_5_seconds(
 async def test_6_3_full_pipeline_under_22_seconds(
     mock_supabase_client: MockSupabaseClient,
     mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
 ) -> None:
     """Criterion 6.3: Confirm full pipeline execution completes well within the 22-second limit."""
     mock_llm_apis["news_analyst_confidence"] = 0.80  # Triggers full pipeline slow path
@@ -514,6 +540,7 @@ async def test_6_3_full_pipeline_under_22_seconds(
 async def test_6_4_memory_prepended(
     mock_supabase_client: MockSupabaseClient,
     mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
 ) -> None:
     """Criterion 6.4: agent_memory lessons are correctly formatted and placed at the top of the Trade Decision prompt."""
     # Seed lessons in agent_memory
@@ -563,6 +590,7 @@ async def test_6_4_memory_prepended(
 async def test_6_5_conflict_detection(
     mock_supabase_client: MockSupabaseClient,
     mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
 ) -> None:
     """Criterion 6.5: Disagreement with high News Analyst confidence (>0.70) triggers LLM Coordinator; low confidence does not."""
     # Case 1: High News Analyst confidence (>0.70) + Disagreement
@@ -617,6 +645,7 @@ async def test_6_5_conflict_detection(
 async def test_6_6_risk_check_on_all_paths(
     mock_supabase_client: MockSupabaseClient,
     mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
 ) -> None:
     """Criterion 6.6: Confirm risk_engine checks execute on both fast path and full pipeline."""
     # Fast path
@@ -666,6 +695,7 @@ async def test_6_6_risk_check_on_all_paths(
 async def test_6_7_circuit_breaker_halt(
     mock_supabase_client: MockSupabaseClient,
     mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
 ) -> None:
     """Criterion 6.7: Daily drawdown of 9% (>8%) blocks trading and records circuit breaker trip."""
     res = await run_pipeline(
@@ -689,6 +719,7 @@ async def test_6_7_circuit_breaker_halt(
 async def test_6_8_pre_order_idempotency(
     mock_supabase_client: MockSupabaseClient,
     mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
 ) -> None:
     """Criterion 6.8: Pre-order idempotency generates a UUID and logs it in Supabase as pending before order goes out."""
     # Spy on Supabase insert of idempotency_log
@@ -718,6 +749,7 @@ async def test_6_8_pre_order_idempotency(
 async def test_6_9_cache_timeout_fallback_to_full_pipeline(
     mock_supabase_client: MockSupabaseClient,
     mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
 ) -> None:
     """Criterion 6.9: Cache lookup timeout triggers graceful fallback to the full pipeline."""
     # Seed cache keyword to simulate hit
@@ -760,6 +792,7 @@ async def test_6_9_cache_timeout_fallback_to_full_pipeline(
 async def test_6_9_memory_timeout_proceeds_memoryless(
     mock_supabase_client: MockSupabaseClient,
     mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
 ) -> None:
     """Criterion 6.9: agent_memory timeout proceeds with the trade, flagging was_memoryless = true."""
     # Full pipeline
@@ -794,6 +827,7 @@ async def test_6_9_memory_timeout_proceeds_memoryless(
 async def test_6_9_idempotency_timeout_fails_closed(
     mock_supabase_client: MockSupabaseClient,
     mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
 ) -> None:
     """Criterion 6.9: Supabase timeout on idempotency check halts trading and fails closed."""
     # Full pipeline
@@ -827,6 +861,7 @@ async def test_6_9_idempotency_timeout_fails_closed(
 async def test_6_10_siliconflow_failover(
     mock_supabase_client: MockSupabaseClient,
     mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
 ) -> None:
     """Criterion 6.10: NVIDIA NIM delay of 19s (>18s) triggers immediate cancel and failover to OpenRouter."""
     mock_llm_apis["news_analyst_confidence"] = 0.80  # Forces full pipeline slow path
@@ -861,6 +896,7 @@ async def test_6_10_siliconflow_failover(
 async def test_news_analyst_fail_fast(
     mock_supabase_client: MockSupabaseClient,
     mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
 ) -> None:
     """Verify that a 401 response on primary SiliconFlow triggers immediate News Analyst fallback to NVIDIA NIM."""
     mock_llm_apis["jev_status"] = 401          # Force Jev to fail so generative fallback is reached
@@ -890,6 +926,7 @@ async def test_news_analyst_fail_fast(
 async def test_trade_decision_fail_fast(
     mock_supabase_client: MockSupabaseClient,
     mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
 ) -> None:
     """Verify that a 403 response on primary NVIDIA NIM triggers immediate Trade Decision fallback to OpenRouter."""
     mock_llm_apis["news_analyst_confidence"] = 0.80  # Force full pipeline
@@ -930,17 +967,20 @@ async def test_copy_trade_class_b_end_to_end_flow(
 
     wallet_addr = "0xClassBCopy0000000000000000000000000000"
     
-    # 1. Seed the tracked_wallets starting state
+    # 1. Seed the tracked_wallets starting state.
+    # List A.md Step 0: the copy_edge_class_b estimator fail-closes on wallets with
+    # zero resolved history, so this Class B wallet needs real evidence to pass the
+    # estimator gate (18W/2L → Laplace hit rate 19/22).
     mock_supabase_client.db_state.setdefault("tracked_wallets", []).append({
         "wallet_address": wallet_addr,
         "trader_name": "MacroGenius",
         "class_type": "B",
         "state": "NEW",
         "is_active": True,
-        "resolved_trades_count": 0,
-        "wins_count": 0,
-        "losses_count": 0,
-        "trust_score": 0.5000,
+        "resolved_trades_count": 20,
+        "wins_count": 18,
+        "losses_count": 2,
+        "trust_score": 0.7667,
         "avg_roi_per_trade": 0.0,
         "probation_entered_at": None,
         "probation_resolved_at_entry": 0,
@@ -1024,11 +1064,12 @@ async def test_copy_trade_class_b_end_to_end_flow(
     assert logs[0]["status"] == "won"
     
     # Assert tracked_wallets was updated with win + trust_score recomputed
+    # (seeded 18W/2L + this resolved win → 19 wins / 21 resolved)
     wallets = mock_supabase_client.db_state.get("tracked_wallets", [])
     assert len(wallets) == 1
     w = wallets[0]
-    assert w["wins_count"] == 1
-    assert w["resolved_trades_count"] == 1
-    # Bayesian: (0+1+5)/(0+0+1+10) = 6/11
-    expected_trust = 6.0 / 11.0
+    assert w["wins_count"] == 19
+    assert w["resolved_trades_count"] == 21
+    # Bayesian: (18+1+5)/(18+2+1+10) = 24/31
+    expected_trust = 24.0 / 31.0
     assert abs(w["trust_score"] - expected_trust) < 0.001

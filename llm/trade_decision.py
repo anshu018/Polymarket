@@ -278,12 +278,21 @@ async def decide_trade(
     portfolio_value: float,
     time_to_resolution_hours: Optional[float] = None,
     signal_source: Optional[str] = None,
+    *,
+    estimate_method: str,
+    estimate_sample_size: int,
 ) -> tuple[Optional[TradeDecisionOutput], bool]:
     """
     Decide whether to execute a trade by calling Qwen3-235B-A22B on SiliconFlow
     with a strict 18-second timeout, failing over immediately to OpenRouter.
-    
+
     Prepend agent_memory lessons as a marked "Warning Block" at the top of the prompt.
+
+    Args:
+        estimate_method:       Estimator method identifier behind agent_estimate
+                               (strategies.estimator METHOD_* values). Shown to the LLM
+                               as provenance so it can reason about estimate quality.
+        estimate_sample_size:  Number of observations behind agent_estimate (n).
     """
     import os
 
@@ -312,7 +321,7 @@ async def decide_trade(
         f"- Market ID: {market_id}\n"
         f"- Market Question: {market_question}\n"
         f"- Current Price (USDC): {market_price:.4f}\n"
-        f"- Calibration Model Probability Estimate: {agent_estimate:.4f}\n"
+        f"- Model Probability Estimate (source: {estimate_method}, n={estimate_sample_size}): {agent_estimate:.4f}\n"
         f"- Total Portfolio Value: ${portfolio_value:.2f}\n"
         f"Determine if a YES or NO trade is optimal using the 3-step reasoning format (Event/timing check, Edge vs price, Conclusion)."
     )

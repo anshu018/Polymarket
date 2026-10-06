@@ -24,6 +24,7 @@ from data.market_discovery import (
     get_market_price,
     get_market_metadata,
 )
+from strategies.estimator import get_estimate
 from monitoring.telegram_alerts import (
     alert_supabase_degradation,
     alert_idempotency_duplicate,
@@ -40,6 +41,8 @@ _drop_counters: dict[str, int] = {
     "no_market_match": 0,
     "news_analyst_none": 0,
     "low_confidence": 0,
+    "estimate:no_data": 0,
+    "estimate:ttr_fallback": 0,
     "contract_parser_none": 0,
     "trade_decision_none": 0,
     "abstain": 0,
@@ -463,6 +466,26 @@ async def get_live_portfolio_value() -> float:
 # MASTER PIPELINE ENTRYPOINT
 # ─────────────────────────────────────────────
 
+def _parse_end_date(end_date_iso: Optional[str]) -> Optional[datetime]:
+    """
+    Parse a market end-date ISO string into an aware UTC datetime.
+
+    Args:
+        end_date_iso: ISO 8601 timestamp (optionally 'Z'-suffixed), or None.
+
+    Returns:
+        Parsed datetime, or None when missing/invalid (caller applies its own
+        documented fallback).
+    """
+    if not end_date_iso:
+        return None
+    try:
+        return datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
+    except Exception as e:
+        logger.warning(f"[PIPELINE] Failed to parse end_date_iso '{end_date_iso}': {e}")
+        return None
+
+
 async def run_pipeline(
     headline: str,
     source: str,
@@ -607,6 +630,23 @@ async def run_pipeline(
     if is_fast_path:
         # Fast Path skips: Contract Parser, Trade Decision, and LLM Coordinator
         # Trade Decision simulated from News Analyst directly
+        # Estimator gate (fail-closed): no measured probability → no trade (List A.md Step 0).
+        estimate_strategy = strategy_override if strategy_override else "velocity"
+        estimate = await get_estimate(
+            strategy=estimate_strategy,
+            category=category,
+            market_id=market_id,
+            market_price=market_price,
+            side=news_output.direction,
+            wallet_address=wallet_address,
+        )
+        if estimate.p_point is None:
+            _increment_drop("estimate:no_data")
+            logger.warning(
+                f"[PIPELINE][DROP:estimate:no_data] market_id={market_id} strategy={estimate_strategy} "
+                f"method={estimate.method} side={news_output.direction}"
+            )
+            return {"status": "blocked", "reason": "estimate_no_data"}
         decision_direction = news_output.direction
         decision_confidence = news_output.confidence_score
         reasoning = f"Fast path matched. News Analyst wins directly: {news_output.reasoning}"
@@ -643,6 +683,25 @@ async def run_pipeline(
                 logger.warning(f"[PIPELINE] Failed to fetch metadata for market {market_id}: {e}")
                 return None
 
+        # Estimator gate (fail-closed): no measured probability → drop BEFORE the
+        # Contract Parser / Trade Decision LLM calls (zero token burn) (List A.md Step 0).
+        estimate_strategy = strategy_override if strategy_override else "recalibration"
+        estimate = await get_estimate(
+            strategy=estimate_strategy,
+            category=category,
+            market_id=market_id,
+            market_price=market_price,
+            side=news_output.direction,
+            wallet_address=wallet_address,
+        )
+        if estimate.p_point is None:
+            _increment_drop("estimate:no_data")
+            logger.warning(
+                f"[PIPELINE][DROP:estimate:no_data] market_id={market_id} strategy={estimate_strategy} "
+                f"method={estimate.method} side={news_output.direction}"
+            )
+            return {"status": "blocked", "reason": "estimate_no_data"}
+
         # A. Contract Parser (DeepSeek V3, 18s timeout, cached)
         parser_output = await parse_contract(market_id, market_question, resolution_criteria)
         if not parser_output:
@@ -652,8 +711,20 @@ async def run_pipeline(
             return None
         # NOTE: asyncio.sleep(2) removed — was a 2-second dead wait with no purpose (perf fix C1)
             
-        time_to_res = 48.0  # Simulated time to resolution in hours
-        
+        # Real time-to-resolution parsed from the market end date (List A.md Step 0 —
+        # replaces the simulated constant). Missing/invalid falls back to a conservative
+        # default that stays visible via the estimate:ttr_fallback counter.
+        end_dt = _parse_end_date(end_date_iso)
+        if end_dt is not None:
+            time_to_res = max(0.0, (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600.0)
+        else:
+            time_to_res = float(config.DEFAULT_TTR_HOURS)
+            _increment_drop("estimate:ttr_fallback")
+            logger.warning(
+                f"[PIPELINE][DROP:estimate:ttr_fallback] market_id={market_id} "
+                f"end_date_iso='{end_date_iso}' fallback_hours={config.DEFAULT_TTR_HOURS}"
+            )
+
         # B. Trade Decision Agent (Qwen 235B, 18s SiliconFlow timeout, OpenRouter fallback)
         trade_output, was_memoryless = await decide_trade(
             headline=headline,
@@ -661,10 +732,12 @@ async def run_pipeline(
             market_id=market_id,
             market_question=market_question,
             market_price=market_price,
-            agent_estimate=market_price + 0.10,  # Simulate calibration model adding empirical edge
+            agent_estimate=estimate.p_point,
             portfolio_value=portfolio_value,
             time_to_resolution_hours=time_to_res,
-            signal_source=signal_source
+            signal_source=signal_source,
+            estimate_method=estimate.method,
+            estimate_sample_size=estimate.sample_size,
         )
         if not trade_output:
             logger.warning("[PIPELINE] Trade Decision Agent returned None. Dropping signal.")
@@ -743,8 +816,14 @@ async def run_pipeline(
         logger.info(f"[PIPELINE][DROP:risk_gate:low_confidence] market_id={market_id}")
         return {"status": "blocked", "reason": "low_confidence"}
 
-    # Edge gate: assume agent estimate is derived
-    estimated_probability = market_price + 0.10  # Simulating calibration model probability
+    # Edge gate: consumes the measured estimate passed down from the estimator gate
+    # (never recomputed — List A.md Step 0). Defensive fail-closed guard: the branches
+    # above guarantee a data-bearing estimate, but never dereference None.
+    if estimate.p_point is None:
+        _increment_drop("estimate:no_data")
+        logger.warning(f"[PIPELINE][DROP:estimate:no_data] market_id={market_id} (post-decision guard)")
+        return {"status": "blocked", "reason": "estimate_no_data"}
+    estimated_probability = estimate.p_point
     if risk_engine.check_edge(estimated_probability, market_price) == "BLOCK":
         logger.info(f"[PIPELINE] Risk check: edge below minimum. Blocking.")
         _increment_drop("risk_gate:low_edge")
@@ -832,16 +911,12 @@ async def run_pipeline(
         return {"status": "blocked", "reason": "cash_reserve"}
 
     # Calculate remaining days to resolution for deadline risk gate
+    end_dt = _parse_end_date(end_date_iso)
     days_to_resolution = 365
-    if end_date_iso:
-        try:
-            iso_str = end_date_iso.replace("Z", "+00:00")
-            end_dt = datetime.fromisoformat(iso_str)
-            now_dt = datetime.now(timezone.utc)
-            delta = end_dt - now_dt
-            days_to_resolution = max(0, delta.days)
-        except Exception as e:
-            logger.warning(f"[PIPELINE] Failed to parse end_date_iso '{end_date_iso}': {e}")
+    if end_dt is not None:
+        now_dt = datetime.now(timezone.utc)
+        delta = end_dt - now_dt
+        days_to_resolution = max(0, delta.days)
 
     # Deadline risk gate
     if risk_engine.check_deadline_risk(market_price, days_to_resolution) == "BLOCK":

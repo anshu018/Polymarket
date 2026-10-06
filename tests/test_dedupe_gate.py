@@ -36,6 +36,7 @@ from llm.news_analyst import NewsAnalystOutput
 from llm.contract_parser import ContractParserOutput
 from llm.trade_decision import TradeDecisionOutput
 from llm.coordinator import CoordinatorOutput
+from strategies.estimator import EstimateResult
 
 
 @pytest.fixture(autouse=True)
@@ -46,6 +47,27 @@ def clean_test_environment():
         _drop_counters[k] = 0
     yield
     reset_market_locks()
+
+
+@pytest.fixture
+def estimator_has_data():
+    """
+    List A.md Step 0: the main-pipeline estimators are fail-closed stubs, so every
+    news signal would drop at 'estimate:no_data' before the gates. The tests below
+    exercise tranche-gate / order-flow / telemetry logic — not estimation — so feed
+    the pipeline a data-bearing estimate (0.65 vs price 0.50 = 15¢ edge, same as the
+    pre-Step-0 fake) to reach the behavior under test.
+    """
+    async def fake_get_estimate(*args, **kwargs):
+        return EstimateResult(
+            p_point=0.65,
+            sample_size=100,
+            method="recalibration_base_rate",
+            computed_at=datetime.now(timezone.utc),
+        )
+
+    with patch("coordinator.pipeline.get_estimate", fake_get_estimate):
+        yield
 
 
 class MockTableBuilder:
@@ -156,7 +178,7 @@ async def test_shared_lock_registry_across_modules():
 
 
 @pytest.mark.anyio
-async def test_four_signals_at_high_confidence_produces_exactly_two_orders(mock_db):
+async def test_four_signals_at_high_confidence_produces_exactly_two_orders(mock_db, estimator_has_data):
     """Test 1: 4 distinct signals at 0.88 confidence -> exactly 2 orders."""
     market_id = "test-mkt-4-signals"
 
@@ -213,7 +235,7 @@ async def test_four_signals_at_high_confidence_produces_exactly_two_orders(mock_
 
 
 @pytest.mark.anyio
-async def test_four_signals_repeats_below_threshold_produces_exactly_one_order(mock_db):
+async def test_four_signals_repeats_below_threshold_produces_exactly_one_order(mock_db, estimator_has_data):
     """Test 2: 4 signals with repeats at 0.86 confidence -> exactly 1 order."""
     market_id = "test-mkt-low-conf-repeat"
     current_conf = [0.88]
@@ -278,7 +300,7 @@ async def test_four_signals_repeats_below_threshold_produces_exactly_one_order(m
 
 
 @pytest.mark.anyio
-async def test_repeat_at_087_capped_at_3pct_portfolio(mock_db):
+async def test_repeat_at_087_capped_at_3pct_portfolio(mock_db, estimator_has_data):
     """Test 3: Repeat at 0.87 confidence allowed and capped at 3% of portfolio ($300)."""
     market_id = "test-mkt-087-repeat"
     current_conf = [0.88]
@@ -339,7 +361,7 @@ async def test_repeat_at_087_capped_at_3pct_portfolio(mock_db):
 
 
 @pytest.mark.anyio
-async def test_concurrent_workers_on_same_market(mock_db):
+async def test_concurrent_workers_on_same_market(mock_db, estimator_has_data):
     """Test 4: Concurrent pipeline executions on one market produce at most 2 orders total."""
     market_id = "test-concurrent-market"
 
@@ -390,7 +412,7 @@ async def test_concurrent_workers_on_same_market(mock_db):
 
 
 @pytest.mark.anyio
-async def test_concurrent_workers_at_086_confidence_produce_exactly_one_order(mock_db):
+async def test_concurrent_workers_at_086_confidence_produce_exactly_one_order(mock_db, estimator_has_data):
     """Concurrent pipeline executions at 0.86 confidence on an empty market produce exactly 1 order."""
     market_id = "test-concurrent-market-086"
 
@@ -446,7 +468,7 @@ async def test_concurrent_workers_at_086_confidence_produce_exactly_one_order(mo
 
 
 @pytest.mark.anyio
-async def test_load_market_state_none_fails_closed(mock_db):
+async def test_load_market_state_none_fails_closed(mock_db, estimator_has_data):
     """Test 5: load_market_state returning None causes fail-closed, no idempotency write."""
     market_id = "test-fail-closed"
 
@@ -680,7 +702,7 @@ async def test_all_four_paths_hit_the_gate(mock_db):
 
 
 @pytest.mark.anyio
-async def test_drop_counters_increment_accurately(mock_db):
+async def test_drop_counters_increment_accurately(mock_db, estimator_has_data):
     """Test 10: Drop counters accurately increment for all tranche gate block scenarios."""
     mkt = "test-drop-counters-mkt"
 
@@ -810,7 +832,7 @@ async def test_real_blocking_callable_times_out():
 
 
 @pytest.mark.anyio
-async def test_repeat_entry_price_delta_signed(mock_db, caplog):
+async def test_repeat_entry_price_delta_signed(mock_db, caplog, estimator_has_data):
     """Test repeat entry telemetry records signed price_delta (positive when price rises, negative when drops)."""
     import logging
     caplog.set_level(logging.INFO)
