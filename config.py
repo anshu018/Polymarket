@@ -175,6 +175,12 @@ FORWARD_SAMPLER_READ_TIMEOUT_SECONDS = 8                  # outer timeout per pr
                                                           # (get_market_price has its own 4s)
 FORWARD_SAMPLER_QUEUE_MAXSIZE = 500                       # max queued sampling jobs; full →
                                                           # job dropped, logged, never blocks
+DRIFT_VIABILITY_ASSUMED_SPREAD_CENTS = 0.03  # report-ONLY synthetic full spread for the
+                                             # velocity viability verdict in
+                                             # scripts/signal_drift_report.py (offline
+                                             # analysis has no live book; fees are exact,
+                                             # spread/slippage are this assumption). Not
+                                             # used by any runtime trading decision.
 
 KELLY_FRACTION_VELOCITY = 0.15
 KELLY_FRACTION_RECALIBRATION = 0.25
