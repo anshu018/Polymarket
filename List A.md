@@ -11,11 +11,12 @@
 | Field | Value |
 |---|---|
 | Created | 2026-10-06 |
-| Last updated | 2026-10-06 |
-| Current phase | Phase 0 — Steps 0–1 complete |
-| Current step | **Step 1 DONE** — next action is **Step 2** (A6 signal instrumentation + novelty detection — ⏱ TIME-GATED) |
-| Overall status | **IN PROGRESS — Steps 0–1 landed** (estimator fail-closed + honest net-edge gate; every entry logs a full cost breakdown) |
-| Live-pipeline safety state | ✅ SAFE: no fake edge, no constant estimates, and entries now require net_edge > 2¢ after verified fees + spread + slippage from a live book. |
+| Last updated | 2026-10-07 |
+| Current phase | Phase 0 — Steps 0–2 complete |
+| Current step | **Step 2 DONE** — next action is **Step 3** (A7 attribution ledger + edge-fade monitor — ⏱ TIME-GATED: ledger clock starts with the first paper trade after it lands) |
+| Overall status | **IN PROGRESS — Steps 0–2 landed** (fail-closed pipeline; honest net-edge gate; every signal now instrumented for forward prices + novelty — the data clock is running) |
+| Live-pipeline safety state | ✅ SAFE: no fake edge, no constant estimates; entries require net_edge > 2¢ after verified fees + spread + slippage from a live book; novelty dups drop pre-LLM. |
+| ⚠️ Operator action needed | **Apply `signal_outcomes` to the live Supabase** (scratch/migration_signal_outcomes.sql or via the bot's own startup migration pass on next restart). Until then the sampler's writes fail best-effort and are skipped — no data is collected. |
 
 **How to resume work (any future session):**
 1. Read this file top to bottom.
@@ -105,7 +106,7 @@ Status vocabulary: `NOT STARTED` / `IN PROGRESS` / `BLOCKED` / `DONE` / `VERIFIE
 |---|---|---|---|---|---|---|
 | 0 | A1-S Estimator contract + fail-closed swap + real `time_to_res` | — | **DONE** | 2026-10-06 | 2026-10-06 | Fake `+0.10` removed (grep-clean); 254 tests green (baseline 224 + 30 new); D-08 `wallet_address` kwarg |
 | 1 | A2 Cost model + net-edge gate + maker/taker rule | Step 0 (contract only) | **DONE** | 2026-10-06 | 2026-10-06 | Fee schedule VERIFIED (D-09); `check_edge` deprecated, no live callers; 306 tests green (254 + 52 new) |
-| 2 | A6 `signal_outcomes` instrumentation + novelty detection | — | NOT STARTED | — | — | ⏱ TIME-GATED: every week not running = data lost forever |
+| 2 | A6 `signal_outcomes` instrumentation + novelty detection | — | **DONE** | 2026-10-07 | 2026-10-07 | Sampler + novelty live in pipeline; drift report shipped; 355 tests green (306 + 49 new). ⚠️ Owner must apply the migration to the live DB (or restart the bot to trigger migrations.py) — data clock starts then. Paper-mode ≥1 week observation still running |
 | 3 | A7 Attribution columns + edge-fade monitor (CUSUM) | — | NOT STARTED | — | — | ⏱ TIME-GATED: ledger should compound from first paper trade |
 | 4 | A4 Kelly on real probability + shrinkage | Steps 0, 1 | NOT STARTED | — | — | Copy Class B gets real Kelly immediately |
 | 5 | A5 Book-aware paper fills + market baseline + gate report | Steps 1–4 | NOT STARTED | — | — | Gate must judge on printed numbers |
@@ -254,16 +255,17 @@ event look like fresh signals.
    Output: markdown + Telegram. This is the empirical answer to "does the velocity edge survive our latency."
 
 **Work plan.**
-- [ ] Migration SQL for `signal_outcomes` (pattern: `scratch/migration_*.sql`)
-- [ ] Sampler task in `main.py` + tests (timeouts, NULL handling)
-- [ ] `data/novelty.py` + unit tests (hash stability, Jaccard, factor rules)
-- [ ] Wire novelty into pipeline drop logic + counters
-- [ ] `scripts/signal_drift_report.py` + a synthetic-data test
-- [ ] Run ≥1 week in paper mode before evaluating results (do not judge early)
+- [x] Migration SQL for `signal_outcomes` (pattern: `scratch/migration_*.sql`)
+- [x] Sampler task in `main.py` + tests (timeouts, NULL handling)
+- [x] `data/novelty.py` + unit tests (hash stability, Jaccard, factor rules)
+- [x] Wire novelty into pipeline drop logic + counters
+- [x] `scripts/signal_drift_report.py` + a synthetic-data test
+- [ ] Run ≥1 week in paper mode before evaluating results (do not judge early) — **starts once the owner applies the migration / restarts the bot**
 
 **Definition of Done.** Every signal has forward prices (or explicit NULLs); drift report runs;
 novelty counters live in pipeline stats. **Data clock starts the day this lands — schedule early.**
-Status: **NOT STARTED**.
+Status: **DONE (2026-10-07)** — see Session Log for the design notes (hook point, fail-open
+novelty reads, Class A copy signals not instrumented, migration pending owner application).
 
 ---
 
@@ -469,6 +471,11 @@ logged with method + n. Status: **NOT STARTED** (deferred by operator decision �
 | `NOVELTY_WINDOW_HOURS` | 24 | 2 |
 | `JACCARD_REPEAT_THRESHOLD` | 0.5 | 2 |
 | `NOVELTY_REPEAT_FACTOR` | 0.5 | 2 |
+| `NOVELTY_MAX_HISTORY_ROWS` | 200 | 2 |
+| `FORWARD_SAMPLER_HORIZONS_SECONDS` | (60, 300, 900, 3600) | 2 |
+| `FORWARD_SAMPLER_READ_TIMEOUT_SECONDS` | 8 | 2 |
+| `FORWARD_SAMPLER_QUEUE_MAXSIZE` | 500 | 2 |
+| `DRIFT_VIABILITY_ASSUMED_SPREAD_CENTS` | 0.03 (report-only) | 2 |
 | `CUSUM_THRESHOLD` / `CUSUM_DRIFT` | tuned once in Step 3 | 3 |
 | `REALLOC_MIN_SAMPLES` | 30 | 3 |
 | `GATE_MIN_RESOLVED_SAMPLES` | 200 | 5 |
@@ -520,6 +527,7 @@ logged with method + n. Status: **NOT STARTED** (deferred by operator decision �
 
 | Date | Step | What was done | Next action |
 |---|---|---|---|
+| 2026-10-07 | 2 | **Step 2 (A6) DONE.** `signal_outcomes` table: `scratch/migration_signal_outcomes.sql` (repo migration pattern, SAFE TO RUN) + registered in `memory/migrations.py` so the bot's own startup pass creates it on next restart — **owner must apply to the live DB** (defaulted to not touching live infra). `data/novelty.py` (pure: `compute_headline_hash` lowercase/strip-punct/sort-tokens→sha1; `jaccard` (empty∩empty=0); `novelty_verdict` 0/1/2+ similar priors → novel 1.0 / repeat `NOVELTY_REPEAT_FACTOR` / dup). `data/forward_sampler.py` (`SamplerJob` + `DirectionUpdate` queue messages; supervisor started in main.py inserts the row (client-generated UUID) and spawns one tracked sampling task per job; CLOB midpoint reads at +1/5/15/60m via `get_market_price`, each under `FORWARD_SAMPLER_READ_TIMEOUT_SECONDS`; misses stay NULL; `apply_signal_direction` records `confirmed_direction` (YES=True/NO=False/ABSTAIN=NULL) and backfills `signal_id` from market_signals via the log_final_signal_status lookup pattern). Pipeline hook placed EARLY — after market/price resolution, BEFORE the News Analyst and estimator gate — so dormant-dropped signals are measured (design choice per assignment note, recorded here as specified). Novelty: dup → drop pre-LLM (`novelty:dup`, zero token burn); repeat/novel counted; read failure → fail-OPEN + `novelty:check_failed` (novelty is a burst filter, not a capital gate — the honest gates downstream still protect). Sampler stats joined the 5-min stats reporter. `scripts/signal_drift_report.py`: per category × event-type mean signed drift + n + pass rate at each horizon, verdict = mean drift as gross edge for a velocity TAKER through the REAL Step 1 gate (cost_model + check_net_edge; fees exact, synthetic spread `DRIFT_VIABILITY_ASSUMED_SPREAD_CENTS`); markdown + Telegram; reads .env.test per the scripts rule; graceful DB-failure handling. **Suite: 306 → 355 passed / 0 failed** (18 novelty + 10 sampler + 6 wiring + 15 report). Test adaptations: test_integration 6_9 timeout indices +1 (novelty window read is now Supabase Call 1) — intent preserved. KEY FINDINGS (recorded): (1) Python 3.11 `asyncio.wait_for` swallows an external cancellation arriving after its inner future completed — a cancelled task survives and loops; new code uses `async with asyncio.timeout(...)` (repo precedent in main.py); (2) module-level `asyncio.Queue` binds to its first loop — `get_sampler_queue()` rebinds per running loop (single loop in prod; fresh queues in tests). Noticed issues (NOT fixed, per discipline): (a) **live PolyAgent Supabase has RLS disabled on all 11 tables** (Supabase advisor flags CRITICAL; enabling without policies locks the bot out — owner's call); (b) older scratch/*.py scripts `load_dotenv('.env')` contrary to the CLAUDE.md scripts rule (pre-existing); (c) Class A copy trades bypass coordinator/pipeline by design → NOT instrumented (candidate: hook `_execute_class_a` later); (d) same-market copy-signal bursts hit novelty before the tranche gate (consistent with MAX_MARKET_TRANCHES, noted); (e) market_signals.event_type == category today (classify_signal writes the same value) so report grouping degenerates gracefully; (f) pending sampler reads are in-memory — a restart loses them (recorded as NULLs; backfill out of scope); (g) `asyncio.wait_for` footgun exists in OTHER pre-existing modules' timeout wrappers (untouched here). | Start **Step 3** (A7: attribution columns migration + `risk/edge_monitor.py` CUSUM + allocation rule + `strategy_dashboard.py` — ⏱ TIME-GATED: ledger clock starts with the first paper trade after it lands). Before that: owner applies the signal_outcomes migration / restarts the bot to start the data clock. |
 | 2026-10-06 | 1 | **Step 1 (A2) DONE.** Created `risk/cost_model.py` (pure: `BookSnapshot`/`FeeConfig`/`CostBreakdown`, `taker_fee_units` = rate×p×(1−p) per D-09, `half_spread_units`, `expected_slippage_units` with zero-depth/oversize fail-closed 1.0, `maker_fill_haircut_units`, `compute_cost_breakdown`/`net_edge` signed by side, `check_net_edge` (strict > 2¢; band 0.10–0.90 takers only), `decide_order_type` per `MAKER_ORDER_STRATEGIES`, unknown→taker fail-safe). Added `data/market_discovery.get_market_book` (fail-closed `Optional[BookSnapshot]`, depth = thinner side over top-10 levels). Pipeline: gross `check_edge` swapped for the net-edge gate — fetches the live book (`book_token_id` = cache token for news path, signal `market_id` for non-cache/copy path, the classifier-proven key), decides maker/taker, logs the mandatory `[OBSERVABILITY][NET_EDGE]` cost breakdown on every entry evaluation (both paths via the shared gate), blocks on `low_net_edge` / `price_band` / `book_unavailable` with new drop counters. `check_edge` deprecated (one-time warning, kept one release for tests, zero live callers). Config: verified fee schedule (D-09), `MIN_NET_EDGE_CENTS=0.02`, `TRADEABLE_PRICE_BAND=(0.10,0.90)`, `MAKER_FILL_HAIRCUT=0.01`, `SLIPPAGE_SPREAD_MULTIPLE=1.2`, `MAKER_FALLBACK_SECONDS=20`. Tests: 47 cost-model unit + 5 gate integration (incl. the DoD 2¢-trap test and log-format assert); fixtures made direction-aware + book-patched; 6_5 case-2 estimate overridden (honest gate blocks trades whose final direction opposes the estimate — correct new behavior). **Suite: 254 → 306 passed / 0 failed.** Noticed issues (NOT fixed): (1) classifier `_fetch_live_ask` passes the signal's `market_id` (a data-api condition id) as the CLOB `token_id` — if it ever stops resolving, Class B signals drop upstream at `DROP:price_fetch_failed`; pipeline book key intentionally mirrors it; (2) `MAKER_FALLBACK_SECONDS` enforcement (unfilled-maker → taker) is execution-phase work (Phase 3), config-ready now; (3) slippage is a conservative flat `full_spread×1.2` until Step 5's empirical curve. | Start **Step 2** (A6: `signal_outcomes` instrumentation + novelty detection — ⏱ TIME-GATED: data clock starts when this lands) |
 | 2026-10-06 | 0 | **Step 0 (A1-S) DONE.** Created `strategies/estimator.py` (`EstimateResult` frozen contract, fail-closed registry, Laplace wallet hit-rate for `copy_edge_class_b`; `recalibration`/`velocity`/`resolution` stubs per D-02/D-05; `side_probability` helper for Step 4). Pipeline: estimator gate on BOTH fast+full paths — drop pre-LLM with `estimate:no_data`; edge gate + `open_positions.agent_estimate` consume the same `p_point` (no recompute); real `time_to_res` parsed from `end_date_iso` via `_parse_end_date` helper (deduped the deadline-gate parse); missing/invalid → `config.DEFAULT_TTR_HOURS=720` + `estimate:ttr_fallback` counter (visibility tag, not a drop). `decide_trade` prompt now shows `Model Probability Estimate (source: {method}, n={n})` via required `estimate_method`/`estimate_sample_size` kwargs. Tests: 25 estimator unit + 5 pipeline integration (no-constant reachable, zero-token-burn drop, fast-path dormancy, Laplace flow, TTR real+fallback); 23 dormancy-broken existing tests repaired with an `estimator_has_data` fixture (original intent preserved); Class B e2e wallet seeded 18W/2L so the REAL estimator runs end-to-end. **Suite: baseline 224 → 254 passed / 0 failed.** Grep gate clean (`0\.10` and `48.0` gone from live paths). Drift notes: E-1..E-5 line numbers all confirmed exactly. D-08 recorded (`wallet_address` kwarg). Noticed issues (NOT fixed, per discipline): (1) Class B copy signals often lack `end_date_iso` — metadata is only fetched when `matching_markets` non-empty, so `ttr_fallback` fires by design on that path (candidate improvement, out of Step 0 scope); (2) `test_all_four_paths_hit_the_gate` seeds the fast-path cache with a `keywords` key but `get_cached_keywords` reads `resolution_keywords` — path 1 actually routes full; pre-existing test quirk, untouched. | ~~Start Step 1~~ → done, see above |
 | 2026-10-06 | — | Plan created; root causes verified in code (E-1..E-10); work order agreed (A3 last) | Await operator go for **Step 0** |
