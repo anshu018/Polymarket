@@ -132,17 +132,21 @@ async def _process_loop(queue: asyncio.Queue) -> None:
 async def _stats_reporter() -> None:
     """Log a pipeline health summary every 5 minutes."""
     from coordinator.pipeline import get_drop_counters
+    from data.forward_sampler import get_sampler_stats
     while True:
         await asyncio.sleep(300)
         drops = get_drop_counters()
         drops_str = " ".join(f"{k}={v}" for k, v in drops.items())
+        sampler = get_sampler_stats()
+        sampler_str = " ".join(f"{k}={v}" for k, v in sampler.items())
         logger.info(
             "[PIPELINE][5MIN_STATS] "
             f"received={_pipeline_stats['signals_received']} "
             f"spacy_pass={_pipeline_stats['spacy_passed']} "
             f"analyst_pass={_pipeline_stats['analyst_passed']} "
             f"analyst_fail={_pipeline_stats['analyst_failures']} | "
-            f"drops: {drops_str}"
+            f"drops: {drops_str} | "
+            f"sampler: {sampler_str}"
         )
 
 

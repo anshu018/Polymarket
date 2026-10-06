@@ -113,6 +113,14 @@ async def main():
         asyncio.create_task(run_class_b_executor(_copy_queue_b), name="copy_executor_b")
         logger.info("[COPY_EDGE] Strategy 5 CopyTrade engine started (poller + classifier + 2 executors).")
 
+        # Start the Step 2 forward-price sampler (List A.md A6). Consumes the
+        # instrumentation jobs the pipeline hook enqueues for every signal and
+        # records +1m/+5m/+15m/+60m prices into signal_outcomes — the data
+        # clock behind the velocity estimator and the drift report.
+        from data.forward_sampler import run_forward_sampler_supervisor
+        asyncio.create_task(run_forward_sampler_supervisor(), name="forward_price_sampler")
+        logger.info("[FORWARD_SAMPLER] Forward-price sampler started (supervisor task).")
+
         # Validate News Analyst models before starting signal processing
         from llm.news_analyst import validate_models
         logger.info("Validating news analyst models...")
