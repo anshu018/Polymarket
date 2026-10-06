@@ -12,10 +12,10 @@
 |---|---|
 | Created | 2026-10-06 |
 | Last updated | 2026-10-06 |
-| Current phase | Phase 0 — Step 0 complete |
-| Current step | **Step 0 DONE** — next action is **Step 1** (A2 cost model + net-edge gate) |
-| Overall status | **IN PROGRESS — Step 0 landed** (main news pipeline fail-closed dormant by design; Copy Edge Class B live on wallet hit-rate; Class A estimate-free via executor path) |
-| Live-pipeline safety state | ✅ SAFE since Step 0: fake `+0.10` edge removed (grep-clean); every entry requires a measured estimate — no data → drop. |
+| Current phase | Phase 0 — Steps 0–1 complete |
+| Current step | **Step 1 DONE** — next action is **Step 2** (A6 signal instrumentation + novelty detection — ⏱ TIME-GATED) |
+| Overall status | **IN PROGRESS — Steps 0–1 landed** (estimator fail-closed + honest net-edge gate; every entry logs a full cost breakdown) |
+| Live-pipeline safety state | ✅ SAFE: no fake edge, no constant estimates, and entries now require net_edge > 2¢ after verified fees + spread + slippage from a live book. |
 
 **How to resume work (any future session):**
 1. Read this file top to bottom.
@@ -104,7 +104,7 @@ Status vocabulary: `NOT STARTED` / `IN PROGRESS` / `BLOCKED` / `DONE` / `VERIFIE
 | Step | Item | Depends on | Status | Started | Completed | Notes |
 |---|---|---|---|---|---|---|
 | 0 | A1-S Estimator contract + fail-closed swap + real `time_to_res` | — | **DONE** | 2026-10-06 | 2026-10-06 | Fake `+0.10` removed (grep-clean); 254 tests green (baseline 224 + 30 new); D-08 `wallet_address` kwarg |
-| 1 | A2 Cost model + net-edge gate + maker/taker rule | Step 0 (contract only) | NOT STARTED | — | — | Pure code, no data needed |
+| 1 | A2 Cost model + net-edge gate + maker/taker rule | Step 0 (contract only) | **DONE** | 2026-10-06 | 2026-10-06 | Fee schedule VERIFIED (D-09); `check_edge` deprecated, no live callers; 306 tests green (254 + 52 new) |
 | 2 | A6 `signal_outcomes` instrumentation + novelty detection | — | NOT STARTED | — | — | ⏱ TIME-GATED: every week not running = data lost forever |
 | 3 | A7 Attribution columns + edge-fade monitor (CUSUM) | — | NOT STARTED | — | — | ⏱ TIME-GATED: ledger should compound from first paper trade |
 | 4 | A4 Kelly on real probability + shrinkage | Steps 0, 1 | NOT STARTED | — | — | Copy Class B gets real Kelly immediately |
@@ -210,18 +210,20 @@ Class B e2e wallet given 18W/2L history so the REAL estimator runs end-to-end. S
    `gross_edge, fee_units, spread_units, slippage_units, net_edge, order_type, price_band_ok`.
 
 **Work plan.**
-- [ ] `risk/cost_model.py` + unit tests (fee math at 2¢/50¢/98¢; sign correctness YES/NO; zero-book fail-closed)
-- [ ] VERIFY Polymarket fee schedule from docs; set config values; record source in Decision Log
-- [ ] Config keys: `TAKER_FEE_RATE`, `MAKER_FEE_RATE`, `MAKER_FILL_HAIRCUT`, `MIN_NET_EDGE_CENTS`,
-      `TRADEABLE_PRICE_BAND`, `MAKER_FALLBACK_SECONDS`
-- [ ] Swap gate call site in `pipeline.py`; deprecate `check_edge`
-- [ ] Maker/taker rule module + per-strategy config map
-- [ ] Decision-log line wired into both pipeline paths
-- [ ] Tests: gate blocks when net_edge ≤ MIN_NET_EDGE; low-price taker blocked; maker bypass of price band; log format
+- [x] `risk/cost_model.py` + unit tests (fee math at 2¢/50¢/98¢; sign correctness YES/NO; zero-book fail-closed)
+- [x] VERIFY Polymarket fee schedule from docs; set config values; record source in Decision Log (→ D-09)
+- [x] Config keys: `TAKER_FEE_RATE`, `MAKER_FEE_RATE`, `MAKER_FILL_HAIRCUT`, `MIN_NET_EDGE_CENTS`,
+      `TRADEABLE_PRICE_BAND`, `MAKER_FALLBACK_SECONDS` (+ `TAKER_FEE_RATE_BY_CATEGORY`, `SLIPPAGE_SPREAD_MULTIPLE`, `BOOK_DEPTH_TOP_LEVELS`, `MAKER_ORDER_STRATEGIES`)
+- [x] Swap gate call site in `pipeline.py`; deprecate `check_edge`
+- [x] Maker/taker rule module + per-strategy config map
+- [x] Decision-log line wired into both pipeline paths (`[OBSERVABILITY][NET_EDGE]` at the shared gate)
+- [x] Tests: gate blocks when net_edge ≤ MIN_NET_EDGE; low-price taker blocked; maker bypass of price band; log format
 
 **Definition of Done.** No entry decision possible without a cost breakdown in logs; tests prove
 the 2¢ taker-fee trap is blocked; old `check_edge` no longer called from live paths.
-Status: **NOT STARTED**.
+Status: **DONE (2026-10-06)** — 47 cost-model unit tests + 5 pipeline gate integration tests;
+fixtures made direction-aware (the honest gate blocks trades whose final direction opposes the
+estimate — the old direction-blind gross gate let those through). Suite: 306 passed / 0 failed.
 
 ---
 
@@ -501,6 +503,7 @@ logged with method + n. Status: **NOT STARTED** (deferred by operator decision �
 | D-06 | 2026-10-06 | Launch-strategy implication accepted: go-live menu is copy-trade-first until Step 6 | Recalibration (planned Strategy 2) requires A3 |
 | D-07 | 2026-10-06 | Fee schedule values marked VERIFY — parameterized, never hardcoded | Schedule may change; operator's 3.9%-at-2¢ figure to be confirmed from official docs |
 | D-08 | 2026-10-06 | `get_estimate()` gained optional keyword param `wallet_address` (not in the frozen spec signature) | copy_edge_class_b estimator must attribute the estimate to the tracked wallet behind the signal; the pipeline already holds `wallet_address` (run_pipeline param, set by executor.py); estimator fail-closes when absent; backward-compatible, unused by stub estimators |
+| D-09 | 2026-10-06 | Fee schedule VERIFIED from official docs and encoded in config: `fee = shares × feeRate × p × (1−p)`; makers NEVER charged (15–25% rebates); taker feeRate per category (politics/finance/tech/mentions 0.04, crypto 0.07, sports/economics/culture/weather 0.05, default "Other" 0.05, geopolitics 0) | Source: https://docs.polymarket.com/polymarket-learn/trading/fees (fetched 2026-10-06; formula also matches Polymarket ctf-exchange docs). Sanity check: politics at 2¢ → 0.04×0.02×0.98 ≈ 3.9% of trade value — matches the operator's reported figure, closing D-07's VERIFY item |
 
 ## 10. RISK REGISTER
 
@@ -517,7 +520,8 @@ logged with method + n. Status: **NOT STARTED** (deferred by operator decision �
 
 | Date | Step | What was done | Next action |
 |---|---|---|---|
-| 2026-10-06 | 0 | **Step 0 (A1-S) DONE.** Created `strategies/estimator.py` (`EstimateResult` frozen contract, fail-closed registry, Laplace wallet hit-rate for `copy_edge_class_b`; `recalibration`/`velocity`/`resolution` stubs per D-02/D-05; `side_probability` helper for Step 4). Pipeline: estimator gate on BOTH fast+full paths — drop pre-LLM with `estimate:no_data`; edge gate + `open_positions.agent_estimate` consume the same `p_point` (no recompute); real `time_to_res` parsed from `end_date_iso` via `_parse_end_date` helper (deduped the deadline-gate parse); missing/invalid → `config.DEFAULT_TTR_HOURS=720` + `estimate:ttr_fallback` counter (visibility tag, not a drop). `decide_trade` prompt now shows `Model Probability Estimate (source: {method}, n={n})` via required `estimate_method`/`estimate_sample_size` kwargs. Tests: 25 estimator unit + 5 pipeline integration (no-constant reachable, zero-token-burn drop, fast-path dormancy, Laplace flow, TTR real+fallback); 23 dormancy-broken existing tests repaired with an `estimator_has_data` fixture (original intent preserved); Class B e2e wallet seeded 18W/2L so the REAL estimator runs end-to-end. **Suite: baseline 224 → 254 passed / 0 failed.** Grep gate clean (`0\.10` and `48.0` gone from live paths). Drift notes: E-1..E-5 line numbers all confirmed exactly. D-08 recorded (`wallet_address` kwarg). Noticed issues (NOT fixed, per discipline): (1) Class B copy signals often lack `end_date_iso` — metadata is only fetched when `matching_markets` non-empty, so `ttr_fallback` fires by design on that path (candidate improvement, out of Step 0 scope); (2) `test_all_four_paths_hit_the_gate` seeds the fast-path cache with a `keywords` key but `get_cached_keywords` reads `resolution_keywords` — path 1 actually routes full; pre-existing test quirk, untouched. | Start **Step 1** (A2: cost model + net-edge gate + maker/taker rule) — VERIFY Polymarket fee schedule from official docs first |
+| 2026-10-06 | 1 | **Step 1 (A2) DONE.** Created `risk/cost_model.py` (pure: `BookSnapshot`/`FeeConfig`/`CostBreakdown`, `taker_fee_units` = rate×p×(1−p) per D-09, `half_spread_units`, `expected_slippage_units` with zero-depth/oversize fail-closed 1.0, `maker_fill_haircut_units`, `compute_cost_breakdown`/`net_edge` signed by side, `check_net_edge` (strict > 2¢; band 0.10–0.90 takers only), `decide_order_type` per `MAKER_ORDER_STRATEGIES`, unknown→taker fail-safe). Added `data/market_discovery.get_market_book` (fail-closed `Optional[BookSnapshot]`, depth = thinner side over top-10 levels). Pipeline: gross `check_edge` swapped for the net-edge gate — fetches the live book (`book_token_id` = cache token for news path, signal `market_id` for non-cache/copy path, the classifier-proven key), decides maker/taker, logs the mandatory `[OBSERVABILITY][NET_EDGE]` cost breakdown on every entry evaluation (both paths via the shared gate), blocks on `low_net_edge` / `price_band` / `book_unavailable` with new drop counters. `check_edge` deprecated (one-time warning, kept one release for tests, zero live callers). Config: verified fee schedule (D-09), `MIN_NET_EDGE_CENTS=0.02`, `TRADEABLE_PRICE_BAND=(0.10,0.90)`, `MAKER_FILL_HAIRCUT=0.01`, `SLIPPAGE_SPREAD_MULTIPLE=1.2`, `MAKER_FALLBACK_SECONDS=20`. Tests: 47 cost-model unit + 5 gate integration (incl. the DoD 2¢-trap test and log-format assert); fixtures made direction-aware + book-patched; 6_5 case-2 estimate overridden (honest gate blocks trades whose final direction opposes the estimate — correct new behavior). **Suite: 254 → 306 passed / 0 failed.** Noticed issues (NOT fixed): (1) classifier `_fetch_live_ask` passes the signal's `market_id` (a data-api condition id) as the CLOB `token_id` — if it ever stops resolving, Class B signals drop upstream at `DROP:price_fetch_failed`; pipeline book key intentionally mirrors it; (2) `MAKER_FALLBACK_SECONDS` enforcement (unfilled-maker → taker) is execution-phase work (Phase 3), config-ready now; (3) slippage is a conservative flat `full_spread×1.2` until Step 5's empirical curve. | Start **Step 2** (A6: `signal_outcomes` instrumentation + novelty detection — ⏱ TIME-GATED: data clock starts when this lands) |
+| 2026-10-06 | 0 | **Step 0 (A1-S) DONE.** Created `strategies/estimator.py` (`EstimateResult` frozen contract, fail-closed registry, Laplace wallet hit-rate for `copy_edge_class_b`; `recalibration`/`velocity`/`resolution` stubs per D-02/D-05; `side_probability` helper for Step 4). Pipeline: estimator gate on BOTH fast+full paths — drop pre-LLM with `estimate:no_data`; edge gate + `open_positions.agent_estimate` consume the same `p_point` (no recompute); real `time_to_res` parsed from `end_date_iso` via `_parse_end_date` helper (deduped the deadline-gate parse); missing/invalid → `config.DEFAULT_TTR_HOURS=720` + `estimate:ttr_fallback` counter (visibility tag, not a drop). `decide_trade` prompt now shows `Model Probability Estimate (source: {method}, n={n})` via required `estimate_method`/`estimate_sample_size` kwargs. Tests: 25 estimator unit + 5 pipeline integration (no-constant reachable, zero-token-burn drop, fast-path dormancy, Laplace flow, TTR real+fallback); 23 dormancy-broken existing tests repaired with an `estimator_has_data` fixture (original intent preserved); Class B e2e wallet seeded 18W/2L so the REAL estimator runs end-to-end. **Suite: baseline 224 → 254 passed / 0 failed.** Grep gate clean (`0\.10` and `48.0` gone from live paths). Drift notes: E-1..E-5 line numbers all confirmed exactly. D-08 recorded (`wallet_address` kwarg). Noticed issues (NOT fixed, per discipline): (1) Class B copy signals often lack `end_date_iso` — metadata is only fetched when `matching_markets` non-empty, so `ttr_fallback` fires by design on that path (candidate improvement, out of Step 0 scope); (2) `test_all_four_paths_hit_the_gate` seeds the fast-path cache with a `keywords` key but `get_cached_keywords` reads `resolution_keywords` — path 1 actually routes full; pre-existing test quirk, untouched. | ~~Start Step 1~~ → done, see above |
 | 2026-10-06 | — | Plan created; root causes verified in code (E-1..E-10); work order agreed (A3 last) | Await operator go for **Step 0** |
 
 ## 12. PART A EXIT CRITERIA (all must hold)
