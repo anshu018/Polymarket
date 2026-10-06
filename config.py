@@ -150,6 +150,32 @@ SLIPPAGE_SPREAD_MULTIPLE = 1.2          # conservative default slippage = full_s
 BOOK_DEPTH_TOP_LEVELS = 10              # levels summed per side for book depth (USDC)
 MAKER_ORDER_STRATEGIES = {"recalibration", "resolution", "copy_edge_class_b"}  # rest → taker
 
+# ── SIGNAL INSTRUMENTATION & NOVELTY (List A.md Step 2 — A6) ─────────────────
+# Novelty detection is deterministic (data/novelty.py): a signal is a "repeat"
+# when its headline_hash already appeared for the market inside the trailing
+# window, or its entity set overlaps a prior signal's set by
+# JACCARD_REPEAT_THRESHOLD or more. First occurrence → novelty_factor 1.0,
+# repeat → NOVELTY_REPEAT_FACTOR, third+ similar signal in the window → dropped
+# (counter "novelty:dup") BEFORE any LLM token burn. The factor itself is
+# consumed by the velocity estimator (Step 6f), not by Step 2 gating.
+NOVELTY_WINDOW_HOURS = 24               # trailing window for repeat/similarity lookups
+JACCARD_REPEAT_THRESHOLD = 0.5          # entity-set Jaccard at/above this → same event thread
+NOVELTY_REPEAT_FACTOR = 0.5             # novelty_factor for a repeat (first signal = 1.0)
+NOVELTY_MAX_HISTORY_ROWS = 200          # cap on the per-market window query (safety valve —
+                                        # a burst cannot make the novelty read unbounded)
+# Forward-price sampler: on every signal entering the pipeline (before the
+# estimator gate — dormant-dropped signals are still measured), one row in
+# signal_outcomes plus 4 delayed CLOB midpoint reads at these offsets from the
+# signal's arrival time (t0). Misses (timeout, book unavailable) stay NULL —
+# explicit NULLs are valid data, not errors. The sampler is best-effort by
+# design and can never crash the pipeline; pending reads are lost on restart
+# (recorded as NULLs).
+FORWARD_SAMPLER_HORIZONS_SECONDS = (60, 300, 900, 3600)   # +1m/+5m/+15m/+60m
+FORWARD_SAMPLER_READ_TIMEOUT_SECONDS = 8                  # outer timeout per price read
+                                                          # (get_market_price has its own 4s)
+FORWARD_SAMPLER_QUEUE_MAXSIZE = 500                       # max queued sampling jobs; full →
+                                                          # job dropped, logged, never blocks
+
 KELLY_FRACTION_VELOCITY = 0.15
 KELLY_FRACTION_RECALIBRATION = 0.25
 KELLY_FRACTION_CORRELATION = 0.25
