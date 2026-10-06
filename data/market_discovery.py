@@ -6,6 +6,7 @@ import json
 from typing import Optional
 import httpx
 import config
+from risk.cost_model import BookSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -324,6 +325,91 @@ async def get_market_price(token_id: str) -> float:
         raise
     except Exception as e:
         raise MarketPriceUnavailableError(f"Unexpected pricing error: {e}") from e
+
+async def get_market_book(token_id: str) -> Optional[BookSnapshot]:
+    """
+    Fetch the current CLOB order book for a token as a cost-model BookSnapshot
+    (List A.md Step 1 — the net-edge gate prices entries from this).
+
+    Unlike get_market_price (which raises), this returns None on ANY failure —
+    timeout, HTTP error, empty or crossed book, parse error — so the caller can
+    fail closed: the gate must never price an entry from an unverifiable book.
+
+    depth_usd is the conservative fill depth: the thinner side of the book, summed
+    over the top config.BOOK_DEPTH_TOP_LEVELS levels (size × price, USDC).
+
+    Args:
+        token_id: CLOB token id (clobTokenIds[0] = YES token on the discovery cache).
+
+    Returns:
+        BookSnapshot, or None when the book is unavailable or unusable.
+    """
+
+    def _side_depth(levels: list[dict], descending: bool) -> float:
+        """Sum size × price over the top-N levels of one side (USDC)."""
+        try:
+            priced = sorted(
+                ((float(lvl["price"]), float(lvl.get("size", 0.0) or 0.0)) for lvl in levels),
+                key=lambda pair: pair[0],
+                reverse=descending,
+            )
+        except (ValueError, KeyError, TypeError):
+            return 0.0
+        return sum(price * size for price, size in priced[:config.BOOK_DEPTH_TOP_LEVELS])
+
+    async def _fetch() -> Optional[BookSnapshot]:
+        url = f"https://clob.polymarket.com/book?token_id={token_id}"
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(url, timeout=4.0)
+            except Exception as e:
+                logger.warning("[MARKET_DISCOVERY] Book fetch failed for %s: %s", token_id[:16], e)
+                return None
+
+            if response.status_code != 200:
+                logger.warning(
+                    "[MARKET_DISCOVERY] CLOB book returned HTTP %d for token %s",
+                    response.status_code, token_id[:16],
+                )
+                return None
+
+            try:
+                data = response.json()
+                bids = data.get("bids", [])
+                asks = data.get("asks", [])
+                if not bids or not asks:
+                    logger.warning("[MARKET_DISCOVERY] Empty book (bids=%d asks=%d) for token %s",
+                                   len(bids), len(asks), token_id[:16])
+                    return None
+                best_bid = max(float(b["price"]) for b in bids)
+                best_ask = min(float(a["price"]) for a in asks)
+            except (ValueError, KeyError, TypeError) as e:
+                logger.warning("[MARKET_DISCOVERY] Failed to parse book for token %s: %s",
+                               token_id[:16], e)
+                return None
+
+            # Fail closed on unusable books: crossed, one-sided extremes, or certainty.
+            if not (0.0 < best_bid <= best_ask < 1.0):
+                logger.warning(
+                    "[MARKET_DISCOVERY] Unusable book for token %s: bid=%.4f ask=%.4f",
+                    token_id[:16], best_bid, best_ask,
+                )
+                return None
+
+            depth_usd = min(
+                _side_depth(bids, descending=True),
+                _side_depth(asks, descending=False),
+            )
+            return BookSnapshot(best_bid=best_bid, best_ask=best_ask, depth_usd=depth_usd)
+
+    try:
+        return await asyncio.wait_for(_fetch(), timeout=4.0)
+    except asyncio.TimeoutError:
+        logger.warning("[MARKET_DISCOVERY] get_market_book timed out for token %s", token_id[:16])
+        return None
+    except Exception as e:
+        logger.warning("[MARKET_DISCOVERY] Unexpected book error for token %s: %s", token_id[:16], e)
+        return None
 
 async def get_market_metadata(market_id: str) -> dict:
     """
