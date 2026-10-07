@@ -24,8 +24,23 @@ SQL_MIGRATIONS = [
             category TEXT,
             idempotency_uuid UUID,
             opened_at TIMESTAMPTZ DEFAULT NOW(),
-            last_checked_at TIMESTAMPTZ
+            last_checked_at TIMESTAMPTZ,
+            thesis_id TEXT,
+            p_model_at_entry DECIMAL(10,4),
+            market_price_at_entry DECIMAL(10,4),
+            net_edge_at_entry DECIMAL(10,4),
+            costs_paid_usdc DECIMAL(10,4),
+            order_type TEXT
         );
+        -- List A.md Step 3 (A7): attribution columns for databases created
+        -- before Step 3. Canonical DDL lives in
+        -- scratch/migration_attribution_columns.sql — keep the two in sync.
+        ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS thesis_id TEXT;
+        ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS p_model_at_entry DECIMAL(10,4);
+        ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS market_price_at_entry DECIMAL(10,4);
+        ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS net_edge_at_entry DECIMAL(10,4);
+        ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS costs_paid_usdc DECIMAL(10,4);
+        ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS order_type TEXT;
         """
     },
     {
@@ -51,8 +66,25 @@ SQL_MIGRATIONS = [
             opened_at TIMESTAMPTZ,
             closed_at TIMESTAMPTZ DEFAULT NOW(),
             was_memoryless BOOLEAN DEFAULT FALSE,
-            notes TEXT
+            notes TEXT,
+            thesis_id TEXT,
+            p_model_at_entry DECIMAL(10,4),
+            market_price_at_entry DECIMAL(10,4),
+            net_edge_at_entry DECIMAL(10,4),
+            costs_paid_usdc DECIMAL(10,4),
+            order_type TEXT
         );
+        -- List A.md Step 3 (A7): attribution columns for databases created
+        -- before Step 3. Canonical DDL lives in
+        -- scratch/migration_attribution_columns.sql — keep the two in sync.
+        ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS thesis_id TEXT;
+        ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS p_model_at_entry DECIMAL(10,4);
+        ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS market_price_at_entry DECIMAL(10,4);
+        ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS net_edge_at_entry DECIMAL(10,4);
+        ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS costs_paid_usdc DECIMAL(10,4);
+        ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS order_type TEXT;
+        CREATE INDEX IF NOT EXISTS idx_closed_trades_strategy_closed_at
+            ON closed_trades (strategy, closed_at DESC);
         """
     },
     {
