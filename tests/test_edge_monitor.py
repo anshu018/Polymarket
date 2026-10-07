@@ -282,3 +282,11 @@ def test_neutral_allocation_shape():
         strategy="copy_edge_class_a", n=0, rolling_net_edge=0.0, rolling_sharpe=0.0,
         weight=1.0, probation=False, retired=False, faded=False, cusum_score=0.0,
     )
+
+
+def test_clean_edges_coerces_ledger_types_and_drops_bad_strings():
+    """Ledger numerics can decode as Decimal/str — coerce; unconvertible and
+    'NaN' strings are non-measurements."""
+    from decimal import Decimal
+    series = [Decimal("0.05"), "0.03", "NaN", "garbage", 7, None]
+    assert clean_edges(series) == [0.05, 0.03, 7.0]

@@ -70,7 +70,9 @@ def clean_edges(edges: Sequence[Optional[float]]) -> list[float]:
 
     NULL (`net_edge_at_entry` absent — no cost model ran) and NaN (corrupt
     row) carry no evidence and are skipped, never coerced to 0 — treating a
-    missing measurement as a zero-edge trade would fabricate a fade.
+    missing measurement as a zero-edge trade would fabricate a fade. Values
+    are coerced through float() first so Decimals / numeric strings from the
+    ledger decode cleanly; anything unconvertible is a non-measurement too.
 
     Args:
         edges: Per-trade net edges in chronological order (oldest first).
@@ -82,9 +84,13 @@ def clean_edges(edges: Sequence[Optional[float]]) -> list[float]:
     for edge in edges:
         if edge is None:
             continue
-        if isinstance(edge, float) and math.isnan(edge):
+        try:
+            value = float(edge)
+        except (TypeError, ValueError):
             continue
-        clean.append(float(edge))
+        if math.isnan(value):
+            continue
+        clean.append(value)
     return clean
 
 

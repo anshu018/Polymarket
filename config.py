@@ -185,7 +185,8 @@ DRIFT_VIABILITY_ASSUMED_SPREAD_CENTS = 0.03  # report-ONLY synthetic full spread
 # ── EDGE-FADE MONITOR (List A.md Step 3 — A7) ────────────────────────────────
 # risk/edge_monitor.py runs a one-sided downward CUSUM on per-trade net edge
 # (closed_trades.net_edge_at_entry): S_t = max(0, S_{t-1} + (−e_t − CUSUM_DRIFT)),
-# fade flag when max_t S_t > CUSUM_THRESHOLD. Values TUNED ONCE on seeded
+# fade flag when S at the end of the fed window > CUSUM_THRESHOLD (score =
+# max_t S_t). Values TUNED ONCE on seeded
 # synthetic series (σ = 3¢ per-trade noise) and recorded in Decision Log D-10:
 # a 30-trade zero-edge run triggers ~2% of the time (an exact-zero run never),
 # a healthy +5¢ edge never triggers (0/500 over 100 trades), a persistent
