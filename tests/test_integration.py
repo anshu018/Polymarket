@@ -861,16 +861,19 @@ async def test_6_9_idempotency_timeout_fails_closed(
     mock_llm_apis["news_analyst_confidence"] = 0.80
     
     # Supabase call sequence with market tranche checks (Step 2 adds the
-    # novelty window read as Call 1 — the pipeline hook runs before the analyst):
+    # novelty window read as Call 1 — the pipeline hook runs before the analyst;
+    # Step 3 adds the allocation ledger read as Call 6 — after the net-edge
+    # gate, before the exposure fetch):
     # Call 1: novelty window read (succeeds)
     # Call 2: load_market_state pre-check (succeeds)
     # Call 3: _check_cache (no hit)
     # Call 4: _write_cache (succeeds)
     # Call 5: fetch_relevant_lessons (succeeds)
-    # Call 6: fetch_open_positions_exposure (succeeds)
-    # Call 7: load_market_state inside market_lock (succeeds)
-    # Call 8: check_pre_order_idempotency (times out!)
-    mock_supabase_client.timeout_on_calls = {8}
+    # Call 6: allocation history read (closed_trades — succeeds)
+    # Call 7: fetch_open_positions_exposure (succeeds)
+    # Call 8: load_market_state inside market_lock (succeeds)
+    # Call 9: check_pre_order_idempotency (times out!)
+    mock_supabase_client.timeout_on_calls = {9}
 
     with pytest.raises(RuntimeError, match="Trading halted due to idempotency (check|write) timeout"):
         await run_pipeline(

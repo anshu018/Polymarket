@@ -197,6 +197,29 @@ EDGE_ROLLING_WINDOW = 30                # trailing window for rolling_net_edge /
                                         # rolling_net_sharpe (List A.md Step 3
                                         # "window=30", config is the live truth)
 
+# ── ALLOCATION RULE (List A.md Step 3 — A7, mechanical) ──────────────────────
+# Enforcement point: the sizing read path (coordinator/pipeline.py, between
+# kelly_size and position_size_check). Derivation (risk/edge_monitor.py
+# derive_allocations) is pure math over the closed_trades ledger:
+#   - below REALLOC_MIN_SAMPLES measured edges → weight 1.0 (unweighted default)
+#   - above: weight ∝ per-trade rolling net Sharpe, normalized so the mean
+#     weight across positive-Sharpe strategies is 1.0, clamped to
+#     [0, REALLOC_WEIGHT_MAX]; Sharpe ≤ 0 → weight 0; if NO eligible strategy
+#     has a positive Sharpe, all eligible fall back to 1.0 (probation and
+#     retirement do the throttling)
+#   - probation (mean net edge of the last STRATEGY_PROBATION_TRADE_COUNT
+#     trades < STRATEGY_PROBATION_EDGE_THRESHOLD_CENTS) → size ×
+#     PROBATION_SIZE_MULTIPLIER
+#   - two consecutive complete probation windows → retired (entry dropped with
+#     counter "allocation:retired"; the trades are never deleted)
+# Read failure of the closed_trades history → neutral allocation (weight 1.0,
+# no probation) + WARNING: this is an advisory throttle, not a capital gate —
+# the hard gates (net edge, exposure, idempotency) stay fail-closed.
+REALLOC_MIN_SAMPLES = 30                # measured edges before a strategy is weighted
+REALLOC_WEIGHT_MAX = 2.0                # clamp on the Sharpe-proportional multiplier
+PROBATION_SIZE_MULTIPLIER = 0.5         # size × this while a strategy is on probation
+ALLOCATION_HISTORY_LIMIT = 1000         # max closed_trades rows fetched per derivation
+
 KELLY_FRACTION_VELOCITY = 0.15
 KELLY_FRACTION_RECALIBRATION = 0.25
 KELLY_FRACTION_CORRELATION = 0.25

@@ -156,3 +156,129 @@ def test_cusum_explicit_params_override_config():
     result = cusum_fade([-0.01] * 10, threshold=100.0, drift=0.005)
     assert result.faded is False
     assert isinstance(result, CusumResult)
+
+
+# ── derive_allocations (Step 3 — A7 allocation rule) ─────────────────────────
+
+from risk.edge_monitor import StrategyAllocation, derive_allocations, neutral_allocation
+
+
+def make_rows(edges) -> list[dict]:
+    """Closed-trade rows (oldest first) carrying only what derivation reads."""
+    return [{"net_edge_at_entry": e} for e in edges]
+
+
+TWO_LEVEL_A = [0.02, 0.04] * 15   # mean 0.03, per-trade sharpe ≈ 2.95
+TWO_LEVEL_B = [0.02, 0.06] * 15   # mean 0.04, per-trade sharpe ≈ 1.97
+
+
+def test_derive_allocations_empty_input():
+    assert derive_allocations({}) == {}
+
+
+def test_below_min_samples_stays_unweighted():
+    """n < REALLOC_MIN_SAMPLES → weight 1.0 regardless of edge quality."""
+    alloc = derive_allocations({"s": make_rows([0.02] * 10)})["s"]
+    assert alloc.n == 10
+    assert alloc.weight == 1.0
+    assert alloc.probation is False          # window incomplete (10 < 20)
+    assert alloc.retired is False
+
+
+def test_probation_fires_on_thin_edge_window():
+    """Existing rule made live: mean net edge of the last 20 trades < 4¢."""
+    alloc = derive_allocations({"s": make_rows([0.025] * 20)})["s"]
+    assert alloc.probation is True
+    assert alloc.weight == 1.0               # still below min samples
+
+
+def test_no_probation_when_edge_healthy():
+    alloc = derive_allocations({"s": make_rows([0.05] * 20)})["s"]
+    assert alloc.probation is False
+
+
+def test_retired_after_two_consecutive_probation_windows():
+    alloc = derive_allocations({"s": make_rows([0.02] * 40)})["s"]
+    assert alloc.retired is True
+    assert alloc.probation is True
+
+
+def test_one_bad_window_then_healthy_is_probation_not_retired():
+    edges = [0.02] * 20 + [0.05] * 20        # latest window healthy
+    alloc = derive_allocations({"s": make_rows(edges)})["s"]
+    assert alloc.probation is False
+    assert alloc.retired is False
+
+
+def test_weight_proportional_to_rolling_sharpe_normalized_to_mean_one():
+    allocs = derive_allocations({
+        "a": make_rows(TWO_LEVEL_A),
+        "b": make_rows(TWO_LEVEL_B),
+    })
+    sa = rolling_net_sharpe(TWO_LEVEL_A)
+    sb = rolling_net_sharpe(TWO_LEVEL_B)
+    assert sa > 0 and sb > 0
+    # ∝ Sharpe: the weight ratio equals the Sharpe ratio...
+    assert allocs["a"].weight / allocs["b"].weight == pytest.approx(sa / sb)
+    # ...normalized so the mean weight across positive-Sharpe strategies is 1.0
+    assert (allocs["a"].weight + allocs["b"].weight) / 2 == pytest.approx(1.0)
+
+
+def test_negative_sharpe_eligible_strategy_gets_zero_weight():
+    constant = [0.05] * 30                   # exactly constant → sharpe 0
+    allocs = derive_allocations({
+        "good": make_rows(TWO_LEVEL_A),
+        "flat": make_rows(constant),
+    })
+    assert allocs["flat"].n == 30
+    assert allocs["flat"].rolling_sharpe == 0.0
+    assert allocs["flat"].weight == 0.0
+    assert allocs["good"].weight > 0.0
+
+
+def test_all_eligible_nonpositive_fall_back_to_unweighted():
+    allocs = derive_allocations({
+        "flat1": make_rows([0.05] * 30),
+        "flat2": make_rows([0.03] * 30),
+    })
+    assert allocs["flat1"].weight == 1.0
+    assert allocs["flat2"].weight == 1.0
+
+
+def test_weight_clamped_at_realloc_max():
+    """A tiny-variance strategy cannot take an unbounded multiplier."""
+    sharp = [0.0495, 0.0505] * 15            # mean 0.05, sharpe ≈ 49
+    allocs = derive_allocations({
+        "sharp": make_rows(sharp),
+        "b": make_rows(TWO_LEVEL_A),
+        "c": make_rows(TWO_LEVEL_B),
+    })
+    assert allocs["sharp"].weight == config.REALLOC_WEIGHT_MAX
+    # The others are scaled by the UNCLAMPED mean sharpe — cap applies per strategy.
+    sa, sb, sc = (rolling_net_sharpe(s) for s in (sharp, TWO_LEVEL_A, TWO_LEVEL_B))
+    assert allocs["b"].weight == pytest.approx(sb / ((sa + sb + sc) / 3))
+
+
+def test_null_edge_trades_stay_unweighted_and_unjudged():
+    """Class A semantics: trades without a cost model are never fabricated."""
+    alloc = derive_allocations({"s": make_rows([None] * 40)})["s"]
+    assert alloc.n == 0
+    assert alloc.weight == 1.0
+    assert alloc.probation is False
+    assert alloc.retired is False
+
+
+def test_cusum_fade_surfaced_on_allocation():
+    edges = [0.05] * 30 + [-0.01] * 55       # persistent fade in the recent tail
+    alloc = derive_allocations({"s": make_rows(edges)})["s"]
+    assert alloc.faded is True
+    assert alloc.cusum_score > config.CUSUM_THRESHOLD
+    assert alloc.probation is True           # last 20 mean = −1¢
+
+
+def test_neutral_allocation_shape():
+    a = neutral_allocation("copy_edge_class_a")
+    assert a == StrategyAllocation(
+        strategy="copy_edge_class_a", n=0, rolling_net_edge=0.0, rolling_sharpe=0.0,
+        weight=1.0, probation=False, retired=False, faded=False, cusum_score=0.0,
+    )

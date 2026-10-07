@@ -29,6 +29,7 @@ from data import novelty
 from data import forward_sampler
 from strategies.estimator import get_estimate
 from risk import cost_model
+from risk.edge_monitor import StrategyAllocation, derive_allocations, neutral_allocation
 from monitoring.telegram_alerts import (
     alert_supabase_degradation,
     alert_idempotency_duplicate,
@@ -427,6 +428,47 @@ async def log_to_open_positions(
         logger.info(f"[PIPELINE] Position logged to open_positions: {market_id}")
     except Exception as e:
         logger.error(f"[PIPELINE] Failed to write position {market_id} to open_positions: {e}")
+
+
+async def _fetch_strategy_allocations() -> dict[str, StrategyAllocation]:
+    """
+    Fetch the closed-trades ledger and derive the per-strategy allocation state
+    (List A.md Step 3 — A7). One read under the 2s timeout, capped at
+    config.ALLOCATION_HISTORY_LIMIT rows, oldest first; the math is pure
+    (risk/edge_monitor.derive_allocations).
+
+    Fail-open NEUTRAL on read failure (weight 1.0, no probation): the
+    allocation rule is an advisory throttle, not a capital gate — the hard
+    gates (net edge, exposure, idempotency) stay fail-closed, and a ledger
+    blip must not silently stop trading. The failure is logged loudly so the
+    drift is visible.
+    """
+    async def _fetch() -> list[dict[str, Any]]:
+        client = await get_client()
+        res = (
+            client.table("closed_trades")
+            .select("strategy,net_edge_at_entry,closed_at")
+            .order("closed_at")
+            .limit(config.ALLOCATION_HISTORY_LIMIT)
+            .execute()
+        )
+        return res.data or []
+
+    try:
+        rows = await asyncio.wait_for(_fetch(), timeout=config.SUPABASE_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning(
+            "[PIPELINE] Allocation history read failed (fail-open neutral): %s: %s",
+            type(e).__name__, e,
+        )
+        return {}
+
+    trades_by_strategy: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        trades_by_strategy.setdefault(str(row.get("strategy") or "unknown"), []).append(row)
+    return derive_allocations(trades_by_strategy)
 
 
 # ─────────────────────────────────────────────
@@ -1082,6 +1124,20 @@ async def run_pipeline(
         )
         return {"status": "blocked", "reason": "price_band"}
 
+    # Allocation rule (List A.md Step 3 — A7): mechanical per-strategy capital
+    # reallocation, derived from the closed-trades ledger. Retired strategies
+    # (two consecutive probations) are dropped before any sizing work; the
+    # weight/probation multipliers are applied at the sizing read below.
+    allocations = await _fetch_strategy_allocations()
+    allocation = allocations.get(strategy_for_check) or neutral_allocation(strategy_for_check)
+    if allocation.retired:
+        _increment_drop("allocation:retired")
+        logger.info(
+            "[PIPELINE][DROP:allocation:retired] market_id=%s strategy=%s n=%d",
+            market_id, strategy_for_check, allocation.n,
+        )
+        return {"status": "blocked", "reason": "strategy_retired"}
+
     # D. Portfolio exposure gates
     # Fetch exposure under 2s timeout (Rule 5 handles halting on failure)
     cat_exp, corr_exp, open_pos_value = await fetch_open_positions_exposure(category)
@@ -1119,6 +1175,27 @@ async def run_pipeline(
             portfolio_value=portfolio_value
         )
         
+    # Allocation multipliers (List A.md Step 3 — A7): applied AFTER kelly and
+    # BEFORE the hard position cap — the cap still binds the weighted size.
+    pre_allocation_size = raw_size
+    raw_size *= allocation.weight
+    if allocation.probation:
+        raw_size *= config.PROBATION_SIZE_MULTIPLIER
+    if raw_size <= 0.0:
+        _increment_drop("allocation:zero_weight")
+        logger.info(
+            "[PIPELINE][DROP:allocation:zero_weight] market_id=%s strategy=%s n=%d weight=%.3f",
+            market_id, strategy_for_check, allocation.n, allocation.weight,
+        )
+        return {"status": "blocked", "reason": "allocation_zero_weight"}
+    logger.info(
+        "[OBSERVABILITY][ALLOCATION] market=%s strategy=%s n=%d weight=%.3f probation=%s "
+        "cusum_faded=%s cusum_score=%.3f pre_size=$%.2f post_size=$%.2f",
+        market_id, strategy_for_check, allocation.n, allocation.weight,
+        allocation.probation, allocation.faded, allocation.cusum_score,
+        pre_allocation_size, raw_size,
+    )
+
     # strategy_for_check was resolved at the net-edge gate above (maker/taker rule).
     final_trade_size = max(0.0, risk_engine.position_size_check(raw_size, portfolio_value, strategy=strategy_for_check))
     

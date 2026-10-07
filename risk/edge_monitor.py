@@ -37,8 +37,8 @@ NaNs) are skipped, never treated as 0.
 
 import logging
 import math
-from dataclasses import dataclass
-from typing import Optional, Sequence
+from dataclasses import dataclass, replace
+from typing import Any, Optional, Sequence
 
 import config
 
@@ -176,3 +176,145 @@ def cusum_fade(
             max_score = score
 
     return CusumResult(faded=score > h, score=max_score)
+
+
+# ── Allocation rule (mechanical — List A.md Step 3) ───────────────────────────
+
+@dataclass(frozen=True)
+class StrategyAllocation:
+    """
+    The mechanical allocation state of one strategy, derived from its closed
+    trades (List A.md Step 3). The caller enforces it at the sizing read path:
+    size ×= weight, then ×= config.PROBATION_SIZE_MULTIPLIER when probation;
+    retired strategies are dropped before sizing.
+
+    Attributes:
+        strategy:         Strategy key.
+        n:                Measured (non-NULL) net edges seen in the history.
+        rolling_net_edge: Mean net edge over the trailing window.
+        rolling_sharpe:   Per-trade net-edge Sharpe over the trailing window.
+        weight:           Sharpe-proportional size multiplier (1.0 = unweighted
+                          default below REALLOC_MIN_SAMPLES).
+        probation:        Last STRATEGY_PROBATION_TRADE_COUNT trades mean net
+                          edge < STRATEGY_PROBATION_EDGE_THRESHOLD_CENTS.
+        retired:          Two consecutive complete probation windows failing.
+                          A flag, never a deletion — trades stay in the ledger.
+        faded:            CUSUM fade flag (observability only in Step 3).
+        cusum_score:      Worst CUSUM excursion in the fed history.
+    """
+    strategy: str
+    n: int
+    rolling_net_edge: float
+    rolling_sharpe: float
+    weight: float
+    probation: bool
+    retired: bool
+    faded: bool
+    cusum_score: float
+
+
+def neutral_allocation(strategy: str) -> StrategyAllocation:
+    """
+    The no-evidence state: unweighted default, no probation, not retired.
+
+    Used for strategies with no closed trades yet and as the fail-open
+    fallback when the ledger read fails (advisory throttle, not a capital
+    gate — the hard gates stay fail-closed).
+    """
+    return StrategyAllocation(
+        strategy=strategy, n=0, rolling_net_edge=0.0, rolling_sharpe=0.0,
+        weight=1.0, probation=False, retired=False, faded=False, cusum_score=0.0,
+    )
+
+
+def _window_mean(edges: list[float], count: int) -> Optional[float]:
+    """Mean of the last `count` edges; None while the window is incomplete."""
+    if len(edges) < count:
+        return None
+    return sum(edges[-count:]) / count
+
+
+def _in_probation(edges: list[float]) -> bool:
+    """Existing rule made live: mean net edge of the last
+    STRATEGY_PROBATION_TRADE_COUNT trades < STRATEGY_PROBATION_EDGE_THRESHOLD_CENTS."""
+    mean = _window_mean(edges, config.STRATEGY_PROBATION_TRADE_COUNT)
+    return mean is not None and mean < config.STRATEGY_PROBATION_EDGE_THRESHOLD_CENTS
+
+
+def _is_retired(edges: list[float]) -> bool:
+    """Two consecutive complete probation windows failing → retired (flag, never delete)."""
+    count = config.STRATEGY_PROBATION_TRADE_COUNT
+    threshold = config.STRATEGY_PROBATION_EDGE_THRESHOLD_CENTS
+    latest = _window_mean(edges, count)
+    previous = _window_mean(edges[:-count], count) if len(edges) >= 2 * count else None
+    return (
+        latest is not None and previous is not None
+        and latest < threshold and previous < threshold
+    )
+
+
+def derive_allocations(
+    trades_by_strategy: dict[str, Sequence[dict[str, Any]]],
+) -> dict[str, StrategyAllocation]:
+    """
+    Derive the per-strategy allocation state from the closed-trades ledger.
+
+    Pure math — the caller fetches rows (2s timeout, ALLOCATION_HISTORY_LIMIT
+    cap) and groups them by strategy, OLDEST FIRST (chronological by
+    closed_at); each row needs `net_edge_at_entry` (NULLs are skipped — they
+    carry no measurement; a strategy whose trades all lack edges, e.g. the
+    estimate-free Class A copy path, stays unweighted and unjudged).
+
+    Weight rules (mechanical, config-driven):
+        - n < REALLOC_MIN_SAMPLES               → weight 1.0 (default).
+        - n ≥ REALLOC_MIN_SAMPLES ("eligible")  → weight = sharpe / mean(sharpe
+          of positive-Sharpe eligible strategies), clamped to
+          [0, REALLOC_WEIGHT_MAX]; Sharpe ≤ 0 → 0.0; when NO eligible strategy
+          has a positive Sharpe, all eligible fall back to 1.0 (probation and
+          retirement then do the throttling).
+
+    Args:
+        trades_by_strategy: strategy → closed-trade rows, oldest first.
+
+    Returns:
+        One StrategyAllocation per strategy present in the input.
+    """
+    allocations: dict[str, StrategyAllocation] = {}
+    for strategy, trades in trades_by_strategy.items():
+        edges = clean_edges([t.get("net_edge_at_entry") for t in trades])
+        cusum = cusum_fade(edges)
+        allocations[strategy] = StrategyAllocation(
+            strategy=strategy,
+            n=len(edges),
+            rolling_net_edge=rolling_net_edge(edges),
+            rolling_sharpe=rolling_net_sharpe(edges),
+            weight=1.0,
+            probation=_in_probation(edges),
+            retired=_is_retired(edges),
+            faded=cusum.faded,
+            cusum_score=cusum.score,
+        )
+
+    eligible = {
+        strategy: alloc for strategy, alloc in allocations.items()
+        if alloc.n >= config.REALLOC_MIN_SAMPLES
+    }
+    positive = {
+        strategy: alloc.rolling_sharpe for strategy, alloc in eligible.items()
+        if alloc.rolling_sharpe > 0.0
+    }
+    if positive:
+        mean_sharpe = sum(positive.values()) / len(positive)
+        for strategy, sharpe in positive.items():
+            weight = min(sharpe / mean_sharpe, config.REALLOC_WEIGHT_MAX)
+            allocations[strategy] = replace(allocations[strategy], weight=weight)
+        for strategy in eligible:
+            if strategy not in positive:
+                allocations[strategy] = replace(allocations[strategy], weight=0.0)
+    else:
+        # No eligible strategy earns capital on its own Sharpe — fall back to
+        # the unweighted default for all of them instead of starving everyone.
+        for strategy in eligible:
+            allocations[strategy] = replace(allocations[strategy], weight=1.0)
+
+    return allocations

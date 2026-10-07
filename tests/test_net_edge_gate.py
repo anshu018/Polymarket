@@ -281,3 +281,108 @@ async def test_decision_log_line_has_all_mandatory_fields(
     for field in ("gross_edge=", "fee_units=", "spread_units=", "slippage_units=",
                   "haircut_units=", "net_edge=", "order_type=", "price_band_ok="):
         assert field in line, f"decision-log line missing {field}"
+
+
+# ── 6. Allocation rule enforcement (Step 3 — A7, sizing read path) ───────────
+
+def _seed_ledger(state: dict[str, list[dict[str, Any]]], strategy: str,
+                 edges: list[Any]) -> None:
+    """Seed closed_trades rows (any closed_at order — the mock returns them as-is
+    and the derivation treats the list as oldest-first)."""
+    for edge in edges:
+        state["closed_trades"].append({
+            "strategy": strategy,
+            "net_edge_at_entry": edge,
+            "closed_at": "2026-01-01T00:00:00+00:00",
+        })
+
+
+@pytest.mark.anyio
+async def test_probation_halves_the_trade_size(mock_db, monkeypatch):
+    """A strategy whose last 20 closed trades mean net edge < 4¢ is sized at
+    PROBATION_SIZE_MULTIPLIER of the unweighted size. The position cap is
+    widened so kelly is not cap-bound — the multiplier is applied BEFORE the
+    hard cap, so a cap-bound trade correctly shows no visible change."""
+    monkeypatch.setattr(config, "MAX_SINGLE_TRADE_PCT", 0.50)
+    monkeypatch.setattr(config, "MAX_MARKET_TRADE_PCT", 1.0)   # market ceiling non-binding too
+
+    control = await run_default_pipeline()
+    assert control is not None and control["status"] == "success"
+    base_size = control["size_usdc"]
+    assert base_size > 0.0
+    # (If any hard cap were binding, the ratio below would not be 0.5 and this
+    # test would fail — the ratio itself proves the caps are non-binding.)
+
+    for k in _drop_counters:
+        _drop_counters[k] = 0
+    mock_db["open_positions"].clear()
+
+    _seed_ledger(mock_db, "recalibration", [0.025] * 20)   # mean 2.5¢ < 4¢
+    probated = await run_default_pipeline()
+
+    assert probated is not None and probated["status"] == "success"
+    assert probated["size_usdc"] == pytest.approx(base_size * config.PROBATION_SIZE_MULTIPLIER)
+
+
+@pytest.mark.anyio
+async def test_retired_strategy_dropped_before_sizing(mock_db):
+    """Two consecutive failing probation windows → retired: the entry is
+    dropped with the allocation:retired counter and no position is written."""
+    _seed_ledger(mock_db, "recalibration", [0.02] * 40)
+
+    result = await run_default_pipeline()
+
+    assert result is not None
+    assert result["status"] == "blocked"
+    assert result["reason"] == "strategy_retired"
+    assert get_drop_counters()["allocation:retired"] == 1
+    assert len(mock_db["open_positions"]) == 0
+
+
+@pytest.mark.anyio
+async def test_zero_weight_strategy_dropped(mock_db):
+    """An eligible (n ≥ 30) strategy with Sharpe ≤ 0 gets weight 0 when the
+    panel contains a positive-Sharpe peer — the entry drops instead of
+    submitting a zero-size order."""
+    _seed_ledger(mock_db, "recalibration", [0.05] * 30)    # constant → sharpe 0
+    _seed_ledger(mock_db, "velocity", [0.02, 0.04] * 15)   # healthy sharpe peer
+
+    result = await run_default_pipeline()
+
+    assert result is not None
+    assert result["status"] == "blocked"
+    assert result["reason"] == "allocation_zero_weight"
+    assert get_drop_counters()["allocation:zero_weight"] == 1
+    assert len(mock_db["open_positions"]) == 0
+
+
+@pytest.mark.anyio
+async def test_ledger_read_failure_falls_open_neutral(mock_db):
+    """A closed_trades read failure must not stop trading: neutral allocation
+    (weight 1.0, no probation) and the failure stays visible in the log."""
+    control = await run_default_pipeline()
+    assert control is not None and control["status"] == "success"
+    base_size = control["size_usdc"]
+
+    for k in _drop_counters:
+        _drop_counters[k] = 0
+    mock_db["open_positions"].clear()
+    _seed_ledger(mock_db, "recalibration", [0.02] * 40)    # would be retired on a live read
+
+    delegating = MockSupabaseClient(mock_db)
+
+    class OutageClient:
+        def table(self, name: str):
+            if name == "closed_trades":
+                raise ConnectionError("mock ledger outage")
+            return delegating.table(name)
+
+    async def failing_get_client():
+        return OutageClient()
+
+    with patch("coordinator.pipeline.get_client", failing_get_client):
+        result = await run_default_pipeline()
+
+    assert result is not None and result["status"] == "success"
+    assert result["size_usdc"] == pytest.approx(base_size)
+    assert get_drop_counters().get("allocation:retired", 0) == 0
