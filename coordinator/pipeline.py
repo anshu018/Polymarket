@@ -381,8 +381,23 @@ async def log_to_open_positions(
     kelly_fraction: float,
     category: str,
     idempotency_uuid: str,
+    thesis_id: Optional[str] = None,
+    p_model_at_entry: Optional[float] = None,
+    market_price_at_entry: Optional[float] = None,
+    net_edge_at_entry: Optional[float] = None,
+    costs_paid_usdc: Optional[float] = None,
+    order_type: Optional[str] = None,
 ) -> None:
-    """Write newly opened position to the open_positions database table."""
+    """
+    Write newly opened position to the open_positions database table.
+
+    The Step 3 (A7) attribution kwargs (thesis_id, p_model_at_entry,
+    market_price_at_entry, net_edge_at_entry, costs_paid_usdc, order_type)
+    carry the entry's self-description through to closed_trades via the
+    startup-reconciliation close path. They default to None so a caller
+    without a cost breakdown (estimate-free paths) still writes an honest
+    NULL instead of a fabricated number.
+    """
     async def _write() -> None:
         client = await get_client()
         client.table("open_positions").insert({
@@ -398,7 +413,13 @@ async def log_to_open_positions(
             "category": category,
             "idempotency_uuid": idempotency_uuid,
             "opened_at": datetime.now(timezone.utc).isoformat(),
-            "last_checked_at": datetime.now(timezone.utc).isoformat()
+            "last_checked_at": datetime.now(timezone.utc).isoformat(),
+            "thesis_id": thesis_id,
+            "p_model_at_entry": p_model_at_entry,
+            "market_price_at_entry": market_price_at_entry,
+            "net_edge_at_entry": net_edge_at_entry,
+            "costs_paid_usdc": costs_paid_usdc,
+            "order_type": order_type
         }).execute()
 
     try:
@@ -557,7 +578,7 @@ async def _instrument_signal(
     strategy_override: Optional[str],
     signal_source: Optional[str],
     entities: list[str],
-) -> tuple[str, str, Optional[float]]:
+) -> tuple[str, str, Optional[float], str]:
     """
     Instrument one signal: novelty verdict + forward-sampling job (Step 2).
 
@@ -568,8 +589,10 @@ async def _instrument_signal(
     taken by the caller.
 
     Returns:
-        (outcome_id, verdict, novelty_factor) — verdict is one of
-        novelty.NOVELTY_NOVEL / NOVELTY_REPEAT / NOVELTY_DUP.
+        (outcome_id, verdict, novelty_factor, headline_hash) — verdict is one
+        of novelty.NOVELTY_NOVEL / NOVELTY_REPEAT / NOVELTY_DUP; headline_hash
+        is always computed (before any fallible I/O) so the entry write can
+        derive the thesis event key even when the novelty read failed.
     """
     headline_hash = novelty.compute_headline_hash(headline)
     outcome_id = str(uuid.uuid4())
@@ -602,7 +625,7 @@ async def _instrument_signal(
             source=source,
         )
     )
-    return outcome_id, verdict, factor
+    return outcome_id, verdict, factor, headline_hash
 
 
 async def run_pipeline(
@@ -702,7 +725,7 @@ async def run_pipeline(
     # clock matters more than the trade decision. Best-effort by design: an
     # instrumentation failure logs and moves on, it never stops the signal.
     try:
-        outcome_id, novelty_verdict, novelty_factor = await _instrument_signal(
+        outcome_id, novelty_verdict, novelty_factor, headline_hash = await _instrument_signal(
             headline=headline,
             source=source,
             market_id=market_id,
@@ -719,6 +742,9 @@ async def run_pipeline(
         )
         _increment_drop("novelty:check_failed")
         outcome_id, novelty_verdict, novelty_factor = None, novelty.NOVELTY_NOVEL, None
+        # Deterministic pure math — the entry write still gets a stable thesis
+        # event key even when the instrumentation I/O failed.
+        headline_hash = novelty.compute_headline_hash(headline)
 
     if novelty_verdict == novelty.NOVELTY_DUP:
         # Third+ similar signal for this market inside NOVELTY_WINDOW_HOURS —
@@ -1250,7 +1276,16 @@ async def run_pipeline(
         # Step E: Confirm idempotency record in DB
         await confirm_idempotency_log(order_uuid, mock_order_id)
 
-        # Step F: Write newly opened position to the open_positions table
+        # Step F: Write newly opened position to the open_positions table.
+        # Attribution (List A.md Step 3 — A7): every entry self-describes its
+        # edge — thesis, model probability, the book mid the net-edge math
+        # used as reference, the signed net edge, the modeled all-in cost for
+        # the final size, and the maker/taker rule outcome. The close path
+        # (startup reconciliation) passes these through to closed_trades.
+        thesis_id = (
+            f"{market_id}:{strategy_for_check}:"
+            f"{novelty.compute_event_key(entities, headline_hash)}"
+        )
         await log_to_open_positions(
             market_id=market_id,
             market_question=market_question,
@@ -1262,7 +1297,15 @@ async def run_pipeline(
             confidence=clamped_conf,
             kelly_fraction=kelly_fraction,
             category=category,
-            idempotency_uuid=order_uuid
+            idempotency_uuid=order_uuid,
+            thesis_id=thesis_id,
+            p_model_at_entry=estimated_probability,
+            market_price_at_entry=book.mid,
+            net_edge_at_entry=breakdown.net_edge,
+            costs_paid_usdc=cost_model.entry_cost_usdc(
+                breakdown, final_trade_size, market_price
+            ),
+            order_type=order_type
         )
 
     # Log to copytrade_log for trust scoring and audit trail (Class B)

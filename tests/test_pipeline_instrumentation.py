@@ -24,11 +24,12 @@ import config
 
 import data.forward_sampler as forward_sampler
 from data import novelty
-from coordinator.pipeline import run_pipeline, get_drop_counters, _drop_counters
+from coordinator.pipeline import run_pipeline, get_drop_counters, _drop_counters, extract_entities
 from coordinator.market_state import reset_market_locks
 from llm.news_analyst import NewsAnalystOutput
 from llm.contract_parser import ContractParserOutput
 from llm.trade_decision import TradeDecisionOutput
+from risk import cost_model
 from risk.cost_model import BookSnapshot
 from strategies.estimator import EstimateResult
 
@@ -436,3 +437,75 @@ async def test_direction_update_spawned_for_yes_signal():
     assert update.headline == "Congress passes new spending bill"
     assert update.source == "Reuters"
     assert update.confirmed_yes is True  # YES → confirmed_direction True
+
+
+# ── 7. The entry write self-describes its edge (Step 3 — A7 attribution) ─────
+
+@pytest.mark.anyio
+async def test_open_position_row_carries_attribution():
+    """A successful entry writes the Step 3 attribution columns to
+    open_positions: thesis_id, p_model_at_entry, market_price_at_entry
+    (the book mid the net-edge math used), net_edge_at_entry (the signed
+    Step 1 net edge), costs_paid_usdc and the decided order_type."""
+    db_state = default_db_state()
+
+    async def data_estimate(*args, **kwargs):
+        return EstimateResult(
+            p_point=0.65, sample_size=100, method="recalibration_base_rate",
+            computed_at=datetime.now(timezone.utc),
+        )
+
+    async def fake_book(token_id: str):
+        return BookSnapshot(best_bid=0.48, best_ask=0.52, depth_usd=5000.0)
+
+    async def fake_parse(*args, **kwargs):
+        return ContractParserOutput(
+            resolution_source="Reuters", resolution_condition="Condition",
+            key_entities=["Trump"], resolution_keywords=["trump", "bill", "spending"],
+            ambiguity_score=0.1, resolution_type="binary",
+        )
+
+    async def fake_decide(*args, **kwargs):
+        return TradeDecisionOutput(
+            direction="YES", confidence_score=0.80, reasoning="Edge confirmed"
+        ), False
+
+    get_client_patch, _ = patch_db(db_state)
+    with get_client_patch, \
+         patch("coordinator.pipeline.get_estimate", data_estimate), \
+         patch("coordinator.pipeline.get_market_book", fake_book), \
+         patch("coordinator.pipeline.parse_contract", fake_parse), \
+         patch("coordinator.pipeline.decide_trade", fake_decide), \
+         patch("coordinator.pipeline.classify_signal", classify_stub()):
+        result = await run_default_pipeline()
+
+    assert result is not None and result["status"] == "success"
+    assert len(db_state["open_positions"]) == 1
+    row = db_state["open_positions"][0]
+
+    headline = "Congress passes new spending bill"
+    expected_thesis = (
+        f"mkt-instr:recalibration:"
+        f"{novelty.compute_event_key(extract_entities(headline), novelty.compute_headline_hash(headline))}"
+    )
+    assert row["thesis_id"] == expected_thesis
+    assert row["p_model_at_entry"] == pytest.approx(0.65)
+    assert row["market_price_at_entry"] == pytest.approx(0.50)  # book mid
+    assert row["order_type"] == "maker"  # recalibration is in MAKER_ORDER_STRATEGIES
+
+    # net_edge_at_entry is exactly what the Step 1 cost model produced for
+    # this evaluation (maker: gross 15¢ − 1¢ haircut).
+    breakdown = cost_model.compute_cost_breakdown(
+        p_model=0.65, price=0.50, side="YES", order_type="maker",
+        book=BookSnapshot(best_bid=0.48, best_ask=0.52, depth_usd=5000.0),
+        fee_cfg=cost_model.fee_config_for("politics"),
+        size_usd=10_000.0 * config.MAX_SINGLE_TRADE_PCT,
+    )
+    assert row["net_edge_at_entry"] == pytest.approx(breakdown.net_edge)
+    assert row["net_edge_at_entry"] == pytest.approx(0.14)
+
+    # costs_paid_usdc = the modeled all-in cost for the final size, converted
+    # at the recorded entry price.
+    assert row["costs_paid_usdc"] == pytest.approx(
+        cost_model.entry_cost_usdc(breakdown, result["size_usdc"], 0.50))
+    assert row["costs_paid_usdc"] > 0.0

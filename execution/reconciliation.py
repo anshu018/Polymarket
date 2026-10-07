@@ -114,7 +114,16 @@ async def _supabase_move_to_closed(pos: dict[str, Any], exit_price: float, outco
             "opened_at": pos.get("opened_at"),
             "closed_at": datetime.now(timezone.utc).isoformat(),
             "was_memoryless": False,
-            "notes": "Resolved during agent downtime startup reconciliation."
+            "notes": "Resolved during agent downtime startup reconciliation.",
+            # Attribution passthrough (List A.md Step 3 — A7): the entry's
+            # self-description rides along so every closed trade keeps its
+            # thesis and edge context. NULL for pre-Step-3 open rows.
+            "thesis_id": pos.get("thesis_id"),
+            "p_model_at_entry": pos.get("p_model_at_entry"),
+            "market_price_at_entry": pos.get("market_price_at_entry"),
+            "net_edge_at_entry": pos.get("net_edge_at_entry"),
+            "costs_paid_usdc": pos.get("costs_paid_usdc"),
+            "order_type": pos.get("order_type")
         }).execute()
         
         # Delete from open_positions

@@ -26,6 +26,7 @@ from risk.cost_model import (
     check_net_edge,
     compute_cost_breakdown,
     decide_order_type,
+    entry_cost_usdc,
     expected_slippage_units,
     fee_config_for,
     half_spread_units,
@@ -320,3 +321,40 @@ class TestTwoCentTakerFeeTrap:
         assert breakdown.net_edge > config.MIN_NET_EDGE_CENTS
         # ...but the band blocks the taker.
         assert check_net_edge(breakdown.net_edge, 0.02, "taker") == "BLOCK_PRICE_BAND"
+
+
+# ── entry_cost_usdc (Step 3 — A7 attribution ledger) ─────────────────────────
+
+def test_entry_cost_usdc_taker_breakdown_exact():
+    """Dollar cost = shares × total cost units (fee+spread+slippage+haircut)."""
+    breakdown = compute_cost_breakdown(
+        p_model=0.65, price=0.50, side="YES", order_type="taker",
+        book=SANE_BOOK, fee_cfg=POLITICS, size_usd=100.0,
+    )
+    total_units = (breakdown.fee_units + breakdown.spread_units
+                   + breakdown.slippage_units + breakdown.haircut_units)
+    assert total_units > 0
+    assert entry_cost_usdc(breakdown, size_usdc=100.0, entry_price=0.50) == pytest.approx(
+        (100.0 / 0.50) * total_units)
+
+
+def test_entry_cost_usdc_maker_only_haircut():
+    """Maker entries carry no spread/slippage/fee — only the queue-risk haircut."""
+    breakdown = compute_cost_breakdown(
+        p_model=0.65, price=0.50, side="YES", order_type="maker",
+        book=SANE_BOOK, fee_cfg=POLITICS, size_usd=100.0,
+    )
+    assert breakdown.spread_units == 0.0 and breakdown.slippage_units == 0.0
+    assert entry_cost_usdc(breakdown, size_usdc=100.0, entry_price=0.50) == pytest.approx(
+        200.0 * POLITICS.maker_haircut)
+
+
+def test_entry_cost_usdc_degenerate_inputs_fail_soft():
+    """Zero/unknown size or price → 0.0, never an exception into the entry path."""
+    breakdown = compute_cost_breakdown(
+        p_model=0.65, price=0.50, side="YES", order_type="taker",
+        book=SANE_BOOK, fee_cfg=POLITICS, size_usd=100.0,
+    )
+    assert entry_cost_usdc(breakdown, size_usdc=0.0, entry_price=0.50) == 0.0
+    assert entry_cost_usdc(breakdown, size_usdc=-5.0, entry_price=0.50) == 0.0
+    assert entry_cost_usdc(breakdown, size_usdc=100.0, entry_price=0.0) == 0.0

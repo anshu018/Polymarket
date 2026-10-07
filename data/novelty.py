@@ -58,6 +58,35 @@ def compute_headline_hash(headline: str) -> str:
     return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
 
 
+def compute_event_key(entities: list[str], headline_hash: str) -> str:
+    """
+    Deterministic event-group key for thesis attribution (List A.md Step 3).
+
+    The identity novelty groups signals on is the normalized entity set: two
+    headlines about the same event extract (near-)identical entity sets. The
+    key is therefore the sorted, deduplicated, lowercase entity set joined
+    with '|'. Signals with no entities fall back to the headline_hash.
+
+    Conservative by design: identical entity sets share a thesis, while
+    Jaccard-similar-but-not-identical sets stay separate theses — significance
+    math (Step 5) may over-count theses, never merge distinct ones.
+
+    Args:
+        entities:      Extracted entities for this signal (any case/order).
+        headline_hash: compute_headline_hash value; used when `entities` is
+                       empty. Callers on paths with neither (Class A copy
+                       trades have no headline) pass their own last-resort
+                       key (market_id).
+
+    Returns:
+        Event-group key string.
+    """
+    normalized = sorted({str(e).strip().lower() for e in entities if str(e).strip()})
+    if not normalized:
+        return headline_hash
+    return "|".join(normalized)
+
+
 def jaccard(set_a: frozenset[str], set_b: frozenset[str]) -> float:
     """
     Jaccard similarity |A ∩ B| / |A ∪ B| of two entity sets.

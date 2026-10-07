@@ -375,6 +375,43 @@ def net_edge(
     ).net_edge
 
 
+def entry_cost_usdc(breakdown: CostBreakdown, size_usdc: float, entry_price: float) -> float:
+    """
+    Modeled all-in entry cost in USDC for a filled size (List A.md Step 3).
+
+    CostBreakdown units are per-share probability units ("cents"), so the
+    dollar cost of a position is shares × total cost units, with
+    shares = size_usdc / entry_price (USDC spent per share at the recorded
+    entry price). This is the modeled cost the entry will pay — paper mode
+    books nothing real — persisted to closed_trades/open_positions as
+    `costs_paid_usdc` so every closed trade self-describes what its edge
+    costs.
+
+    Fail-soft: non-positive size or price yields 0.0 (nothing bought, or no
+    price to convert at) — callers persist the result directly and a
+    degenerate input must never raise into the entry path.
+
+    Args:
+        breakdown:   CostBreakdown from compute_cost_breakdown().
+        size_usdc:   Final position size in USDC (0 = unknown → 0.0).
+        entry_price: Recorded entry price in (0, 1] used for the shares
+                     conversion (the row's entry_price value).
+
+    Returns:
+        Modeled all-in entry cost in USDC (>= 0.0).
+    """
+    if size_usdc <= 0.0 or entry_price <= 0.0:
+        return 0.0
+    shares = size_usdc / entry_price
+    total_units = (
+        breakdown.fee_units
+        + breakdown.spread_units
+        + breakdown.slippage_units
+        + breakdown.haircut_units
+    )
+    return shares * total_units
+
+
 # ── Gate + order-type rule ────────────────────────────────────────────────────
 
 def check_net_edge(net_edge_value: float, price_mid: float, order_type: str) -> str:

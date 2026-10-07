@@ -590,3 +590,68 @@ async def test_resolve_copy_trade_missing_uuid_logs_critical_and_skips() -> None
     assert any("wrong-wallet" in m or "wrong wallet" in m.lower() for m in critical_msgs), (
         f"CRITICAL message should mention wrong-wallet risk. Got: {critical_msgs}"
     )
+
+
+@pytest.mark.anyio
+async def test_close_path_passes_attribution_through(
+    mock_supabase_client: MockSupabaseClient,
+    db_state: dict[str, list[dict[str, Any]]]
+) -> None:
+    """Step 3 (A7): the startup-reconciliation close path carries the entry's
+    attribution columns from open_positions into closed_trades verbatim."""
+    db_state["open_positions"].append({
+        "id": "pos-attr",
+        "market_id": "M-ATTR",
+        "market_question": "Will X happen?",
+        "direction": "YES",
+        "entry_price": 0.50,
+        "position_size_usdc": 100.0,
+        "strategy": "recalibration",
+        "agent_estimate": 0.65,
+        "confidence_at_entry": 0.80,
+        "category": "politics",
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+        "thesis_id": "M-ATTR:recalibration:fed|congress",
+        "p_model_at_entry": 0.65,
+        "market_price_at_entry": 0.50,
+        "net_edge_at_entry": 0.14,
+        "costs_paid_usdc": 2.0,
+        "order_type": "maker",
+    })
+
+    mock_clob = MagicMock()
+    mock_clob.get_balance_allowance.return_value = {"balance": "100000000"}
+
+    class MockResponse:
+        def __init__(self, status_code: int, data: dict[str, Any]) -> None:
+            self.status_code = status_code
+            self._data = data
+        def json(self) -> dict[str, Any]:
+            return self._data
+
+    mock_gamma_data = {
+        "id": "M-ATTR",
+        "umaResolutionStatus": "resolved",
+        "outcomes": ["Yes", "No"],
+        "outcomePrices": ["1", "0"],
+        "closed": True
+    }
+
+    async def mock_get(_self: Any, url: str, **kwargs: Any) -> MockResponse:
+        return MockResponse(200, mock_gamma_data)
+
+    with patch("execution.reconciliation.get_polymarket_client", return_value=mock_clob), \
+         patch("httpx.AsyncClient.get", mock_get), \
+         patch("config.PAPER_TRADING", True):
+
+        await reconcile_on_startup()
+
+    assert len(db_state["open_positions"]) == 0
+    assert len(db_state["closed_trades"]) == 1
+    closed = db_state["closed_trades"][0]
+    assert closed["thesis_id"] == "M-ATTR:recalibration:fed|congress"
+    assert closed["p_model_at_entry"] == pytest.approx(0.65)
+    assert closed["market_price_at_entry"] == pytest.approx(0.50)
+    assert closed["net_edge_at_entry"] == pytest.approx(0.14)
+    assert closed["costs_paid_usdc"] == pytest.approx(2.0)
+    assert closed["order_type"] == "maker"

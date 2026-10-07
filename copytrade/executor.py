@@ -40,6 +40,7 @@ import aiohttp
 import config
 from memory.supabase_client import get_client
 from risk import risk_engine
+from risk import cost_model
 from monitoring.telegram_alerts import alert_circuit_breaker, alert_supabase_degradation
 from coordinator.market_state import load_market_state, get_market_lock
 from copytrade.performance_tracker import (
@@ -150,7 +151,17 @@ async def _log_open_position(
     trader_name: str,
     idempotency_uuid: str,
 ) -> None:
-    """Write the new Class A position to open_positions. Non-blocking on failure."""
+    """Write the new Class A position to open_positions. Non-blocking on failure.
+
+    Attribution (List A.md Step 3 — A7): Class A is estimate-free by design —
+    there is no model probability, no net-edge gate and no cost breakdown on
+    this path — so the edge columns are written as honest NULLs (never
+    fabricated). The thesis identity falls back to the market_id (no headline
+    exists to hash); market_price_at_entry and the config-decided order_type
+    are what this path actually knows.
+    """
+    strategy = f"copy_edge_class_{class_type.lower()}"
+
     async def _w():
         client = await get_client()
         client.table("open_positions").insert({
@@ -159,7 +170,7 @@ async def _log_open_position(
             "direction": direction,
             "entry_price": entry_price,
             "position_size_usdc": size_usdc,
-            "strategy": f"copy_edge_class_{class_type.lower()}",
+            "strategy": strategy,
             "agent_estimate": entry_price,
             "confidence_at_entry": 1.0,          # Smart-money copy = assume tracker is confident
             "kelly_fraction_used": 0.0,           # Class A uses fixed cap, not Kelly
@@ -167,6 +178,12 @@ async def _log_open_position(
             "idempotency_uuid": idempotency_uuid,
             "opened_at": datetime.now(timezone.utc).isoformat(),
             "last_checked_at": datetime.now(timezone.utc).isoformat(),
+            "thesis_id": f"{market_id}:{strategy}:{market_id}",
+            "p_model_at_entry": None,             # estimate-free path — no model exists
+            "market_price_at_entry": entry_price,
+            "net_edge_at_entry": None,            # no cost model runs on this path
+            "costs_paid_usdc": None,
+            "order_type": cost_model.decide_order_type(strategy),
         }).execute()
 
     try:

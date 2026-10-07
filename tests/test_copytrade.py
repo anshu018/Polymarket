@@ -327,3 +327,63 @@ class TestClassifierRouting:
             assert queue_b.empty()
 
         asyncio.run(_run())
+
+
+# ── Tests: Class A attribution write (Step 3 — A7) ───────────────────────────
+
+class _Result:
+    def __init__(self, data):
+        self.data = data
+
+
+class _TableStub:
+    """Records the last insert payload for assertion."""
+    def __init__(self, sink):
+        self.sink = sink
+
+    def insert(self, payload):
+        self.sink.append(payload)
+        return self
+
+    def execute(self):
+        return _Result([{}])
+
+
+@pytest.mark.anyio
+async def test_class_a_open_position_row_carries_attribution():
+    """The Class A write keeps honest NULLs for the edge columns (estimate-free
+    path — never fabricated) and records thesis/order_type/entry price."""
+    from copytrade import executor
+    from risk import cost_model
+
+    sink = []
+
+    class _Client:
+        def table(self, name):
+            assert name == "open_positions"
+            return _TableStub(sink)
+
+    async def fake_get_client():
+        return _Client()
+
+    from unittest.mock import patch
+    with patch.object(executor, "get_client", fake_get_client):
+        await executor._log_open_position(
+            market_id="mkt-copy-1",
+            direction="YES",
+            entry_price=0.42,
+            size_usdc=10.0,
+            class_type="A",
+            trader_name="whale",
+            idempotency_uuid="uuid-1",
+        )
+
+    assert len(sink) == 1
+    row = sink[0]
+    assert row["strategy"] == "copy_edge_class_a"
+    assert row["thesis_id"] == "mkt-copy-1:copy_edge_class_a:mkt-copy-1"
+    assert row["p_model_at_entry"] is None          # estimate-free by design
+    assert row["net_edge_at_entry"] is None         # no cost model runs here
+    assert row["costs_paid_usdc"] is None
+    assert row["market_price_at_entry"] == pytest.approx(0.42)
+    assert row["order_type"] == cost_model.decide_order_type("copy_edge_class_a") == "taker"

@@ -9,6 +9,7 @@ from data.novelty import (
     NOVELTY_DUP,
     NOVELTY_NOVEL,
     NOVELTY_REPEAT,
+    compute_event_key,
     compute_headline_hash,
     jaccard,
     novelty_verdict,
@@ -166,3 +167,24 @@ def test_verdict_threshold_is_config_driven():
         assert novelty_verdict(rows, "h", ["a", "b", "c"])[0] == NOVELTY_NOVEL
     finally:
         config.JACCARD_REPEAT_THRESHOLD = original
+
+
+# ── compute_event_key (Step 3 — A7 thesis attribution) ────────────────────────
+
+def test_event_key_is_sorted_deduped_lowercase_entity_set():
+    """The event identity novelty groups on: order/case/duplicates must not matter."""
+    k1 = compute_event_key(["Fed", "ECB"], "hash")
+    k2 = compute_event_key(["ecb", "fed"], "hash")
+    k3 = compute_event_key(["ECB", "fed", "Fed "], "hash")
+    assert k1 == k2 == k3 == "ecb|fed"
+
+
+def test_event_key_falls_back_to_headline_hash_when_no_entities():
+    """Signals without entities keep the headline_hash identity."""
+    assert compute_event_key([], "abc123") == "abc123"
+    assert compute_event_key(["", "   "], "abc123") == "abc123"
+
+
+def test_event_key_distinguishes_distinct_entity_sets():
+    """Different events → different keys (theses never merge)."""
+    assert compute_event_key(["fed"], "hash") != compute_event_key(["ecb"], "hash")
