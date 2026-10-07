@@ -182,6 +182,21 @@ DRIFT_VIABILITY_ASSUMED_SPREAD_CENTS = 0.03  # report-ONLY synthetic full spread
                                              # spread/slippage are this assumption). Not
                                              # used by any runtime trading decision.
 
+# ── EDGE-FADE MONITOR (List A.md Step 3 — A7) ────────────────────────────────
+# risk/edge_monitor.py runs a one-sided downward CUSUM on per-trade net edge
+# (closed_trades.net_edge_at_entry): S_t = max(0, S_{t-1} + (−e_t − CUSUM_DRIFT)),
+# fade flag when max_t S_t > CUSUM_THRESHOLD. Values TUNED ONCE on seeded
+# synthetic series (σ = 3¢ per-trade noise) and recorded in Decision Log D-10:
+# a 30-trade zero-edge run triggers ~2% of the time (an exact-zero run never),
+# a healthy +5¢ edge never triggers (0/500 over 100 trades), a persistent
+# −1¢/trade fade is detected ~98% within 120 trades (~39 mean latency; a flat
+# −1¢ series alarms at trade 50). Do not re-tune without re-recording D-10.
+CUSUM_THRESHOLD = 0.25                  # alarm level h (probability units)
+CUSUM_DRIFT = 0.005                     # allowance k — fade rate below 0 tolerated
+EDGE_ROLLING_WINDOW = 30                # trailing window for rolling_net_edge /
+                                        # rolling_net_sharpe (List A.md Step 3
+                                        # "window=30", config is the live truth)
+
 KELLY_FRACTION_VELOCITY = 0.15
 KELLY_FRACTION_RECALIBRATION = 0.25
 KELLY_FRACTION_CORRELATION = 0.25
