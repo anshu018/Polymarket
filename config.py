@@ -227,6 +227,19 @@ KELLY_FRACTION_CORRELATION = 0.25
 KELLY_FRACTION_RESOLUTION = 0.35
 PIPELINE_QUEUE_MAXSIZE = 100
 
+# ── KELLY SIZING (List A.md Step 4 — A4) ─────────────────────────────────────
+# Kelly consumes the REAL side-adjusted model probability, never the LLM's
+# confidence (confidence stays only in the confidence gates). The probability
+# is shrunk toward neutral by its sample size BEFORE Kelly
+# (risk_engine.shrink_probability): p_used = w·p + (1−w)·0.5 with
+# w = n/(n+SHRINKAGE_PRIOR_STRENGTH). Thin-data estimates therefore size
+# conservatively and converge to the raw estimate as evidence accumulates.
+# A Kelly output <= 0 (shrunk probability at/below the market price — no edge
+# at these odds) drops the signal with counter "sizing:kelly_zero".
+SHRINKAGE_PRIOR_STRENGTH = 20           # pseudo-observations K in w = n/(n+K);
+                                        # n=20 → w=0.5, n=100 → w≈0.83. Higher K
+                                        # = more humility for thin data.
+
 # ── STRATEGY 5: COPY EDGE (CopyTrade) ────────────────────────────────────────
 # PRD source: CopyTrade.md §7.1, §9.2
 KELLY_FRACTION_COPY = 0.10              # 10% fractional Kelly for Class B sizing

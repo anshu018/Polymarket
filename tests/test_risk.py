@@ -22,6 +22,7 @@ import pytest
 import config
 from risk.risk_engine import (
     kelly_size,
+    shrink_probability,
     position_size_check,
     check_drawdown,
     check_liquidity,
@@ -692,3 +693,60 @@ class TestCheckDeadlineRisk:
             days_to_resolution=15,
         )
         assert result == "ALLOW"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# shrink_probability (List A.md Step 4 — A4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestShrinkProbability:
+    """Tests for shrink_probability()."""
+
+    def test_exact_weight_math_at_n_equal_k(self) -> None:
+        """n = K → w = 0.5 → p_used is exactly halfway to neutral."""
+        assert shrink_probability(0.65, 20) == pytest.approx(0.575)
+
+    def test_thin_data_collapses_toward_neutral(self) -> None:
+        """n << K → p_used close to 0.5; n = 0 → exactly 0.5."""
+        assert shrink_probability(0.65, 0) == 0.5
+        assert shrink_probability(0.65, 1) == pytest.approx(0.5 + (0.15 / 21))
+
+    def test_converges_to_p_model_as_n_grows(self) -> None:
+        """n >> K → w → 1 → p_used → p_model (w = 10000/10020 → 0.6497)."""
+        assert shrink_probability(0.65, 10_000) == pytest.approx(0.6497, abs=1e-6)
+
+    def test_monotone_in_sample_size(self) -> None:
+        """More data → less shrinkage (p_used moves monotonically toward p_model)."""
+        previous = 0.5
+        for n in (0, 1, 2, 5, 10, 20, 50, 100, 500):
+            current = shrink_probability(0.80, n)
+            assert current >= previous
+            previous = current
+
+    def test_negative_and_noninteger_sample_sizes_are_no_data(self) -> None:
+        """n <= 0 → exactly neutral; float n is truncated toward int handling."""
+        assert shrink_probability(0.9, -5) == 0.5
+        assert shrink_probability(0.9, 7.9) == pytest.approx(shrink_probability(0.9, 7))
+
+    def test_out_of_range_p_is_clamped(self) -> None:
+        """Invalid p never propagates garbage; clamped to [0, 1] before blending."""
+        assert shrink_probability(1.5, 100) == pytest.approx(
+            (100 / 120) * 1.0 + (20 / 120) * 0.5)
+        assert shrink_probability(-0.5, 100) == pytest.approx(
+            (100 / 120) * 0.0 + (20 / 120) * 0.5)
+
+    def test_neutral_p_stays_neutral_at_any_n(self) -> None:
+        """Shrinking 0.5 toward 0.5 is a fixed point."""
+        for n in (0, 3, 20, 1000):
+            assert shrink_probability(0.5, n) == pytest.approx(0.5)
+
+    def test_deterministic_and_config_driven(self) -> None:
+        """Same inputs → same output; K comes from config (the live truth).
+        K=1000, n=20, p=0.9: w = 20/1020 → p_used = 0.5078431..."""
+        assert shrink_probability(0.7, 30) == shrink_probability(0.7, 30)
+        original = config.SHRINKAGE_PRIOR_STRENGTH
+        try:
+            config.SHRINKAGE_PRIOR_STRENGTH = 1000
+            assert shrink_probability(0.9, 20) == pytest.approx(0.507843137254902, abs=1e-12)
+        finally:
+            config.SHRINKAGE_PRIOR_STRENGTH = original

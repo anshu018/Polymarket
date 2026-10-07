@@ -48,6 +48,34 @@ def kelly_size(
     return f_full * kelly_fraction * portfolio_value
 
 
+def shrink_probability(p_model: float, sample_size: int) -> float:
+    """Shrink a model probability toward neutral by its sample size (List A.md Step 4).
+
+    Principled humility replacing arbitrary flatness: thin-data estimates are
+    pulled toward 0.5 proportionally to how little data stands behind them,
+
+        p_used = w * p_model + (1 - w) * 0.5,    w = n / (n + K),
+
+    with K = config.SHRINKAGE_PRIOR_STRENGTH. As n grows the estimate converges
+    to p_model; at n = 0 it collapses to exactly neutral. Shrinking toward 0.5
+    commutes with side-adjustment (1 - p_used is the shrunk NO-side
+    probability), so callers shrink on the YES line and side-adjust after.
+
+    Args:
+        p_model:     YES-line model probability (clamped into [0, 1]).
+        sample_size: Number of observations behind the estimate (n); values
+                     <= 0 are treated as no data.
+
+    Returns:
+        Shrunk probability in [0, 1] on the same (YES) line as p_model.
+    """
+    if not 0.0 <= p_model <= 1.0:
+        p_model = min(1.0, max(0.0, p_model))
+    n = max(0, int(sample_size))
+    w = n / (n + config.SHRINKAGE_PRIOR_STRENGTH)
+    return w * p_model + (1.0 - w) * 0.5
+
+
 def position_size_check(
     proposed_size: float,
     portfolio_value: float,
