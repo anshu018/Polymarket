@@ -98,8 +98,9 @@ def book_holder() -> dict[str, Any]:
 
 @pytest.fixture
 def estimate_holder() -> dict[str, Any]:
-    """The fake estimate value — tests mutate this to shape the model's view."""
-    return {"p_point": 0.65}
+    """The fake estimate value — tests mutate this to shape the model's view.
+    `sample_size` (default 100) feeds the Step 4 shrinkage weight."""
+    return {"p_point": 0.65, "sample_size": 100}
 
 
 @pytest.fixture
@@ -125,7 +126,7 @@ def mock_db(book_holder: dict[str, Any], estimate_holder: dict[str, Any]):
         from strategies.estimator import EstimateResult
         return EstimateResult(
             p_point=estimate_holder["p_point"],
-            sample_size=100,
+            sample_size=estimate_holder.get("sample_size", 100),
             method="recalibration_base_rate",
             computed_at=datetime.now(timezone.utc),
         )
@@ -386,3 +387,128 @@ async def test_ledger_read_failure_falls_open_neutral(mock_db):
     assert result is not None and result["status"] == "success"
     assert result["size_usdc"] == pytest.approx(base_size)
     assert get_drop_counters().get("allocation:retired", 0) == 0
+
+
+# ── 7. Kelly on real probability (Step 4 — A4) ────────────────────────────────
+
+def _spy_on_kelly():
+    """Patch risk_engine.kelly_size with a recording wrapper around the real one.
+    Returns (patch, calls) — calls collects every win_probability kwarg."""
+    from unittest.mock import patch as mock_patch
+    from risk import risk_engine as _re
+
+    real_kelly = _re.kelly_size
+    calls: list[float] = []
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs.get("win_probability"))
+        return real_kelly(*args, **kwargs)
+
+    return mock_patch("risk.risk_engine.kelly_size", side_effect=spy), calls
+
+
+@pytest.mark.anyio
+async def test_kelly_input_is_shrunk_probability_never_confidence(mock_db, estimate_holder):
+    """Regression (List A.md Step 4 DoD): Kelly's win_probability is the shrunk
+    model probability — (n·p + K·0.5)/(n+K) = (100·0.65 + 20·0.5)/120 = 0.625 —
+    which is BELOW the minimum possible clamped confidence (0.75). If the LLM's
+    confidence ever reached Kelly again, this exact assertion fails."""
+    spy_patch, calls = _spy_on_kelly()
+    with spy_patch:
+        result = await run_default_pipeline()
+
+    assert result is not None and result["status"] == "success"
+    assert len(calls) == 1
+    assert calls[0] == pytest.approx(0.625)
+
+
+@pytest.mark.anyio
+async def test_kelly_input_side_adjusted_for_no_entries(mock_db, estimate_holder):
+    """NO entry: Kelly sees 1 − p_used (YES line 0.30 @ n=40 → p_used 11/30 →
+    Kelly input 19/30). The direction stub flips the coordinator to NO."""
+    from llm.coordinator import CoordinatorOutput
+
+    async def fake_coordinator_no(**kwargs):
+        return CoordinatorOutput(direction="NO", confidence_score=0.80, reasoning="NO edge")
+
+    estimate_holder["p_point"] = 0.30
+    estimate_holder["sample_size"] = 40
+    spy_patch, calls = _spy_on_kelly()
+    with spy_patch, \
+         patch("coordinator.pipeline.coordinate_decision", fake_coordinator_no):
+        result = await run_default_pipeline()
+
+    assert result is not None and result["status"] == "success"
+    assert len(calls) == 1
+    assert calls[0] == pytest.approx(19 / 30)
+
+
+@pytest.mark.anyio
+async def test_size_varies_materially_with_estimate_quality(mock_db, estimate_holder, monkeypatch):
+    """DoD: Kelly output varies with estimate quality — same n, higher p_model
+    → materially larger size (caps widened so nothing but Kelly binds)."""
+    monkeypatch.setattr(config, "MAX_SINGLE_TRADE_PCT", 0.50)
+    monkeypatch.setattr(config, "MAX_MARKET_TRADE_PCT", 1.0)
+
+    result_low = await run_default_pipeline()
+    assert result_low is not None and result_low["status"] == "success"
+    size_low = result_low["size_usdc"]
+
+    for k in _drop_counters:
+        _drop_counters[k] = 0
+    mock_db["open_positions"].clear()
+    estimate_holder["p_point"] = 0.75
+
+    result_high = await run_default_pipeline()
+    assert result_high is not None and result_high["status"] == "success"
+    size_high = result_high["size_usdc"]
+
+    assert size_low > 0.0
+    assert size_high > size_low + 100.0
+
+
+@pytest.mark.anyio
+async def test_kelly_zero_edge_drops_instead_of_zero_order(mock_db, estimate_holder, book_holder):
+    """Kelly consumes net edge (List A.md Step 4): a shrunk probability at/below
+    the market price gives kelly_raw <= 0 → the signal drops as kelly_zero_edge
+    instead of submitting a zero-size order. m=0.80, p=0.835, n=5 →
+    p_used = (5·0.835 + 20·0.5)/25 ≈ 0.567 < 0.80 → kelly < 0."""
+    book_holder["book"] = BookSnapshot(best_bid=0.78, best_ask=0.82, depth_usd=5000.0)
+    estimate_holder["p_point"] = 0.835
+    estimate_holder["sample_size"] = 5
+
+    # market_price aligned with the book mid — net_odds (frozen Step 4 spec:
+    # "keep as-is") is computed from the arrival market_price, not the book.
+    result = await run_default_pipeline(market_price=0.80)
+
+    assert result is not None
+    assert result["status"] == "blocked"
+    assert result["reason"] == "kelly_zero_edge"
+    assert get_drop_counters()["sizing:kelly_zero"] == 1
+    assert len(mock_db["open_positions"]) == 0
+
+
+@pytest.mark.anyio
+async def test_sizing_log_line_has_all_mandatory_fields(mock_db, caplog):
+    """List A.md Step 4: every sizing decision logs p_model, n, w, p_used,
+    p_side, kelly_raw, kelly_capped and the binding constraint."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="coordinator.pipeline"):
+        result = await run_default_pipeline()
+
+    assert result is not None and result["status"] == "success"
+    sizing_lines = [line for line in caplog.text.splitlines()
+                    if "[OBSERVABILITY][SIZING]" in line]
+    assert len(sizing_lines) == 1, "mandatory sizing log line missing or duplicated"
+    line = sizing_lines[0]
+    for field in ("p_model=", "n=", "w=", "p_used=", "p_side=",
+                  "kelly_raw=$", "kelly_capped=$", "binding_constraint="):
+        assert field in line, f"sizing log line missing {field}"
+    # The default fixture (p 0.65, n 100, caps binding) must print exactly:
+    assert "p_model=0.6500" in line
+    assert "n=100" in line
+    assert "w=0.8333" in line
+    assert "p_used=0.6250" in line
+    assert "p_side=0.6250" in line
+    assert "binding_constraint=position_cap" in line  # 5% cap binds $625 → $500

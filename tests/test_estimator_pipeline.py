@@ -394,3 +394,54 @@ async def test_missing_end_date_falls_back_to_config_default_with_counter(mock_d
         float(config.DEFAULT_TTR_HOURS))
     assert get_drop_counters()["estimate:ttr_fallback"] == 1
     assert get_drop_counters()["estimate:no_data"] == 0
+
+
+# ── 6. Class B sized by real wallet hit rate through Kelly (Step 4 — A4) ─────
+
+@pytest.mark.anyio
+async def test_copy_class_b_kelly_input_is_shrunk_wallet_hitrate(mock_db):
+    """DoD (List A.md Step 4): copy Class B is sized by the REAL wallet hit
+    rate immediately. 18W/2L → Laplace p = 19/22 (n=20); shrinkage at n=K=20
+    is exactly halfway to neutral → Kelly consumes (19/22 + 0.5)/2 = 15/22 —
+    never the LLM confidence (0.80)."""
+    mock_db["tracked_wallets"] = [{
+        "wallet_address": "wal-abc",
+        "wins_count": 18,
+        "losses_count": 2,
+    }]
+
+    from risk import risk_engine as _re
+
+    real_kelly = _re.kelly_size
+    kelly_inputs: list[float] = []
+
+    def spy_kelly(*args, **kwargs):
+        kelly_inputs.append(kwargs.get("win_probability"))
+        return real_kelly(*args, **kwargs)
+
+    async def fake_decide(**kwargs):
+        return TradeDecisionOutput(
+            direction="YES", confidence_score=0.80, reasoning="Edge confirmed"), False
+
+    with patch("coordinator.pipeline.classify_signal", make_classify(0.80)), \
+         patch("coordinator.pipeline.parse_contract", fake_parse), \
+         patch("coordinator.pipeline.decide_trade", fake_decide), \
+         patch("risk.risk_engine.kelly_size", side_effect=spy_kelly), \
+         patch("asyncio.sleep", AsyncMock()):
+        result = await run_pipeline(
+            headline="Smart money trader whale_1 entered YES position on Will the bill pass?",
+            source="copy_edge:whale_1",
+            market_id="mkt-copy-kelly",
+            market_question="Will the bill pass?",
+            market_price=0.50,
+            portfolio_value=10_000.0,
+            starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+            current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+            strategy_override="copy_edge_class_b",
+            wallet_address="wal-abc",
+        )
+
+    assert result is not None and result["status"] == "success"
+    assert len(kelly_inputs) == 1
+    assert kelly_inputs[0] == pytest.approx(15 / 22)
+    assert kelly_inputs[0] < 0.75  # below any reachable clamped confidence

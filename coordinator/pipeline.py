@@ -27,7 +27,7 @@ from data.market_discovery import (
 )
 from data import novelty
 from data import forward_sampler
-from strategies.estimator import get_estimate
+from strategies.estimator import get_estimate, side_probability
 from risk import cost_model
 from risk.edge_monitor import StrategyAllocation, derive_allocations, neutral_allocation
 from monitoring.telegram_alerts import (
@@ -1146,11 +1146,23 @@ async def run_pipeline(
     m_price = max(min(market_price, 0.99), 0.01)
     net_odds = (1.0 - m_price) / m_price
 
+    # Kelly input (List A.md Step 4 — A4): the REAL side-adjusted model
+    # probability, shrunk toward neutral by its sample size
+    # (risk_engine.shrink_probability). The LLM's confidence NEVER reaches
+    # Kelly — it stays only in the confidence gates above and the audit
+    # columns. Shrinkage toward 0.5 commutes with side-adjustment, so shrink
+    # on the YES line first, then flip for NO entries.
+    p_used_yes = risk_engine.shrink_probability(estimated_probability, estimate.sample_size)
+    p_side = side_probability(p_used_yes, decision_direction)
+    kelly_shrink_weight = estimate.sample_size / (
+        estimate.sample_size + config.SHRINKAGE_PRIOR_STRENGTH
+    )
+
     # Sizing trade using net_odds
     if strategy_override == "copy_edge_class_b":
         kelly_fraction = config.KELLY_FRACTION_COPY
         kelly_raw = risk_engine.kelly_size(
-            win_probability=clamped_conf,
+            win_probability=p_side,
             odds=net_odds,
             kelly_fraction=kelly_fraction,
             portfolio_value=portfolio_value
@@ -1160,7 +1172,7 @@ async def run_pipeline(
             trust_score = get_trust_score(wallet_address)
             wallet_state = get_wallet_state(wallet_address)
             state_multiplier = compute_state_multiplier(wallet_state)
-            
+
             # class_ceiling = $50 * state_multiplier * trust_score
             class_ceiling = config.COPY_CLASS_B_MAX_SIZE_USDC * state_multiplier * trust_score
             raw_size = min(kelly_raw, class_ceiling)
@@ -1168,13 +1180,27 @@ async def run_pipeline(
             raw_size = kelly_raw
     else:
         kelly_fraction = config.KELLY_FRACTION_VELOCITY if is_fast_path else config.KELLY_FRACTION_RECALIBRATION
-        raw_size = risk_engine.kelly_size(
-            win_probability=clamped_conf,
+        kelly_raw = risk_engine.kelly_size(
+            win_probability=p_side,
             odds=net_odds,
             kelly_fraction=kelly_fraction,
             portfolio_value=portfolio_value
         )
-        
+        raw_size = kelly_raw
+
+    # Kelly consumes net edge (List A.md Step 4): kelly_raw <= 0 means the
+    # shrunk probability is at/below the market price — no edge at these
+    # odds. The honest size is 0: drop rather than submit a zero-size order.
+    if kelly_raw <= 0.0:
+        _increment_drop("sizing:kelly_zero")
+        logger.info(
+            "[PIPELINE][DROP:sizing:kelly_zero] market_id=%s strategy=%s "
+            "binding_constraint=net_edge_zero p_model=%.4f n=%d w=%.4f "
+            "p_used=%.4f p_side=%.4f m_price=%.4f",
+            market_id, strategy_for_check, estimated_probability,
+            estimate.sample_size, kelly_shrink_weight, p_used_yes, p_side, m_price,
+        )
+        return {"status": "blocked", "reason": "kelly_zero_edge"}
     # Allocation multipliers (List A.md Step 3 — A7): applied AFTER kelly and
     # BEFORE the hard position cap — the cap still binds the weighted size.
     pre_allocation_size = raw_size
@@ -1197,7 +1223,13 @@ async def run_pipeline(
     )
 
     # strategy_for_check was resolved at the net-edge gate above (maker/taker rule).
-    final_trade_size = max(0.0, risk_engine.position_size_check(raw_size, portfolio_value, strategy=strategy_for_check))
+    # binding_constraint (List A.md Step 4 — A4): which limit actually set the
+    # final size — kelly_fraction (unclamped) or the first cap that bound it.
+    binding_constraint = "kelly_fraction"
+    position_capped = risk_engine.position_size_check(raw_size, portfolio_value, strategy=strategy_for_check)
+    if position_capped < raw_size:
+        binding_constraint = "position_cap"
+    final_trade_size = max(0.0, position_capped)
     
     proposed_pct = final_trade_size / portfolio_value
 
@@ -1236,7 +1268,11 @@ async def run_pipeline(
     if risk_engine.check_cash_reserve(final_trade_size, available_cash, portfolio_value) == "BLOCK":
         logger.warning(f"[PIPELINE] Risk check: cash reserve violation. Blocking.")
         _increment_drop("risk_gate:cash_reserve")
-        logger.info(f"[PIPELINE][DROP:risk_gate:cash_reserve] market_id={market_id}")
+        logger.info(
+            "[PIPELINE][DROP:risk_gate:cash_reserve] market_id=%s binding_constraint=cash_reserve "
+            "kelly_capped=$%.2f available_cash=$%.2f",
+            market_id, final_trade_size, available_cash,
+        )
         return {"status": "blocked", "reason": "cash_reserve"}
 
     # Calculate remaining days to resolution for deadline risk gate
@@ -1303,6 +1339,9 @@ async def run_pipeline(
             )
             return {"status": "blocked", "reason": reason}
 
+        if permitted_size < final_trade_size:
+            binding_constraint = "market_ceiling"
+
         # Telemetry: Log raw Kelly vs capped size, and repeat entry intervals/price delta
         if state.tranches >= 1:
             time_gap = -1.0
@@ -1324,6 +1363,18 @@ async def run_pipeline(
             )
 
         final_trade_size = permitted_size
+
+        # Mandatory sizing log (List A.md Step 4 — A4): every sizing decision
+        # records the Kelly inputs/outputs and which limit actually bound the
+        # final size (kelly_fraction | position_cap | market_ceiling |
+        # cash_reserve | net_edge_zero — the last two on their drop paths).
+        logger.info(
+            "[OBSERVABILITY][SIZING] market=%s strategy=%s p_model=%.4f n=%d w=%.4f "
+            "p_used=%.4f p_side=%.4f kelly_raw=$%.2f kelly_capped=$%.2f binding_constraint=%s",
+            market_id, strategy_for_check, estimated_probability,
+            estimate.sample_size, kelly_shrink_weight, p_used_yes, p_side,
+            kelly_raw, final_trade_size, binding_constraint,
+        )
 
         # 6. IDEMPOTENT ORDER EXECUTION (Rule 2)
         # Step A: Generate unique UUID at trade decision time
