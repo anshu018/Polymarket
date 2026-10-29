@@ -41,6 +41,14 @@ SQL_MIGRATIONS = [
         ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS net_edge_at_entry DECIMAL(10,4);
         ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS costs_paid_usdc DECIMAL(10,4);
         ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS order_type TEXT;
+        -- List A.md Step 5 (A5): book-aware paper fills. fill_price is on the
+        -- traded token's line; NULL on a maker row = still resting (or cancelled).
+        -- Canonical DDL lives in scratch/migration_step5_fill_and_baseline.sql.
+        ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS fill_price DECIMAL(10,4);
+        ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS fill_type TEXT;
+        CREATE INDEX IF NOT EXISTS idx_open_positions_unfilled_maker
+            ON open_positions (opened_at)
+            WHERE order_type = 'maker' AND fill_price IS NULL;
         """
     },
     {
@@ -83,6 +91,10 @@ SQL_MIGRATIONS = [
         ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS net_edge_at_entry DECIMAL(10,4);
         ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS costs_paid_usdc DECIMAL(10,4);
         ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS order_type TEXT;
+        -- List A.md Step 5 (A5): fill columns pass through the close path so the
+        -- gate report can measure decision-vs-fill slippage on closed trades.
+        ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS fill_price DECIMAL(10,4);
+        ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS fill_type TEXT;
         CREATE INDEX IF NOT EXISTS idx_closed_trades_strategy_closed_at
             ON closed_trades (strategy, closed_at DESC);
         """
@@ -270,6 +282,11 @@ SQL_MIGRATIONS = [
         );
         CREATE INDEX IF NOT EXISTS idx_signal_outcomes_market_t0
             ON signal_outcomes (market_id, t0 DESC);
+        -- List A.md Step 5 (A5): market baseline. resolved_outcome is the market's
+        -- own YES/NO resolution (1 = YES, 0 = NO, NULL = unresolved); recorded by
+        -- the offline gate report (scripts/gate_report.py) via idempotent updates.
+        ALTER TABLE signal_outcomes ADD COLUMN IF NOT EXISTS resolved_outcome SMALLINT;
+        ALTER TABLE signal_outcomes ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
         """
     },
     {

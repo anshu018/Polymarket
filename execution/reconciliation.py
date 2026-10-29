@@ -123,7 +123,12 @@ async def _supabase_move_to_closed(pos: dict[str, Any], exit_price: float, outco
             "market_price_at_entry": pos.get("market_price_at_entry"),
             "net_edge_at_entry": pos.get("net_edge_at_entry"),
             "costs_paid_usdc": pos.get("costs_paid_usdc"),
-            "order_type": pos.get("order_type")
+            "order_type": pos.get("order_type"),
+            # Fill passthrough (List A.md Step 5 — A5): the simulated fill rides
+            # along so the gate report can measure decision-vs-fill slippage on
+            # closed trades. NULL for pre-Step-5 open rows.
+            "fill_price": pos.get("fill_price"),
+            "fill_type": pos.get("fill_type")
         }).execute()
         
         # Delete from open_positions

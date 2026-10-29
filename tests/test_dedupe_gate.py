@@ -617,8 +617,14 @@ async def test_class_a_first_entry_10_dollars_permitted(mock_db):
         "market_volume_usd": 50000.0,
     }
 
+    async def fake_class_a_book(token_id: str):
+        # Ask 0.49 ≤ limit (tracker 0.495 + 0.005 buffer) → the book-aware paper
+        # fill (Step 5) goes through at the ask; depth carries the $10 size.
+        return BookSnapshot(best_bid=0.48, best_ask=0.49, depth_usd=5000.0)
+
     with patch("coordinator.pipeline.get_live_portfolio_value", AsyncMock(return_value=10_000.0)), \
          patch("copytrade.executor._fetch_exposure", AsyncMock(return_value=(0.0, 0.0))), \
+         patch("copytrade.executor.get_market_book", fake_class_a_book), \
          patch("copytrade.executor.get_trust_score", return_value=0.85), \
          patch("copytrade.executor.get_wallet_state", return_value="ACTIVE"), \
          patch("copytrade.executor.compute_state_multiplier", return_value=1.0), \
@@ -630,6 +636,78 @@ async def test_class_a_first_entry_10_dollars_permitted(mock_db):
     pos = mock_db["open_positions"][0]
     assert pos["position_size_usdc"] <= 10.0
     assert pos["position_size_usdc"] > 0.0
+    # Step 5: the fill is book-aware — entry at the ask, fill columns recorded.
+    assert pos["entry_price"] == 0.49
+    assert pos["fill_price"] == 0.49
+    assert pos["fill_type"] == "taker"
+
+
+@pytest.mark.anyio
+async def test_class_a_no_fill_when_ask_runs_past_the_limit(mock_db):
+    """Step 5: the book ask above the copy limit price means the market ran past
+    our limit — the copy is skipped honestly (no idealized fill, no idempotency
+    reservation, no open_positions row)."""
+    market_id = "test-class-a-limit-missed"
+    signal = {
+        "market_id": market_id,
+        "outcome": "Yes",
+        "live_ask": 0.50,
+        "tracker_price": 0.495,  # limit = 0.50
+        "trader_name": "ProTrader",
+        "wallet_address": "0x123",
+        "was_priority_pick": False,
+        "trust_score": 0.85,
+        "market_volume_usd": 50000.0,
+    }
+
+    async def fake_runaway_book(token_id: str):
+        return BookSnapshot(best_bid=0.53, best_ask=0.55, depth_usd=5000.0)  # ask > limit
+
+    with patch("coordinator.pipeline.get_live_portfolio_value", AsyncMock(return_value=10_000.0)), \
+         patch("copytrade.executor._fetch_exposure", AsyncMock(return_value=(0.0, 0.0))), \
+         patch("copytrade.executor.get_market_book", fake_runaway_book), \
+         patch("copytrade.executor.get_trust_score", return_value=0.85), \
+         patch("copytrade.executor.get_wallet_state", return_value="ACTIVE"), \
+         patch("copytrade.executor.compute_state_multiplier", return_value=1.0), \
+         patch("copytrade.executor._tracker_log_trade", AsyncMock()):
+
+        await _execute_class_a(signal)
+
+    assert len(mock_db["open_positions"]) == 0
+    assert len(mock_db["idempotency_log"]) == 0, "no idempotency row for a skipped copy"
+
+
+@pytest.mark.anyio
+async def test_class_a_book_unavailable_fails_closed(mock_db):
+    """Step 5: without a book there is no honest fill price — drop, don't assume."""
+    market_id = "test-class-a-no-book"
+    signal = {
+        "market_id": market_id,
+        "outcome": "Yes",
+        "live_ask": 0.50,
+        "tracker_price": 0.495,
+        "trader_name": "ProTrader",
+        "wallet_address": "0x123",
+        "was_priority_pick": False,
+        "trust_score": 0.85,
+        "market_volume_usd": 50000.0,
+    }
+
+    async def fake_dead_book(token_id: str):
+        return None
+
+    with patch("coordinator.pipeline.get_live_portfolio_value", AsyncMock(return_value=10_000.0)), \
+         patch("copytrade.executor._fetch_exposure", AsyncMock(return_value=(0.0, 0.0))), \
+         patch("copytrade.executor.get_market_book", fake_dead_book), \
+         patch("copytrade.executor.get_trust_score", return_value=0.85), \
+         patch("copytrade.executor.get_wallet_state", return_value="ACTIVE"), \
+         patch("copytrade.executor.compute_state_multiplier", return_value=1.0), \
+         patch("copytrade.executor._tracker_log_trade", AsyncMock()):
+
+        await _execute_class_a(signal)
+
+    assert len(mock_db["open_positions"]) == 0
+    assert len(mock_db["idempotency_log"]) == 0
 
 
 @pytest.mark.anyio

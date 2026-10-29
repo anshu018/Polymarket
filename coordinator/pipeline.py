@@ -29,6 +29,7 @@ from data import novelty
 from data import forward_sampler
 from strategies.estimator import get_estimate, side_probability
 from risk import cost_model
+from risk import fill_simulator
 from risk.edge_monitor import StrategyAllocation, derive_allocations, neutral_allocation
 from monitoring.telegram_alerts import (
     alert_supabase_degradation,
@@ -388,6 +389,8 @@ async def log_to_open_positions(
     net_edge_at_entry: Optional[float] = None,
     costs_paid_usdc: Optional[float] = None,
     order_type: Optional[str] = None,
+    fill_price: Optional[float] = None,
+    fill_type: Optional[str] = None,
 ) -> None:
     """
     Write newly opened position to the open_positions database table.
@@ -398,6 +401,12 @@ async def log_to_open_positions(
     startup-reconciliation close path. They default to None so a caller
     without a cost breakdown (estimate-free paths) still writes an honest
     NULL instead of a fabricated number.
+
+    The Step 5 (A5) fill kwargs carry the book-aware paper fill: fill_price
+    is the traded token's line price the book gave (NULL on a resting maker
+    order until the monitor fills it), fill_type is 'taker' | 'maker_fill' |
+    'taker_fallback' (NULL = unfilled). decision_price is market_price_at_entry
+    — no separate column.
     """
     async def _write() -> None:
         client = await get_client()
@@ -420,7 +429,9 @@ async def log_to_open_positions(
             "market_price_at_entry": market_price_at_entry,
             "net_edge_at_entry": net_edge_at_entry,
             "costs_paid_usdc": costs_paid_usdc,
-            "order_type": order_type
+            "order_type": order_type,
+            "fill_price": fill_price,
+            "fill_type": fill_type
         }).execute()
 
     try:
@@ -1376,6 +1387,63 @@ async def run_pipeline(
             kelly_raw, final_trade_size, binding_constraint,
         )
 
+        # Book-aware paper fill (List A.md Step 5 — A5): no more idealized fills.
+        # Takers cross the spread and are depth-checked HERE — fail-closed before
+        # the idempotency write, since an unfillable order is never submitted (this
+        # uses the gate's already-fetched snapshot: no extra Supabase/HTTP call).
+        # Makers rest at the touch and leave fill_price NULL — the paper fill
+        # monitor (execution/paper_fills.py) fills, falls back or cancels them.
+        fill_price: Optional[float] = None
+        fill_type: Optional[str] = None
+        resting_price: Optional[float] = None
+        if order_type == "taker":
+            if not fill_simulator.taker_depth_ok(book, final_trade_size):
+                _increment_drop("fill:insufficient_depth")
+                logger.warning(
+                    f"[PIPELINE][DROP:fill:insufficient_depth] market_id={market_id} "
+                    f"size=${final_trade_size:.2f} depth=${book.depth_usd:.2f}"
+                )
+                return {"status": "blocked", "reason": "insufficient_depth"}
+            fill_price = fill_simulator.taker_fill_price(book, decision_direction)
+            if fill_price is None:
+                _increment_drop("fill:unpriceable")
+                logger.warning(
+                    f"[PIPELINE][DROP:fill:unpriceable] market_id={market_id} "
+                    f"book_bid={book.best_bid:.4f} book_ask={book.best_ask:.4f}"
+                )
+                return {"status": "blocked", "reason": "fill_unpriceable"}
+            fill_type = "taker"
+        else:
+            resting_price = fill_simulator.maker_resting_price(book, decision_direction)
+            if resting_price is None:
+                _increment_drop("fill:unpriceable")
+                logger.warning(
+                    f"[PIPELINE][DROP:fill:unpriceable] market_id={market_id} "
+                    f"book_bid={book.best_bid:.4f} book_ask={book.best_ask:.4f}"
+                )
+                return {"status": "blocked", "reason": "fill_unpriceable"}
+
+        # Mandatory decision-vs-fill log (List A.md Step 5a) — the empirical
+        # slippage dataset: every trade records the price the decision math used
+        # (book.mid) against the price the book would actually have given.
+        if fill_price is not None:
+            slippage_observed = fill_simulator.signed_slippage_units(
+                fill_price, book.mid, decision_direction
+            )
+            logger.info(
+                "[OBSERVABILITY][FILL] market=%s decision_price=%.4f fill_price=%.4f "
+                "slippage_units=%.4f fill_type=%s size_usdc=%.2f",
+                market_id, book.mid, fill_price,
+                slippage_observed if slippage_observed is not None else float("nan"),
+                fill_type, final_trade_size,
+            )
+        else:
+            logger.info(
+                "[OBSERVABILITY][FILL] market=%s decision_price=%.4f resting_price=%.4f "
+                "fill_type=maker fill_pending=true size_usdc=%.2f",
+                market_id, book.mid, resting_price, final_trade_size,
+            )
+
         # 6. IDEMPOTENT ORDER EXECUTION (Rule 2)
         # Step A: Generate unique UUID at trade decision time
         order_uuid = str(uuid.uuid4())
@@ -1433,7 +1501,9 @@ async def run_pipeline(
             costs_paid_usdc=cost_model.entry_cost_usdc(
                 breakdown, final_trade_size, market_price
             ),
-            order_type=order_type
+            order_type=order_type,
+            fill_price=fill_price,
+            fill_type=fill_type,
         )
 
     # Log to copytrade_log for trust scoring and audit trail (Class B)
@@ -1466,5 +1536,7 @@ async def run_pipeline(
         "order_id": mock_order_id,
         "uuid": order_uuid,
         "was_memoryless": was_memoryless,
-        "reasoning": reasoning
+        "reasoning": reasoning,
+        "fill_price": fill_price,
+        "fill_type": fill_type,
     }

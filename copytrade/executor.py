@@ -41,6 +41,8 @@ import config
 from memory.supabase_client import get_client
 from risk import risk_engine
 from risk import cost_model
+from risk import fill_simulator
+from data.market_discovery import get_market_book
 from monitoring.telegram_alerts import alert_circuit_breaker, alert_supabase_degradation
 from coordinator.market_state import load_market_state, get_market_lock
 from copytrade.performance_tracker import (
@@ -150,6 +152,9 @@ async def _log_open_position(
     class_type: str,
     trader_name: str,
     idempotency_uuid: str,
+    fill_price: Optional[float] = None,
+    fill_type: Optional[str] = None,
+    decision_price: Optional[float] = None,
 ) -> None:
     """Write the new Class A position to open_positions. Non-blocking on failure.
 
@@ -159,6 +164,11 @@ async def _log_open_position(
     fabricated). The thesis identity falls back to the market_id (no headline
     exists to hash); market_price_at_entry and the config-decided order_type
     are what this path actually knows.
+
+    Step 5 (A5) fill kwargs: fill_price/fill_type record the book-aware paper
+    fill (NULL on the not-yet-wired live path); decision_price is the book mid
+    at fill time and feeds market_price_at_entry (falling back to entry_price
+    for callers without a book, preserving pre-Step-5 behavior).
     """
     strategy = f"copy_edge_class_{class_type.lower()}"
 
@@ -180,10 +190,12 @@ async def _log_open_position(
             "last_checked_at": datetime.now(timezone.utc).isoformat(),
             "thesis_id": f"{market_id}:{strategy}:{market_id}",
             "p_model_at_entry": None,             # estimate-free path — no model exists
-            "market_price_at_entry": entry_price,
+            "market_price_at_entry": decision_price if decision_price is not None else entry_price,
             "net_edge_at_entry": None,            # no cost model runs on this path
             "costs_paid_usdc": None,
             "order_type": cost_model.decide_order_type(strategy),
+            "fill_price": fill_price,
+            "fill_type": fill_type,
         }).execute()
 
     try:
@@ -361,6 +373,41 @@ async def _execute_class_a(signal: dict) -> None:
         # ── Limit order pricing ───────────────────────────────────────────────────
         limit_price = round(tracker_price + config.COPY_LIMIT_PRICE_BUFFER, 4)
 
+        # Book-aware paper fill (List A.md Step 5 — A5): the paper fill is what
+        # the live CLOB book would actually give, not an assumed price. A Class A
+        # limit at tracker_price + buffer is marketable only when the ask is at or
+        # below the limit — otherwise the price ran past the limit and the copy is
+        # skipped honestly (no idealized fill, no fabricated entry). Checked BEFORE
+        # the idempotency write: a trade that never fills never reserves a UUID.
+        fill_price: Optional[float] = None
+        fill_type: Optional[str] = None
+        decision_price: Optional[float] = None
+        if config.PAPER_TRADING:
+            book = await get_market_book(market_id)
+            if book is None:
+                logger.warning(
+                    "[COPY_EXECUTOR][CLASS_A][DROP:book_unavailable] market=%s", market_id[:12]
+                )
+                return
+            if not fill_simulator.taker_depth_ok(book, final_size):
+                logger.warning(
+                    "[COPY_EXECUTOR][CLASS_A][DROP:insufficient_depth] market=%s "
+                    "size=$%.2f depth=$%.2f",
+                    market_id[:12], final_size, book.depth_usd,
+                )
+                return
+            ask = fill_simulator.taker_fill_price(book, direction)
+            if ask is None or ask > limit_price:
+                logger.warning(
+                    "[COPY_EXECUTOR][CLASS_A][DROP:limit_missed] market=%s ask=%.4f limit=%.4f",
+                    market_id[:12],
+                    ask if ask is not None else float("nan"), limit_price,
+                )
+                return
+            fill_price = ask
+            fill_type = "taker"
+            decision_price = book.mid
+
         # ── Idempotency ───────────────────────────────────────────────────────────
         order_uuid = str(uuid.uuid4())
         existing = await _check_idempotency(order_uuid)
@@ -376,11 +423,17 @@ async def _execute_class_a(signal: dict) -> None:
         if config.PAPER_TRADING:
             # PAPER MODE FIX (CopyTrade.md §8): simulate fill — no silent no-op.
             # This makes Class A trades visible to the Brier score and paper gate.
+            # The price is the book-aware fill computed above (Step 5), never the
+            # assumed limit price.
             mock_order_id = f"copy_a_paper_{int(time.time())}"
+            slippage_observed = fill_simulator.signed_slippage_units(
+                fill_price, decision_price, direction
+            )
             logger.info(
-                "[COPY_EXECUTOR][CLASS_A][PAPER] Simulated LIMIT %s $%.2f @ %.4f | "
-                "trust=%.3f state=%s order=%s",
-                direction, final_size, limit_price,
+                "[COPY_EXECUTOR][CLASS_A][PAPER] Book-aware taker %s $%.2f @ %.4f "
+                "(decision mid %.4f, slippage %.4f) | trust=%.3f state=%s order=%s",
+                direction, final_size, fill_price, decision_price,
+                slippage_observed if slippage_observed is not None else float("nan"),
                 trust_score, wallet_state, mock_order_id,
             )
             order_id = mock_order_id
@@ -394,15 +447,21 @@ async def _execute_class_a(signal: dict) -> None:
 
         # ── Confirm idempotency and log position ──────────────────────────────────
         await _confirm_idempotency(order_uuid, order_id)
-        # Always log to open_positions (both paper and live) — CopyTrade.md §8 fix
+        # Always log to open_positions (both paper and live) — CopyTrade.md §8 fix.
+        # entry_price is the price ACTUALLY paid (the book-aware fill) so the
+        # close-path P&L (qty = size / entry_price) is honest; the decision-time
+        # reference rides separately in market_price_at_entry.
         await _log_open_position(
             market_id=market_id,
             direction=direction,
-            entry_price=limit_price,
+            entry_price=fill_price if fill_price is not None else limit_price,
             size_usdc=final_size,
             class_type="A",
             trader_name=trader_name,
             idempotency_uuid=order_uuid,
+            fill_price=fill_price,
+            fill_type=fill_type,
+            decision_price=decision_price,
         )
 
         # Log to copytrade_log for trust score tracking and priority audit trail
@@ -424,7 +483,8 @@ async def _execute_class_a(signal: dict) -> None:
         "[COPY_EXECUTOR][CLASS_A] ✅ Executed in %.0fms | market=%s dir=%s "
         "size=$%.2f price=%.4f trust=%.3f state=%s priority=%s",
         elapsed_ms, market_id[:12], direction,
-        final_size, limit_price, trust_score, wallet_state, was_priority_pick,
+        final_size, fill_price if fill_price is not None else limit_price,
+        trust_score, wallet_state, was_priority_pick,
     )
 
     if elapsed_ms > 500:

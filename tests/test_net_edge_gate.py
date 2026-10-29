@@ -512,3 +512,87 @@ async def test_sizing_log_line_has_all_mandatory_fields(mock_db, caplog):
     assert "p_used=0.6250" in line
     assert "p_side=0.6250" in line
     assert "binding_constraint=position_cap" in line  # 5% cap binds $625 → $500
+
+
+# ── Step 5 (A5): book-aware paper fills ───────────────────────────────────────
+
+@pytest.mark.anyio
+async def test_taker_fill_price_persisted_on_open_positions(mock_db, book_holder):
+    """A taker entry records the fill the book actually gave (the ask), not the
+    decision mid — the empirical slippage dataset (List A.md Step 5a)."""
+    result = await run_default_pipeline(strategy_override="velocity")  # velocity → taker
+
+    assert result is not None and result["status"] == "success"
+    assert result["fill_price"] == 0.52  # crossed the spread at the ask
+    assert result["fill_type"] == "taker"
+    pos = mock_db["open_positions"][0]
+    assert pos["fill_price"] == 0.52
+    assert pos["fill_type"] == "taker"
+    # Decision price is market_price_at_entry (book mid), distinct from the fill.
+    assert pos["market_price_at_entry"] == pytest.approx(0.50)
+    assert pos["fill_price"] != pos["market_price_at_entry"]
+
+
+@pytest.mark.anyio
+async def test_maker_entry_leaves_fill_null_for_the_monitor(mock_db, book_holder, caplog):
+    """A maker order rests at the touch and must NOT claim a fill: fill_price and
+    fill_type stay NULL in open_positions until execution/paper_fills.py resolves
+    the resting order (fill / taker fallback / cancel)."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="coordinator.pipeline"):
+        result = await run_default_pipeline()  # default strategy recalibration → maker
+
+    assert result is not None and result["status"] == "success"
+    assert result["fill_price"] is None
+    assert result["fill_type"] is None
+    pos = mock_db["open_positions"][0]
+    assert pos["order_type"] == "maker"
+    assert pos["fill_price"] is None
+    assert pos["fill_type"] is None
+    fill_lines = [line for line in caplog.text.splitlines()
+                  if "[OBSERVABILITY][FILL]" in line]
+    assert len(fill_lines) == 1
+    assert "resting_price=0.4800" in fill_lines[0]  # rests at the YES bid
+    assert "fill_pending=true" in fill_lines[0]
+
+
+@pytest.mark.anyio
+async def test_taker_depth_rejection_fails_closed_before_idempotency(mock_db, book_holder):
+    """Depth < size must block the entry BEFORE the idempotency UUID is written —
+    an unfillable order is never submitted and never reserves an idempotency slot.
+
+    Note: for same-cap strategies the net-edge gate already subsumes this (its
+    slippage term blows up when the worst-case size exceeds depth, and the final
+    size never exceeds the worst case), so the pipeline-level check is
+    defense-in-depth — load-bearing if a strategy cap ever exceeds the gate's
+    worst-case assumption. This test locks the wiring and the ordering."""
+    book_holder["book"] = BookSnapshot(best_bid=0.48, best_ask=0.52, depth_usd=5000.0)
+
+    with patch("coordinator.pipeline.fill_simulator.taker_depth_ok", return_value=False):
+        result = await run_default_pipeline(strategy_override="velocity")  # taker
+
+    assert result is not None
+    assert result["status"] == "blocked"
+    assert result["reason"] == "insufficient_depth"
+    assert get_drop_counters()["fill:insufficient_depth"] == 1
+    assert len(mock_db["open_positions"]) == 0
+    assert len(mock_db["idempotency_log"]) == 0, "no idempotency row before a real order"
+
+
+@pytest.mark.anyio
+async def test_fill_log_line_records_decision_vs_fill(mock_db, book_holder, caplog):
+    """Every filled trade logs decision_price vs fill_price (List A.md Step 5a)."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="coordinator.pipeline"):
+        result = await run_default_pipeline(strategy_override="velocity")
+
+    assert result is not None and result["status"] == "success"
+    fill_lines = [line for line in caplog.text.splitlines()
+                  if "[OBSERVABILITY][FILL]" in line]
+    assert len(fill_lines) == 1, "mandatory fill log line missing or duplicated"
+    line = fill_lines[0]
+    for field in ("decision_price=0.5000", "fill_price=0.5200",
+                  "slippage_units=0.0200", "fill_type=taker"):
+        assert field in line, f"fill log line missing {field}"
