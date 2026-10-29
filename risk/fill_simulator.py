@@ -24,7 +24,8 @@ Line conventions (matches cost_model.compute_cost_breakdown):
       line for YES orders, the NO line (1 − YES price) for NO orders — the same
       line open_positions.entry_price/exit_price accounting uses.
     - Slippage is signed so that POSITIVE = paid worse than the decision reference:
-      (fill − decision) for YES buys, (1 − decision − fill) for NO buys.
+      fill − reference on the traded token's line, where the reference is the YES
+      mid for YES buys and 1 − the YES mid for NO buys.
     - Fail-closed: an invalid/crossed book yields None (caller must not fill).
 """
 
