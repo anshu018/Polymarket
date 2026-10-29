@@ -121,6 +121,15 @@ async def main():
         asyncio.create_task(run_forward_sampler_supervisor(), name="forward_price_sampler")
         logger.info("[FORWARD_SAMPLER] Forward-price sampler started (supervisor task).")
 
+        # Start the Step 5 paper maker-fill monitor (List A.md A5). Resolves
+        # resting paper maker orders against the live book — fills on a
+        # through-trade, falls back to taker if still net-positive after
+        # MAKER_FALLBACK_SECONDS, else cancels. State lives in open_positions
+        # (restart-safe re-scan), so nothing is lost on restart.
+        from execution.paper_fills import run_paper_fill_monitor
+        asyncio.create_task(run_paper_fill_monitor(), name="paper_fill_monitor")
+        logger.info("[PAPER_FILLS] Paper maker-fill monitor started (supervisor task).")
+
         # Validate News Analyst models before starting signal processing
         from llm.news_analyst import validate_models
         logger.info("Validating news analyst models...")

@@ -391,6 +391,7 @@ async def log_to_open_positions(
     order_type: Optional[str] = None,
     fill_price: Optional[float] = None,
     fill_type: Optional[str] = None,
+    resting_price: Optional[float] = None,
 ) -> None:
     """
     Write newly opened position to the open_positions database table.
@@ -405,8 +406,9 @@ async def log_to_open_positions(
     The Step 5 (A5) fill kwargs carry the book-aware paper fill: fill_price
     is the traded token's line price the book gave (NULL on a resting maker
     order until the monitor fills it), fill_type is 'taker' | 'maker_fill' |
-    'taker_fallback' (NULL = unfilled). decision_price is market_price_at_entry
-    — no separate column.
+    'taker_fallback' (NULL = unfilled), resting_price is the level a maker
+    order rests at (the monitor's persisted fill-detection key). decision_price
+    is market_price_at_entry — no separate column.
     """
     async def _write() -> None:
         client = await get_client()
@@ -431,7 +433,8 @@ async def log_to_open_positions(
             "costs_paid_usdc": costs_paid_usdc,
             "order_type": order_type,
             "fill_price": fill_price,
-            "fill_type": fill_type
+            "fill_type": fill_type,
+            "resting_price": resting_price
         }).execute()
 
     try:
@@ -1504,6 +1507,7 @@ async def run_pipeline(
             order_type=order_type,
             fill_price=fill_price,
             fill_type=fill_type,
+            resting_price=resting_price,
         )
 
     # Log to copytrade_log for trust scoring and audit trail (Class B)

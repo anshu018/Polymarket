@@ -59,6 +59,15 @@ def test_unfilled_maker_index_registered() -> None:
     assert "WHERE order_type = 'maker' AND fill_price IS NULL" in sql
 
 
+def test_resting_price_column_registered_on_open_positions() -> None:
+    """The monitor needs the persisted maker level — it is not recomputable
+    from later books. open_positions only (closed trades never rest)."""
+    sql = _migration_sql("open_positions")
+    assert "resting_price DECIMAL(10,4)" in sql
+    assert "ADD COLUMN IF NOT EXISTS resting_price" in sql
+    assert "resting_price" not in _migration_sql("closed_trades")
+
+
 @pytest.mark.parametrize("column", BASELINE_COLUMNS)
 def test_baseline_columns_declared_in_signal_outcomes(column: str) -> None:
     """The market-baseline resolution columns are in the canonical CREATE TABLE."""
