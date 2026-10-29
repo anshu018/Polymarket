@@ -38,6 +38,7 @@ from typing import Optional
 import aiohttp
 
 import config
+from coordinator import equity
 from memory.supabase_client import get_client
 from risk import risk_engine
 from risk import cost_model
@@ -273,22 +274,40 @@ async def _execute_class_a(signal: dict) -> None:
         was_priority_pick,
     )
 
-    # ── Risk Gate 1: Drawdown circuit breakers ────────────────────────────────
-    from coordinator.pipeline import get_live_portfolio_value
-    portfolio_value = await get_live_portfolio_value()
+    # ── Risk Gate 1: Drawdown circuit breakers (List-B.md Step 1 — B2) ────────
+    # Real period-start anchors from the equity snapshot service. The old code
+    # fed check_drawdown the same value as both start and current (E-B3), so
+    # drawdown was permanently 0 and this breaker could never fire. Fail-closed:
+    # stale or unavailable equity blocks the entry (exits are never gated here).
+    # The authoritative drop counters live in coordinator.equity.get_drop_counters().
+    gate = equity.get_entry_gate()
+    if gate is None:
+        logger.warning(
+            "[COPY_EXECUTOR][CLASS_A][DROP:%s] equity gate fail-closed",
+            equity.get_last_gate_failure(),
+        )
+        return
+    portfolio_value = gate.current_equity
     for period in ["daily", "weekly", "monthly"]:
         status = risk_engine.check_drawdown(
-            starting_balance=portfolio_value,
-            current_balance=portfolio_value,
+            starting_balance=gate.starting_balances[period],
+            current_balance=gate.current_balances[period],
             period=period,
         )
         if status in ("HALT", "SHUTDOWN"):
+            starting = gate.starting_balances[period]
+            current = gate.current_balances[period]
             logger.critical("[COPY_EXECUTOR][CLASS_A] Drawdown gate fired: %s — HALTING", period)
             asyncio.create_task(
                 alert_circuit_breaker(
                     breaker_type=period,
-                    current_pct=0.0,
-                    threshold_pct=config.DAILY_DRAWDOWN_HALT_PCT,
+                    current_pct=(starting - current) / starting,
+                    # Per-period threshold — the old code reported the DAILY
+                    # threshold for all three periods.
+                    threshold_pct=(
+                        config.MONTHLY_DRAWDOWN_SHUTDOWN_PCT if period == "monthly"
+                        else getattr(config, f"{period.upper()}_DRAWDOWN_HALT_PCT")
+                    ),
                     portfolio_value=portfolio_value,
                 )
             )

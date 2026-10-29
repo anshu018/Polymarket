@@ -25,6 +25,7 @@ from unittest.mock import patch, AsyncMock
 import pytest
 import config
 from coordinator.pipeline import run_pipeline, get_drop_counters, _drop_counters
+from coordinator import equity
 from coordinator.market_state import (
     get_market_lock,
     reset_market_locks,
@@ -38,6 +39,18 @@ from llm.trade_decision import TradeDecisionOutput
 from llm.coordinator import CoordinatorOutput
 from strategies.estimator import EstimateResult
 from risk.cost_model import BookSnapshot
+
+
+def _flat_equity_gate(current: float) -> "equity.EquityGate":
+    """List-B Step 1 (B2): the Class A drawdown gate reads the equity snapshot
+    service via equity.get_entry_gate(); tests inject a fresh, flat gate
+    explicitly (never live state)."""
+    return equity.EquityGate(
+        as_of=datetime.now(timezone.utc),
+        current_equity=current,
+        starting_balances={"daily": current, "weekly": current, "monthly": current},
+        current_balances={"daily": current, "weekly": current, "monthly": current},
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -602,6 +615,67 @@ async def test_precheck_skips_trade_decision_llm_when_max_tranches(mock_db):
 
 
 @pytest.mark.anyio
+async def test_class_a_drawdown_halt_from_real_equity_gate(mock_db):
+    """List-B.md Step 1 DoD (executor path): a real equity drop trips
+    check_drawdown through the equity gate — the alert carries the REAL
+    percentage (the old code hardcoded current_pct=0.0) and no position is
+    written."""
+    market_id = "test-class-a-drawdown-halt"
+    signal = {
+        "market_id": market_id,
+        "outcome": "Yes",
+        "live_ask": 0.50,
+        "tracker_price": 0.495,
+        "trader_name": "ProTrader",
+        "wallet_address": "0x123",
+        "was_priority_pick": False,
+        "trust_score": 0.85,
+        "market_volume_usd": 50000.0,
+    }
+    gate = equity.EquityGate(
+        as_of=datetime.now(timezone.utc),
+        current_equity=9000.0,
+        starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+        current_balances={"daily": 9000.0, "weekly": 10000.0, "monthly": 10000.0},
+    )
+
+    with patch("coordinator.equity.get_entry_gate", lambda now=None: gate), \
+         patch("copytrade.executor.alert_circuit_breaker", AsyncMock()) as spy_alert:
+        await _execute_class_a(signal)
+
+    assert len(mock_db["open_positions"]) == 0
+    spy_alert.assert_called_once()
+    kwargs = spy_alert.call_args.kwargs
+    assert kwargs["breaker_type"] == "daily"
+    assert kwargs["current_pct"] == pytest.approx(0.10)
+    assert kwargs["threshold_pct"] == pytest.approx(config.DAILY_DRAWDOWN_HALT_PCT)
+
+
+@pytest.mark.anyio
+async def test_class_a_blocked_when_equity_gate_unavailable(mock_db):
+    """Fail-closed: a None gate (stale/unavailable equity) blocks the Class A
+    entry before any DB write."""
+    market_id = "test-class-a-equity-unavailable"
+    signal = {
+        "market_id": market_id,
+        "outcome": "Yes",
+        "live_ask": 0.50,
+        "tracker_price": 0.495,
+        "trader_name": "ProTrader",
+        "wallet_address": "0x123",
+        "was_priority_pick": False,
+        "trust_score": 0.85,
+        "market_volume_usd": 50000.0,
+    }
+
+    with patch("coordinator.equity.get_entry_gate", lambda now=None: None):
+        await _execute_class_a(signal)
+
+    assert len(mock_db["open_positions"]) == 0
+    assert len(mock_db["idempotency_log"]) == 0
+
+
+@pytest.mark.anyio
 async def test_class_a_first_entry_10_dollars_permitted(mock_db):
     """Test 9: A $10 Class A first entry is permitted without being blocked by repeat floor."""
     market_id = "test-class-a-small"
@@ -622,7 +696,7 @@ async def test_class_a_first_entry_10_dollars_permitted(mock_db):
         # fill (Step 5) goes through at the ask; depth carries the $10 size.
         return BookSnapshot(best_bid=0.48, best_ask=0.49, depth_usd=5000.0)
 
-    with patch("coordinator.pipeline.get_live_portfolio_value", AsyncMock(return_value=10_000.0)), \
+    with patch("coordinator.equity.get_entry_gate", lambda now=None: _flat_equity_gate(10_000.0)), \
          patch("copytrade.executor._fetch_exposure", AsyncMock(return_value=(0.0, 0.0))), \
          patch("copytrade.executor.get_market_book", fake_class_a_book), \
          patch("copytrade.executor.get_trust_score", return_value=0.85), \
@@ -663,7 +737,7 @@ async def test_class_a_no_fill_when_ask_runs_past_the_limit(mock_db):
     async def fake_runaway_book(token_id: str):
         return BookSnapshot(best_bid=0.53, best_ask=0.55, depth_usd=5000.0)  # ask > limit
 
-    with patch("coordinator.pipeline.get_live_portfolio_value", AsyncMock(return_value=10_000.0)), \
+    with patch("coordinator.equity.get_entry_gate", lambda now=None: _flat_equity_gate(10_000.0)), \
          patch("copytrade.executor._fetch_exposure", AsyncMock(return_value=(0.0, 0.0))), \
          patch("copytrade.executor.get_market_book", fake_runaway_book), \
          patch("copytrade.executor.get_trust_score", return_value=0.85), \
@@ -696,7 +770,7 @@ async def test_class_a_book_unavailable_fails_closed(mock_db):
     async def fake_dead_book(token_id: str):
         return None
 
-    with patch("coordinator.pipeline.get_live_portfolio_value", AsyncMock(return_value=10_000.0)), \
+    with patch("coordinator.equity.get_entry_gate", lambda now=None: _flat_equity_gate(10_000.0)), \
          patch("copytrade.executor._fetch_exposure", AsyncMock(return_value=(0.0, 0.0))), \
          patch("copytrade.executor.get_market_book", fake_dead_book), \
          patch("copytrade.executor.get_trust_score", return_value=0.85), \
@@ -774,7 +848,7 @@ async def test_all_four_paths_hit_the_gate(mock_db):
         "wallet_address": "0x1",
         "market_volume_usd": 50000.0,
     }
-    with patch("coordinator.pipeline.get_live_portfolio_value", AsyncMock(return_value=10_000.0)), \
+    with patch("coordinator.equity.get_entry_gate", lambda now=None: _flat_equity_gate(10_000.0)), \
          patch("copytrade.executor._fetch_exposure", AsyncMock(return_value=(0.0, 0.0))), \
          patch("copytrade.executor.get_trust_score", return_value=0.85), \
          patch("copytrade.executor.get_wallet_state", return_value="ACTIVE"), \
