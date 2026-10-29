@@ -17,7 +17,6 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
-from unittest.mock import AsyncMock
 
 import pytest
 

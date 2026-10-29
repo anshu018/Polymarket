@@ -36,11 +36,11 @@ Design contract (List-B.md §6 Step 1; decisions D-B03, D-B12):
   reads on the trade path): cache absent → `equity:unavailable`, older than
   EQUITY_STALE_HALT_MINUTES → `equity:stale`. Both BLOCK the entry
   (fail-closed) — an equity system that silently returns zeros is exactly the
-  bug this module kills, so a blind breaker is worse than no trading. DB READ
-  failure inside a tick leaves the cache untouched so it ages toward
-  fail-closed; a DB WRITE failure still refreshes the cache (the anchors the
-  cache carries were read successfully and remain valid) — documented
-  fail-soft on that telemetry path only.
+  bug this module kills, so a blind breaker is worse than no trading. ANY
+  failure inside a tick (DB read or anchor write) leaves the cache untouched
+  so it ages toward fail-closed: the anchor write is capital-safety-adjacent
+  (a silently stale anchor masks drawdown), so it does NOT get the telemetry
+  fail-soft treatment.
 
 This module performs I/O. It must NEVER be imported by risk/risk_engine.py
 (purity rule), and nothing here can place an order or block an exit.
