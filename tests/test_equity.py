@@ -565,7 +565,7 @@ async def test_supervisor_tick_failure_leaves_cache_cold(equity_db, monkeypatch:
 
 
 @pytest.mark.anyio
-async def test_get_current_portfolio_value_uses_cache(equity_db) -> None:
+async def test_get_live_portfolio_value_uses_cache(equity_db) -> None:
     """Sizing reads are cache-backed: no book fetches per call after a tick."""
     state, price_holder, _ = equity_db
     state["open_positions"].append(make_position(entry=0.50, fill=0.50))
@@ -576,6 +576,22 @@ async def test_get_current_portfolio_value_uses_cache(equity_db) -> None:
     value = await equity.get_current_portfolio_value()
 
     assert value == pytest.approx(equity._snapshot_cache.current_equity)
+
+
+@pytest.mark.anyio
+async def test_get_live_portfolio_value_is_marked_in_paper_mode(equity_db) -> None:
+    """E-B5 fix: the sizing/exposure portfolio read is mark-to-market equity in
+    paper mode too — never the frozen PAPER_TRADING_PORTFOLIO_USDC constant."""
+    from coordinator.pipeline import get_live_portfolio_value
+
+    state, price_holder, _ = equity_db
+    state["open_positions"].append(make_position(entry=0.50, fill=0.50))
+    price_holder["price"] = 0.60  # 200 shares → 120
+
+    # Cold cache → one fresh computation: 10000 − 100 committed + 120 marked.
+    value = await get_live_portfolio_value()
+
+    assert value == pytest.approx(10020.0)
 
 
 @pytest.mark.anyio

@@ -212,15 +212,28 @@ def mock_supabase_client(db_state: dict[str, list[dict[str, Any]]]) -> Generator
             await asyncio.sleep(2.5)
         return client
 
-    with patch("coordinator.pipeline.get_client", fake_get_client), \
-         patch("coordinator.equity.get_client", fake_get_client), \
-         patch("llm.contract_parser.get_client", fake_get_client), \
-         patch("llm.trade_decision.get_client", fake_get_client), \
-         patch("strategies.calibration.get_client", fake_get_client), \
-         patch("strategies.estimator.get_client", fake_get_client), \
-         patch("copytrade.performance_tracker.get_client", fake_get_client), \
-         patch("memory.supabase_client.get_client", fake_get_client):
-        yield client
+    # List-B Step 1 (B2): in production the equity snapshot supervisor keeps the
+    # cache warm, so get_live_portfolio_value does zero DB reads on the hot path.
+    # Inject an equivalent warm cache — a cold one would add two reads inside
+    # fetch_open_positions_exposure and shift the documented call-order ordinals.
+    equity._snapshot_cache = equity.EquityGate(
+        as_of=datetime.now(timezone.utc),
+        current_equity=10000.0,
+        starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+        current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+    )
+    try:
+        with patch("coordinator.pipeline.get_client", fake_get_client), \
+             patch("coordinator.equity.get_client", fake_get_client), \
+             patch("llm.contract_parser.get_client", fake_get_client), \
+             patch("llm.trade_decision.get_client", fake_get_client), \
+             patch("strategies.calibration.get_client", fake_get_client), \
+             patch("strategies.estimator.get_client", fake_get_client), \
+             patch("copytrade.performance_tracker.get_client", fake_get_client), \
+             patch("memory.supabase_client.get_client", fake_get_client):
+            yield client
+    finally:
+        equity._snapshot_cache = None
 
 
 @pytest.fixture

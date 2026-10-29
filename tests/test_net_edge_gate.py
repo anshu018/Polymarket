@@ -21,6 +21,24 @@ import pytest
 import config
 from coordinator.pipeline import run_pipeline, get_drop_counters, _drop_counters
 from coordinator.market_state import reset_market_locks
+from coordinator import equity
+
+
+@pytest.fixture(autouse=True)
+def warm_equity_cache():
+    """List-B Step 1 (B2): production keeps the equity snapshot cache warm (the
+    supervisor refreshes it every 300s), so get_live_portfolio_value does zero
+    DB reads on the hot path. Inject an equivalent warm cache — a cold one adds
+    two reads inside fetch_open_positions_exposure and shifts the documented
+    call-order ordinals."""
+    equity._snapshot_cache = equity.EquityGate(
+        as_of=datetime.now(timezone.utc),
+        current_equity=10000.0,
+        starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+        current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+    )
+    yield
+    equity._snapshot_cache = None
 from llm.news_analyst import NewsAnalystOutput
 from llm.contract_parser import ContractParserOutput
 from llm.trade_decision import TradeDecisionOutput

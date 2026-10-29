@@ -4,7 +4,6 @@ Coordinates the entire ingestion, analysis, cache, parsing, trade decision, risk
 """
 
 import asyncio
-import os
 import logging
 import uuid
 import time
@@ -530,25 +529,17 @@ async def _warm_resolution_cache(top_n: int = 15) -> None:
 
 
 async def get_live_portfolio_value() -> float:
-    """Helper to get just the total portfolio value (zero DB calls in paper trading)."""
-    if config.PAPER_TRADING:
-        return float(os.environ.get("PAPER_TRADING_PORTFOLIO_USDC", "10000"))
-    try:
-        from execution.polymarket_auth import get_polymarket_client
-        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+    """Total portfolio value for sizing/exposure reads — mark-to-market in
+    BOTH modes (List-B.md Step 1 — B2; E-B5).
 
-        client = get_polymarket_client()
-        usdc_res = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
-        actual_usdc = float(usdc_res.get("balance", "0")) / 1000000.0
-
-        db_client = await get_client()
-        res = db_client.table("open_positions").select("position_size_usdc").execute()
-        open_pos_value = sum(float(r.get("position_size_usdc", 0)) for r in res.data)
-
-        return actual_usdc + open_pos_value
-    except Exception as e:
-        logger.error(f"[PORTFOLIO] Failed to fetch live portfolio value: {e}")
-        return float(os.environ.get("PAPER_TRADING_PORTFOLIO_USDC", "10000"))
+    Paper mode previously returned the frozen PAPER_TRADING_PORTFOLIO_USDC
+    constant, so sizing caps and the drawdown breakers never saw real P&L.
+    The value now comes from coordinator.equity.get_current_portfolio_value():
+    cache-backed marked equity (the snapshot task owns all I/O — no per-call
+    book fetches), with a one-shot fresh computation when the cache is cold.
+    Raises on failure so callers fail closed — the old fallback of returning
+    the env constant fabricated equity and is gone."""
+    return await equity.get_current_portfolio_value()
 
 
 # ─────────────────────────────────────────────
