@@ -103,6 +103,14 @@ AUTO_EXIT_LIQUIDITY_FLOOR_USDC = 3000
 DAILY_DRAWDOWN_HALT_PCT = 0.08
 WEEKLY_DRAWDOWN_HALT_PCT = 0.15
 MONTHLY_DRAWDOWN_SHUTDOWN_PCT = 0.25
+
+# ── EQUITY SNAPSHOT & DRAWDOWN ANCHORS (List-B.md Step 1 — B2) ────────────────
+# The snapshot task marks the portfolio to market and upserts the daily anchor
+# row in daily_performance; entry paths read ONLY the cached result.
+EQUITY_SNAPSHOT_INTERVAL_SECONDS = 300   # how often the portfolio is marked to market and anchors refreshed
+EQUITY_STALE_HALT_MINUTES = 60           # entries FAIL CLOSED when the equity cache is older than this — a blind drawdown breaker is worse than no trading
+EQUITY_ALERT_COOLDOWN_SECONDS = 3600     # anti-spam floor for repeating equity WARNING alerts (staleness / anchor bootstrap); global DO-NOT: cooldowns required on repeating alerts
+EQUITY_MAX_MARKED_POSITIONS = 50         # cap on live book fetches per snapshot; positions beyond the cap are valued at entry price (conservative, counted)
 MIN_CASH_RESERVE_PCT = 0.20
 HEALTH_SCORE_DEFENSIVE_THRESHOLD = 65
 HEALTH_SCORE_HALT_THRESHOLD = 40

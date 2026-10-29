@@ -99,6 +99,17 @@ async def alert_brier_score_exceeded(current_score: float, threshold: float, per
            f"Action: Models flagged for retraining.")
     asyncio.create_task(_send_to_telegram(msg))
 
+async def alert_equity_warning(event: str, trigger: str, state: str, action: str) -> None:
+    """Warning-level equity event (List-B.md Step 1 — B2): anchor bootstrap,
+    stale equity cache, or unavailable equity. The caller owns the cooldown."""
+    now = datetime.now(timezone.utc).isoformat()
+    msg = (f"[ZERO-ALPHA] WARNING | {event}\n"
+           f"Time: {now}\n"
+           f"Trigger: {trigger}\n"
+           f"State: {state}\n"
+           f"Action: {action}")
+    asyncio.create_task(_send_to_telegram(msg))
+
 async def alert_pipeline_component_crash(component: str, error_type: str, error_detail: str) -> None:
     """Alert when a pipeline component raises an unhandled exception."""
     now = datetime.now(timezone.utc).isoformat()
