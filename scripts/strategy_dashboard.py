@@ -7,7 +7,10 @@ the window — n, net P&L, mean net edge (trailing window), rolling per-trade
 Sharpe, CUSUM fade status, and the allocation state the runtime derives
 (weight / probation / retired). The math is the SAME pure code the runtime
 enforces at the sizing read path (risk/edge_monitor.py) — the dashboard can
-never disagree with the enforcement.
+never disagree with the enforcement. Since Step 5 the Brier-vs-market column
+reuses the gate report's identical-sample math: agent p_model_at_entry vs
+market market_price_at_entry on each strategy's resolved trades ("—" when the
+sample is empty — Class A is estimate-free and renders honestly as no-Brier).
 
 OFFLINE ANALYSIS ONLY — never imported by, or run in, the runtime hot path.
 Reads Supabase, writes a markdown report, and sends a Telegram summary.
@@ -15,10 +18,6 @@ Reads Supabase, writes a markdown report, and sends a Telegram summary.
 Usage:
     python -m scripts.strategy_dashboard [--days 7] [--out PATH]
                                          [--limit 5000] [--no-telegram]
-
-Brier-vs-market column: PLACEHOLDER until Step 5 (the market baseline — the
-market's own probability at decision time on the identical sample — does not
-exist yet). It renders as "—", never as an invented number.
 """
 
 import argparse
@@ -36,10 +35,11 @@ load_dotenv(dotenv_path=".env.test", override=True)
 
 import config  # noqa: E402  (must follow the .env.test load)
 from risk.edge_monitor import derive_allocations  # noqa: E402
+from scripts.gate_report import brier_pairs, mean_brier  # noqa: E402
 
 logger = logging.getLogger("strategy_dashboard")
 
-_BRIER_PLACEHOLDER = "—"  # Step 5: agent-vs-market Brier needs the baseline
+_BRIER_PLACEHOLDER = "—"  # rendered when a strategy has no Brier sample
 
 
 # ── Pure core (unit-testable, no I/O) ─────────────────────────────────────────
@@ -60,7 +60,8 @@ def aggregate_strategies(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     Args:
         rows: closed_trades rows (strategy, pnl_usdc, net_edge_at_entry,
-              thesis_id, closed_at).
+              thesis_id, closed_at, direction, outcome, p_model_at_entry,
+              market_price_at_entry).
 
     Returns:
         One report dict per strategy, sorted by strategy name.
@@ -81,6 +82,18 @@ def aggregate_strategies(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 if r.get("pnl_usdc") is not None]
         theses = {str(r.get("thesis_id")) for r in group_rows
                   if r.get("thesis_id") is not None}
+        # Brier-vs-market (Step 5): the gate report's identical-sample math on
+        # this strategy's resolved trades. Rows without both probabilities
+        # (Class A's estimate-free NULLs) leave the sample — no invented number.
+        pairs = brier_pairs(group_rows)
+        agent_brier = (
+            mean_brier([p[0] for p in pairs], [int(p[2]) for p in pairs])
+            if pairs else None
+        )
+        market_brier = (
+            mean_brier([p[1] for p in pairs], [int(p[2]) for p in pairs])
+            if pairs else None
+        )
         report.append({
             "strategy": strategy,
             "n": alloc.n,
@@ -94,6 +107,9 @@ def aggregate_strategies(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "probation": alloc.probation,
             "retired": alloc.retired,
             "thesis_count": len(theses),
+            "agent_brier": agent_brier,
+            "market_brier": market_brier,
+            "brier_sample_n": len(pairs) if pairs else 0,
         })
     return report
 
@@ -137,8 +153,10 @@ def render_markdown(
         f"{config.EDGE_ROLLING_WINDOW} window via risk/edge_monitor.py — the "
         f"same math the sizing read path enforces.",
         "",
-        "**Brier-vs-market is a placeholder (—) until Step 5's market baseline "
-        "exists; no number is invented.**",
+        "**Brier-vs-market** (Step 5): agent p_model_at_entry vs market "
+        "market_price_at_entry on the strategy's resolved trades — the gate "
+        "report's identical-sample math. \"—\" = no sample (estimate-free rows "
+        "honestly leave the sample; no number is invented).",
         "",
     ]
     if not report:
@@ -152,12 +170,17 @@ def render_markdown(
                  "Brier-vs-market |")
     lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
     for row in report:
+        brier_cell = (
+            f"{row['agent_brier']:.4f} vs {row['market_brier']:.4f} (n={row['brier_sample_n']})"
+            if row["agent_brier"] is not None and row["market_brier"] is not None
+            else _BRIER_PLACEHOLDER
+        )
         lines.append(
             f"| {row['strategy']} | {row['n']} | {row['thesis_count']} | "
             f"{_pnl_label(row['net_pnl'])} | {row['mean_net_edge'] * 100:+.2f} | "
             f"{row['rolling_sharpe']:+.2f} | {_cusum_label(row)} | "
             f"{row['weight']:.2f} | {'YES' if row['probation'] else 'no'} | "
-            f"{'YES' if row['retired'] else 'no'} | {_BRIER_PLACEHOLDER} |"
+            f"{'YES' if row['retired'] else 'no'} | {brier_cell} |"
         )
     lines.append("")
     lines.append(f"Allocation: weight ∝ rolling net Sharpe (mean 1.0 across "
@@ -191,18 +214,22 @@ def render_telegram_summary(
     if not report:
         lines.append("No closed trades in window (ledger clock: first paper "
                      "trade after the Step 3 migration).")
-        lines.append("Brier-vs-market: placeholder until Step 5.")
         return "\n".join(lines)
     for row in report:
         status = ("RETIRED" if row["retired"]
                   else "PROBATION" if row["probation"]
                   else "FADED" if row["cusum_faded"] else "OK")
+        brier_cell = (
+            f"{row['agent_brier']:.3f} vs {row['market_brier']:.3f}"
+            if row["agent_brier"] is not None and row["market_brier"] is not None
+            else "—(no sample)"
+        )
         lines.append(
             f"{row['strategy']}: n={row['n']} "
             f"pnl={_pnl_label(row['net_pnl'])} "
             f"edge={row['mean_net_edge'] * 100:+.1f}¢ "
             f"sharpe={row['rolling_sharpe']:+.2f} cusum={status} "
-            f"w={row['weight']:.2f} brier_mkt=—(Step5)"
+            f"w={row['weight']:.2f} brier_agent/mkt={brier_cell}"
         )
     lines.append("Weekly offline analysis — allocation math matches the "
                  "sizing read path (risk/edge_monitor.py).")
@@ -228,7 +255,10 @@ async def fetch_closed_trades(days: int, limit: int) -> list[dict[str, Any]]:
     client = await get_client()
     res = (
         client.table("closed_trades")
-        .select("strategy,pnl_usdc,net_edge_at_entry,thesis_id,closed_at")
+        .select(
+            "strategy,pnl_usdc,net_edge_at_entry,thesis_id,closed_at,"
+            "direction,outcome,p_model_at_entry,market_price_at_entry"
+        )
         .gte("closed_at", cutoff)
         .order("closed_at")
         .limit(limit)

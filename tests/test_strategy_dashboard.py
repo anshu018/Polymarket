@@ -6,7 +6,9 @@ Supabase, matching the signal_drift_report test pattern.
 The key property under test: the dashboard reuses the runtime's own
 derivation (risk/edge_monitor.derive_allocations), so a strategy the sizing
 path would retire/probate shows exactly that on the dashboard, and the
-Brier-vs-market column is an explicit placeholder — never a number.
+Brier-vs-market column (Step 5) reuses the gate report's identical-sample
+math — rows without estimates leave the sample and render an explicit "—",
+never a fabricated number.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -113,15 +115,16 @@ def build_report() -> list[dict]:
     ])
 
 
-def test_markdown_has_all_spec_columns_and_placeholder():
+def test_markdown_has_all_spec_columns_and_brier_column():
     md = render_markdown(build_report(), total_rows=3, window_days=7, generated_at=_NOW)
     for header in ("strategy", "n", "net P&L (USDC)", "mean net edge (¢)",
                    "rolling Sharpe", "CUSUM", "Brier-vs-market"):
         assert header in md
     assert "recalibration" in md and "velocity" in md
-    # The placeholder is explicit and explained — never a fake number.
+    # Rows without estimates leave the Brier sample — the dash renders
+    # explicitly and the note explains it (never a fake number).
     assert _BRIER_PLACEHOLDER in md
-    assert "placeholder" in md and "Step 5" in md
+    assert "no sample" in md and "Step 5" in md
 
 
 def test_markdown_empty_window_is_explicit():
@@ -135,7 +138,7 @@ def test_telegram_summary_format_and_content():
     assert summary.startswith("[ZERO-ALPHA] INFO | STRATEGY_DASHBOARD")
     assert "Time:" in summary
     for fragment in ("recalibration:", "n=2", "pnl=", "edge=", "sharpe=",
-                     "cusum=", "brier_mkt=—(Step5)"):
+                     "cusum=", "brier_agent/mkt=—(no sample)"):
         assert fragment in summary
 
 
@@ -143,7 +146,30 @@ def test_telegram_summary_empty_window():
     summary = render_telegram_summary([], total_rows=0, window_days=7)
     assert summary.startswith("[ZERO-ALPHA] INFO | STRATEGY_DASHBOARD")
     assert "No closed trades in window" in summary
-    assert "Step 5" in summary
+
+
+def test_brier_column_computed_when_sample_exists():
+    """Step 5: with p_model/market_price/outcome present, the dashboard renders
+    the same agent-vs-market Brier math the gate report uses — not a dash."""
+    rows = [
+        make_row("recalibration", 0.14, 5.0, minutes=300, thesis_id="M1:recalibration:a"),
+        make_row("recalibration", 0.10, -2.0, minutes=200, thesis_id="M1:recalibration:b"),
+    ]
+    for row in rows:
+        row.update({
+            "direction": "YES", "outcome": "win",
+            "p_model_at_entry": 0.70, "market_price_at_entry": 0.50,
+        })
+    report = aggregate_strategies(rows)
+    rec = report[0]
+    assert rec["brier_sample_n"] == 2
+    assert rec["agent_brier"] == pytest.approx((0.70 - 1.0) ** 2)
+    assert rec["market_brier"] == pytest.approx((0.50 - 1.0) ** 2)
+    assert rec["agent_brier"] < rec["market_brier"]
+    md = render_markdown(report, total_rows=2, window_days=7, generated_at=_NOW)
+    assert "0.0900 vs 0.2500 (n=2)" in md
+    tg = render_telegram_summary(report, total_rows=2, window_days=7)
+    assert "brier_agent/mkt=0.090 vs 0.250" in tg
 
 
 def test_cusum_faded_visible_in_renders():
