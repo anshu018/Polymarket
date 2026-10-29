@@ -27,6 +27,7 @@ Conventions (inherited from strategies/estimator.py):
 """
 
 from dataclasses import dataclass
+from typing import Optional
 
 import config
 
@@ -77,6 +78,7 @@ class FeeConfig:
     maker_rate: float
     maker_haircut: float
     slippage_multiple: float
+    empirical_slippage_multiple: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +131,7 @@ def fee_config_for(category: str) -> FeeConfig:
         maker_rate=config.MAKER_FEE_RATE,
         maker_haircut=config.MAKER_FILL_HAIRCUT,
         slippage_multiple=config.SLIPPAGE_SPREAD_MULTIPLE,
+        empirical_slippage_multiple=config.SLIPPAGE_EMPIRICAL_MULTIPLE,
     )
 
 
@@ -202,13 +205,18 @@ def expected_slippage_units(
     fee_cfg: FeeConfig,
 ) -> float:
     """
-    Expected slippage in probability units — conservative default until Step 5's
+    Expected slippage in probability units — conservative default until the
     empirical decision-vs-fill curve replaces it.
 
     Rules (fail-closed):
         - Empty/unknown book depth (<= 0)          → 1.0 (100¢: treat as unfillable).
         - Requested size exceeds visible depth     → 1.0 (the book cannot fill it).
         - Otherwise                                → full_spread × slippage_multiple.
+
+    Step 5 feedback point: when config.SLIPPAGE_EMPIRICAL_MULTIPLE is set (a
+    human decision off the gate report's measured decision-vs-fill data), it
+    replaces the conservative default multiple. Until then the default stands —
+    the curve is never auto-fitted at runtime.
 
     Args:
         size_usd:        Intended order size in USDC (0 = size unknown, skip the
@@ -224,7 +232,12 @@ def expected_slippage_units(
         return 1.0
     if size_usd > book_depth_usd:
         return 1.0
-    return full_spread * fee_cfg.slippage_multiple
+    multiple = (
+        fee_cfg.empirical_slippage_multiple
+        if fee_cfg.empirical_slippage_multiple is not None
+        else fee_cfg.slippage_multiple
+    )
+    return full_spread * multiple
 
 
 def maker_fill_haircut_units(fee_cfg: FeeConfig) -> float:

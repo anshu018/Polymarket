@@ -106,6 +106,19 @@ class TestSpreadSlippageHaircut:
     def test_maker_haircut_from_config(self):
         assert maker_fill_haircut_units(POLITICS) == pytest.approx(0.01)
 
+    def test_slippage_empirical_multiple_overrides_default(self):
+        """Step 5 feedback point: a measured multiple replaces the conservative 1.2."""
+        empirical = FeeConfig(
+            taker_rate=0.04, maker_rate=0.0, maker_haircut=0.01,
+            slippage_multiple=1.2, empirical_slippage_multiple=0.8,
+        )
+        assert expected_slippage_units(0.0, 5000.0, 0.04, empirical) == pytest.approx(0.04 * 0.8)
+
+    def test_slippage_empirical_none_keeps_conservative_default(self):
+        """None (the shipped default) must keep the pre-Step-5 behavior bit-for-bit."""
+        assert POLITICS.empirical_slippage_multiple is None
+        assert expected_slippage_units(0.0, 5000.0, 0.04, POLITICS) == pytest.approx(0.048)
+
 
 # ── 3. Net edge math and sign correctness ─────────────────────────────────────
 

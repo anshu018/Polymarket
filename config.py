@@ -240,6 +240,35 @@ SHRINKAGE_PRIOR_STRENGTH = 20           # pseudo-observations K in w = n/(n+K);
                                         # n=20 → w=0.5, n=100 → w≈0.83. Higher K
                                         # = more humility for thin data.
 
+# ── PAPER FILLS & HONEST GATE (List A.md Step 5 — A5) ────────────────────────
+# Paper mode previously assumed idealized fills at the decision price. Step 5
+# makes every paper fill book-aware (risk/fill_simulator.py): takers cross the
+# spread and are depth-checked, makers rest at the touch and fill only when the
+# book trades through the level inside the wait window. decision_price vs
+# fill_price is logged per trade — the empirical slippage dataset.
+SLIPPAGE_EMPIRICAL_MULTIPLE = None      # float | None. When None (default), the
+                                        # conservative SLIPPAGE_SPREAD_MULTIPLE
+                                        # still governs expected slippage. Once the
+                                        # gate report's measured mean
+                                        # (slippage / full_spread) is stable, set
+                                        # this to that number to replace the
+                                        # default — a human decision off printed
+                                        # data, never automatic.
+PAPER_MAKER_CHECK_SECONDS = 5.0         # how often the paper maker-fill monitor
+                                        # re-reads the book for resting orders
+GATE_MIN_RESOLVED_SAMPLES = 200         # honest gate: minimum resolved samples
+                                        # (composite: backtest + paper) before the
+                                        # gate can PASS (List A.md §5 Step 5c)
+GATE_BOOTSTRAP_RESAMPLES = 10000        # bootstrap resamples for the 95% CIs in
+                                        # the gate report (offline script only —
+                                        # runtime stays pure)
+GATE_BOOTSTRAP_SEED = 20261029          # fixed seed so the report's CIs are
+                                        # deterministic and reproducible
+MAKER_FALLBACK_MIN_NET_EDGE_CENTS = 0.0 # a maker order that timed out falls back
+                                        # to taker only if the CURRENT-book taker
+                                        # net edge is strictly above this
+                                        # (Step 1's "still net-positive" rule)
+
 # ── STRATEGY 5: COPY EDGE (CopyTrade) ────────────────────────────────────────
 # PRD source: CopyTrade.md §7.1, §9.2
 KELLY_FRACTION_COPY = 0.10              # 10% fractional Kelly for Class B sizing
