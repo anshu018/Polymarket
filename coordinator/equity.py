@@ -276,6 +276,15 @@ async def _upsert_daily_anchor(client: Any, today: date, current_equity: float) 
 
     if rows:
         starting = _to_float(rows[0].get("starting_balance_usdc"), 0.0)
+        if starting <= 0.0:
+            # A NULL/zero anchor is corrupted equity truth: feeding it to the
+            # breaker would either divide by zero or report infinite drawdown.
+            # Fail closed — the cache is not refreshed and entries block until
+            # the row is fixed.
+            raise RuntimeError(
+                f"[EQUITY] daily_performance row for {today.isoformat()} has a "
+                f"non-positive starting anchor ({starting}) — refusing to derive balances"
+            )
         async with asyncio.timeout(config.SUPABASE_TIMEOUT_SECONDS):
             client.table("daily_performance").update({
                 "ending_balance_usdc": current_equity,
@@ -325,6 +334,11 @@ async def _earliest_anchor(
 
     row_date = str(rows[0].get("date"))[:10]
     starting = _to_float(rows[0].get("starting_balance_usdc"), 0.0)
+    if starting <= 0.0:
+        raise RuntimeError(
+            f"[EQUITY] {period} anchor row {row_date} has a non-positive "
+            f"starting balance ({starting}) — refusing to derive balances"
+        )
     if row_date != period_start.isoformat():
         _dispatch_equity_alert(
             "EQUITY_ANCHOR_BOOTSTRAP",
@@ -372,6 +386,13 @@ async def take_equity_snapshot_once(now: Optional[datetime] = None) -> bool:
     the cache is left untouched so the entry gate ages toward fail-closed."""
     checked_at = now or datetime.now(timezone.utc)
     marked = await mark_to_market_value(checked_at)
+    if marked.value <= 0.0:
+        # A portfolio at or below zero cannot anchor a drawdown calculation
+        # (check_drawdown divides by the starting balance) and there is nothing
+        # left to trade — fail closed: the cache stays cold, entries block.
+        raise RuntimeError(
+            f"[EQUITY] Marked equity {marked.value:.2f} <= 0 — refusing to anchor"
+        )
     period_balances = await get_period_balances(checked_at, marked.value)
 
     global _snapshot_cache

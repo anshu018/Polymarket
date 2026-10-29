@@ -12,7 +12,7 @@ import asyncio
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Generator, Any, Optional
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 
 # Ensure project root is on the path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,6 +23,7 @@ from llm.news_analyst import NewsAnalystOutput
 from llm.trade_decision import TradeDecisionOutput
 from llm.coordinator import CoordinatorOutput
 from coordinator.pipeline import run_pipeline
+from coordinator import equity
 from strategies.estimator import EstimateResult
 from risk.cost_model import BookSnapshot
 import data.market_discovery
@@ -56,6 +57,7 @@ class MockTableBuilder:
         self.table_name = table_name
         self.filters = []
         self._is_null_filters = []
+        self._gte_filters = []  # List-B Step 1: equity weekly/monthly anchor reads use .gte on DATE
         self._order = None
         self._is_delete = False
 
@@ -64,6 +66,10 @@ class MockTableBuilder:
 
     def eq(self, col: str, val: Any) -> "MockTableBuilder":
         self.filters.append((col, val))
+        return self
+
+    def gte(self, col: str, val: Any) -> "MockTableBuilder":
+        self._gte_filters.append((col, str(val)))
         return self
 
     def is_(self, col: str, val: Any) -> "MockTableBuilder":
@@ -102,6 +108,10 @@ class MockTableBuilder:
             for col, val in self._is_null_filters:
                 row_val = row.get(col)
                 if val == "null" and row_val is not None:
+                    ok = False
+            for col, val in self._gte_filters:
+                # ISO date strings compare correctly as strings.
+                if not str(row.get(col)) >= val:
                     ok = False
             if ok:
                 matched.append(row.copy())
@@ -203,6 +213,7 @@ def mock_supabase_client(db_state: dict[str, list[dict[str, Any]]]) -> Generator
         return client
 
     with patch("coordinator.pipeline.get_client", fake_get_client), \
+         patch("coordinator.equity.get_client", fake_get_client), \
          patch("llm.contract_parser.get_client", fake_get_client), \
          patch("llm.trade_decision.get_client", fake_get_client), \
          patch("strategies.calibration.get_client", fake_get_client), \
@@ -736,6 +747,70 @@ async def test_6_7_circuit_breaker_halt(
     assert res is not None
     assert res["status"] == "blocked"
     assert res["reason"] == "circuit_breaker"
+
+
+@pytest.mark.anyio
+async def test_6_7b_drawdown_halt_from_real_equity_anchors(
+    mock_supabase_client: MockSupabaseClient,
+    mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
+) -> None:
+    """List-B.md Step 1 DoD centerpiece: an injected equity drop flows through
+    the mark-to-market snapshot into the REAL period anchors, and
+    check_drawdown fires HALT with a non-zero percentage — no explicit
+    starting/current balances are passed (the production call shape,
+    data/pipeline.py:77).
+
+    Call-order note (Discipline rule 9): run_pipeline's equity gate reads ONLY
+    the in-process cache — it adds ZERO Supabase reads, so every existing
+    Call N ordinal comment in this file stays valid. The DB reads below happen
+    in take_equity_snapshot_once (test setup), not inside run_pipeline.
+    """
+    equity._snapshot_cache = None  # never inherit a cache from another test
+    today = datetime.now(timezone.utc).date().isoformat()
+    # Day anchored at 10000 (the morning snapshot), then the portfolio drops:
+    # a 2000 USDC YES position filled at 0.50 (4000 shares) now marked at 0.25.
+    db_state = mock_supabase_client.db_state
+    db_state["daily_performance"].append({
+        "date": today,
+        "starting_balance_usdc": 10000.0,
+        "ending_balance_usdc": 10000.0,
+        "daily_pnl_usdc": 0.0,
+    })
+    db_state["open_positions"].append({
+        "market_id": "P1", "direction": "YES", "entry_price": 0.50,
+        "position_size_usdc": 2000.0, "fill_price": 0.50,
+        "market_price_at_entry": 0.50, "order_type": "taker",
+    })
+
+    async def fake_equity_price(token_id: str) -> float:
+        return 0.25
+
+    with patch("coordinator.equity.get_market_price", fake_equity_price), \
+         patch("coordinator.equity.alert_equity_warning", AsyncMock()), \
+         patch("coordinator.pipeline.alert_circuit_breaker", AsyncMock()) as spy_alert:
+        # equity = 10000 cash-anchor − 2000 committed + 4000×0.25 marked = 9000
+        ok = await equity.take_equity_snapshot_once()
+        assert ok is True
+
+        res = await run_pipeline(
+            headline="Donald Trump impeachment",
+            source="AP News",
+            market_id="P1",
+            market_question="Question?",
+            resolution_criteria="Resolves YES.",
+            market_price=0.55,
+        )
+
+    assert res is not None
+    assert res["status"] == "blocked"
+    assert res["reason"] == "circuit_breaker"
+    # The alert must carry the REAL measured drawdown (10%), not a hardcoded 0.
+    spy_alert.assert_called_once()
+    kwargs = spy_alert.call_args.kwargs
+    assert kwargs["breaker_type"] == "daily"
+    assert kwargs["current_pct"] == pytest.approx(0.10)
+    equity._snapshot_cache = None  # leave no cache behind for other tests
 
 
 @pytest.mark.anyio

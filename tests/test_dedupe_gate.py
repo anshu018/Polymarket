@@ -818,6 +818,11 @@ async def test_drop_counters_increment_accurately(mock_db, estimator_has_data):
         await run_pipeline(
             headline="News in opposite direction", source="AP", market_id=mkt,
             market_price=0.50, portfolio_value=10000.0,
+            # List-B Step 1 (B2): run_pipeline without explicit balances now
+            # consults the fail-closed equity snapshot gate. These tests exercise
+            # the tranche gates, so inject balances explicitly (intent preserved).
+            starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+            current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
         )
 
     assert get_drop_counters()["risk_gate:opposite_direction"] == 1
@@ -855,6 +860,11 @@ async def test_drop_counters_increment_accurately(mock_db, estimator_has_data):
         await run_pipeline(
             headline="Repeat news under threshold", source="AP", market_id=mkt,
             market_price=0.50, portfolio_value=10000.0,
+            # List-B Step 1 (B2): run_pipeline without explicit balances now
+            # consults the fail-closed equity snapshot gate. These tests exercise
+            # the tranche gates, so inject balances explicitly (intent preserved).
+            starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+            current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
         )
 
     assert get_drop_counters()["risk_gate:low_confidence_add"] == 1
@@ -884,6 +894,11 @@ async def test_drop_counters_increment_accurately(mock_db, estimator_has_data):
         await run_pipeline(
             headline="Third tranche attempt", source="AP", market_id=mkt,
             market_price=0.50, portfolio_value=10000.0,
+            # List-B Step 1 (B2): run_pipeline without explicit balances now
+            # consults the fail-closed equity snapshot gate. These tests exercise
+            # the tranche gates, so inject balances explicitly (intent preserved).
+            starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+            current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
         )
 
     assert get_drop_counters()["risk_gate:max_market_tranches"] >= 1

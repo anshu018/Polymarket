@@ -38,6 +38,7 @@ from monitoring.telegram_alerts import (
     alert_reconciliation_failure,
 )
 from coordinator.market_state import load_market_state, get_market_lock
+from coordinator import equity
 
 logger = logging.getLogger(__name__)
 
@@ -710,15 +711,25 @@ async def run_pipeline(
     now_str = datetime.now(timezone.utc).isoformat()
     logger.info(f"[{now_str}] [PIPELINE] Received new signal: '{headline}' from {source}")
 
-    # Fetch live balances (zero DB calls in paper trading)
-    if portfolio_value is None:
+    # Part B Step 1 (B2): real period-start anchors from the equity snapshot
+    # service (daily_performance). Fail-closed: stale or unavailable equity
+    # blocks the entry — the old same-snapshot defaults fed check_drawdown the
+    # same number twice, so drawdown was permanently 0 and the breakers were
+    # decorative (E-B2). The authoritative drop counters for this gate live in
+    # coordinator.equity.get_drop_counters(); callers passing explicit
+    # starting_balances AND current_balances (tests) inject equity directly.
+    if starting_balances is None or current_balances is None:
+        gate = equity.get_entry_gate()
+        if gate is None:
+            reason = equity.get_last_gate_failure()
+            logger.warning(f"[PIPELINE][DROP:{reason}] market_id={market_id}")
+            return {"status": "blocked", "reason": "equity_gate"}
+        starting_balances = gate.starting_balances
+        current_balances = gate.current_balances
+        if portfolio_value is None:
+            portfolio_value = gate.current_equity
+    elif portfolio_value is None:
         portfolio_value = await get_live_portfolio_value()
-
-    # Default balance values if not provided
-    if starting_balances is None:
-        starting_balances = {"daily": portfolio_value, "weekly": portfolio_value, "monthly": portfolio_value}
-    if current_balances is None:
-        current_balances = {"daily": portfolio_value, "weekly": portfolio_value, "monthly": portfolio_value}
 
     # --- Market Discovery FIRST ---
     # Attempt to match headline entities against Gamma cached markets
