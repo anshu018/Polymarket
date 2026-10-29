@@ -130,6 +130,14 @@ async def main():
         asyncio.create_task(run_paper_fill_monitor(), name="paper_fill_monitor")
         logger.info("[PAPER_FILLS] Paper maker-fill monitor started (supervisor task).")
 
+        # Start the Step 1 equity snapshot supervisor (List-B.md B2). Marks the
+        # portfolio to market and upserts daily_performance anchors every
+        # EQUITY_SNAPSHOT_INTERVAL_SECONDS; entry paths read only the cached
+        # result and fail closed when it is stale or absent.
+        from coordinator.equity import run_equity_snapshot_supervisor
+        asyncio.create_task(run_equity_snapshot_supervisor(), name="equity_snapshot")
+        logger.info("[EQUITY] Equity snapshot supervisor started (supervisor task).")
+
         # Validate News Analyst models before starting signal processing
         from llm.news_analyst import validate_models
         logger.info("Validating news analyst models...")
