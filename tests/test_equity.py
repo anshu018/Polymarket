@@ -475,6 +475,28 @@ async def test_period_first_day_bootstrap_does_not_warn(equity_db) -> None:
     assert not [a for a in alerts if a[0] == "EQUITY_ANCHOR_BOOTSTRAP"]
 
 
+@pytest.mark.anyio
+async def test_orphaned_mock_anchor_row_is_bootstrapped_with_warning(equity_db) -> None:
+    """A date-only row (migrations smoke test left behind by a killed deploy)
+    has NO drawdown information: bootstrap it to current equity WITH a WARNING
+    (D-B03: no silent bootstrap) — never rewrite a VALID anchor (see
+    test_second_snapshot_updates_ending_never_starting)."""
+    state, _, alerts = equity_db
+    state["daily_performance"].append({
+        "date": WEDNESDAY, "starting_balance_usdc": None,
+        "ending_balance_usdc": None, "daily_pnl_usdc": None,
+    })
+
+    balances = await equity.get_period_balances(NOW, 9800.0)
+
+    assert balances["daily"] == (pytest.approx(9800.0), pytest.approx(9800.0))
+    row = state["daily_performance"][0]
+    assert row["starting_balance_usdc"] == pytest.approx(9800.0)
+    assert row["ending_balance_usdc"] == pytest.approx(9800.0)
+    await _drain_tasks()
+    assert any(a[0] == "EQUITY_ANCHOR_BOOTSTRAP" for a in alerts)
+
+
 # ── Entry gate: staleness / unavailability (fail-closed) ─────────────────────
 
 @pytest.mark.anyio

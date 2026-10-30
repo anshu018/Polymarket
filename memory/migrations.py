@@ -356,7 +356,10 @@ async def test_table(client, table_name: str):
     elif table_name == "closed_trades":
         mock_data = {"market_id": "test_mkt", "direction": "YES"}
     elif table_name == "daily_performance":
-        mock_data = {"date": datetime.date.today().isoformat()}
+        # Fixed far-past date, NEVER today: a date-only mock row left behind by
+        # a crashed deploy must not collide with the equity service's real
+        # anchor for the current day (List-B Step 1 found this exact collision).
+        mock_data = {"date": "1970-01-01"}
     elif table_name == "agent_memory":
         mock_data = {"category": "politics", "lesson": "test_lesson", "trigger_condition": {"test": True}, "severity": "warning"}
     elif table_name == "resolution_keyword_cache":
@@ -375,6 +378,11 @@ async def test_table(client, table_name: str):
         mock_data = {}
 
     try:
+        # daily_performance's `date` is UNIQUE: remove any leftover mock row so
+        # repeated startups stay idempotent even if a previous run died between
+        # insert and cleanup.
+        if table_name == "daily_performance":
+            client.table(table_name).delete().eq("date", "1970-01-01").execute()
         async with asyncio.timeout(config.SUPABASE_TIMEOUT_SECONDS):
             res = client.table(table_name).insert(mock_data).execute()
         

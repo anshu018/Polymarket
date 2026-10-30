@@ -258,12 +258,15 @@ async def mark_to_market_value(now: Optional[datetime] = None) -> MarkedEquity:
 
 # ── Period anchors (daily_performance) ───────────────────────────────────────
 
-async def _upsert_daily_anchor(client: Any, today: date, current_equity: float) -> float:
+async def _upsert_daily_anchor(
+    client: Any, today: date, current_equity: float, now: datetime
+) -> float:
     """Create or extend today's anchor row; return the day's starting balance.
 
     Missing row → bootstrap (anchor = current equity). Existing row → only the
     ending balance and daily P&L advance; the starting anchor NEVER moves
-    (a moving anchor would mask drawdown — the bug this step kills)."""
+    (a moving anchor would mask drawdown — the bug this step kills). An
+    existing row with an unusable anchor is bootstrapped with a WARNING."""
     async with asyncio.timeout(config.SUPABASE_TIMEOUT_SECONDS):
         res = (
             client.table("daily_performance")
@@ -276,20 +279,38 @@ async def _upsert_daily_anchor(client: Any, today: date, current_equity: float) 
 
     if rows:
         starting = _to_float(rows[0].get("starting_balance_usdc"), 0.0)
+        update_payload = {
+            "ending_balance_usdc": current_equity,
+            "daily_pnl_usdc": current_equity - starting,
+        }
         if starting <= 0.0:
-            # A NULL/zero anchor is corrupted equity truth: feeding it to the
-            # breaker would either divide by zero or report infinite drawdown.
-            # Fail closed — the cache is not refreshed and entries block until
-            # the row is fixed.
-            raise RuntimeError(
-                f"[EQUITY] daily_performance row for {today.isoformat()} has a "
-                f"non-positive starting anchor ({starting}) — refusing to derive balances"
+            # The row exists but carries no anchor (NULL/non-positive): it has
+            # ZERO drawdown information — usually a date-only row left behind by
+            # the migrations smoke test of a killed deploy. Bootstrapping it to
+            # current equity masks nothing (there was nothing to mask); the
+            # WARNING keeps it visible (D-B03: no silent bootstrap). A VALID
+            # anchor is never rewritten — that would be the real masking bug.
+            starting = current_equity
+            update_payload["starting_balance_usdc"] = starting
+            update_payload["daily_pnl_usdc"] = 0.0
+            logger.warning(
+                "[EQUITY] daily_performance row for %s has no usable anchor (%s) — "
+                "bootstrapping to current equity",
+                today.isoformat(), rows[0].get("starting_balance_usdc"),
+            )
+            _dispatch_equity_alert(
+                "EQUITY_ANCHOR_BOOTSTRAP",
+                f"Today's anchor row ({today.isoformat()}) had no usable starting "
+                "balance (orphaned mock row or data gap)",
+                f"Anchor bootstrapped to current equity {current_equity:.2f}",
+                "Drawdown for today is measured from this bootstrap; treat today's "
+                "breaker as a lower bound.",
+                now,
             )
         async with asyncio.timeout(config.SUPABASE_TIMEOUT_SECONDS):
-            client.table("daily_performance").update({
-                "ending_balance_usdc": current_equity,
-                "daily_pnl_usdc": current_equity - starting,
-            }).eq("date", today.isoformat()).execute()
+            client.table("daily_performance").update(update_payload).eq(
+                "date", today.isoformat()
+            ).execute()
         return starting
 
     async with asyncio.timeout(config.SUPABASE_TIMEOUT_SECONDS):
@@ -365,7 +386,7 @@ async def get_period_balances(
     month_start = today.replace(day=1)
 
     client = await get_client()
-    daily_start = await _upsert_daily_anchor(client, today, current_equity)
+    daily_start = await _upsert_daily_anchor(client, today, current_equity, now)
     weekly_start = await _earliest_anchor(client, week_start, "weekly", now)
     monthly_start = await _earliest_anchor(client, month_start, "monthly", now)
 
