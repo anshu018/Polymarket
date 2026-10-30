@@ -388,7 +388,15 @@ async def test_table(client, table_name: str):
         
         # Test SELECT on the new row
         if getattr(res, "data", None) and len(res.data) > 0:
-            inserted_id = res.data[0].get('id') or res.data[0].get('date') or uid
+            # daily_performance is keyed by `date` — grabbing the auto `id`
+            # first made the SELECT below miss forever, so the cleanup DELETE
+            # never ran and every startup left its mock row behind (the exact
+            # orphan that blocked the equity service on 2026-10-30).
+            inserted_id = (
+                res.data[0].get("date") or res.data[0].get("id") or uid
+                if table_name == "daily_performance"
+                else res.data[0].get("id") or uid
+            )
             pk_col = 'date' if table_name == 'daily_performance' else 'id'
             
             async with asyncio.timeout(config.SUPABASE_TIMEOUT_SECONDS):
