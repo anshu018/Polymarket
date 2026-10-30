@@ -279,8 +279,9 @@ async def test_price_fetch_failure_falls_back_to_entry_and_counts(equity_db) -> 
 
 
 @pytest.mark.anyio
-async def test_unusable_row_valued_at_zero_and_counted(equity_db) -> None:
-    """A row with no usable price/direction contributes 0 and is counted."""
+async def test_unusable_row_valued_at_cost_and_counted(equity_db) -> None:
+    """A row with no usable price/direction is valued at its cost basis and
+    counted — equity-neutral (cash side already committed the same cost)."""
     state, _, _ = equity_db
     state["open_positions"].append(
         {"market_id": "bad", "direction": "SIDEWAYS", "entry_price": 0.0,
@@ -290,9 +291,9 @@ async def test_unusable_row_valued_at_zero_and_counted(equity_db) -> None:
 
     marked = await equity.mark_to_market_value(NOW)
 
-    # The unusable row contributed 0 to marked value, but its cost was
-    # committed (taker row) — equity is understated, the conservative direction.
-    assert marked.value == pytest.approx(9900.0)
+    # Cost-fallback keeps the row equity-neutral: its $100 cost left the cash
+    # side, so the position side carries the same $100 until priced.
+    assert marked.value == pytest.approx(10000.0)
     assert marked.fallback_positions == 1
 
 
@@ -348,6 +349,23 @@ async def test_live_mode_uses_clob_collateral(monkeypatch: pytest.MonkeyPatch) -
 
     assert marked.cash == pytest.approx(5.0)
     assert marked.value == pytest.approx(5.0 + 200.0 * 0.50)
+
+
+@pytest.mark.anyio
+async def test_no_side_fetch_failure_never_fabricates_payout(equity_db) -> None:
+    """NO-side fallback to 'entry price' would value at shares × (1 − entry) —
+    a near-max fabricated payout (entry 0.019 → 0.981). The fallback must be
+    the COST basis for both directions."""
+    state, price_holder, _ = equity_db
+    state["open_positions"].append(
+        make_position(direction="NO", entry=0.019, size=100.0, fill=0.019)
+    )
+    price_holder["fail"] = True
+
+    marked = await equity.mark_to_market_value(NOW)
+
+    assert marked.marked_positions_value == pytest.approx(100.0)  # cost, not 100/0.019 × 0.981
+    assert marked.fallback_positions == 1
 
 
 # ── Daily anchors & period derivation ────────────────────────────────────────

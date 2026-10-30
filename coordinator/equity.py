@@ -194,11 +194,16 @@ async def _mark_position_row(row: dict[str, Any], fetch_live: bool) -> tuple[flo
     entry = _entry_price(row)
     size = _to_float(row.get("position_size_usdc"), 0.0)
     direction = str(row.get("direction") or "").upper()
-    if entry is None or entry <= 0.0 or size <= 0.0 or direction not in ("YES", "NO"):
+    if entry is None or entry <= 0.0 or direction not in ("YES", "NO"):
+        # Upstream write bug: no usable price or direction. The cash side
+        # already committed `size`, so the position side carries the same cost
+        # until the row can be priced — never fabricate, never double-count.
         logger.error(
-            "[EQUITY] Unusable position row (market=%s direction=%s entry=%s size=%s) — valued at 0 (counted as fallback)",
+            "[EQUITY] Unusable position row (market=%s direction=%s entry=%s size=%s) — valued at cost basis (counted as fallback)",
             str(row.get("market_id"))[:16], row.get("direction"), entry, size,
         )
+        return size, True
+    if size <= 0.0:
         return 0.0, True
 
     shares = size / entry
@@ -214,9 +219,16 @@ async def _mark_position_row(row: dict[str, Any], fetch_live: bool) -> tuple[flo
                 "[EQUITY] Price fetch failed for %s — valuing at entry %.4f: %s",
                 market_id[:16], entry, e,
             )
+    if used_fallback:
+        # Never fabricate gains: an unfetchable price values the position at
+        # its COST basis. For YES this is exactly shares × entry_price; for NO
+        # the mirrored entry fallback (shares × (1 − entry)) would fabricate a
+        # near-max payout (entry 0.019 → valued at 0.981), so cost is the one
+        # honest neutral value for both directions.
+        return size, True
     if direction == "NO":
-        return shares * (1.0 - price), used_fallback
-    return shares * price, used_fallback
+        return shares * (1.0 - price), False
+    return shares * price, False
 
 
 async def mark_to_market_value(now: Optional[datetime] = None) -> MarkedEquity:
