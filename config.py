@@ -142,6 +142,27 @@ HEALTH_BRIER_MIN_RESOLVED = 10           # fewer resolved observations → neutr
 HEALTH_SLIPPAGE_SAMPLE_LIMIT = 50        # max rows fetched per table for the slippage
                                          # component (query safety valve; NULL fills skipped)
 
+# ── LOCKS, LEASES & SINGLETON GUARD (List-B.md Step 3 — B4) ───────────────────
+# coordinator/lease.py. The process-local asyncio per-market locks stay (they
+# guard THIS process); the DB lease adds the cross-process guard for
+# overlapping deploys / stray containers (D-B02, D-B13). Lease failure is
+# fail-closed for entries: an unguardable entry never proceeds.
+LOCK_ACQUIRE_TIMEOUT_SECONDS = 10        # bound on waiting for a per-market
+                                         # asyncio.Lock; timeout = fail-closed
+                                         # drop (lock:timeout) — never queue-jump
+LEASE_TTL_SECONDS = 45                   # per-market lease lifetime; long enough for
+                                         # the multi-call critical section (~10-20s
+                                         # worst case), short enough that a crashed
+                                         # holder blocks a market for seconds, not minutes
+SINGLETON_LEASE_TTL_SECONDS = 90         # __singleton__ lease lifetime; renewed every
+                                         # LEASE_RENEW_INTERVAL_SECONDS, so two missed
+                                         # renewals are tolerated before expiry
+SINGLETON_CLAIM_MAX_WAIT_SECONDS = 600   # a second instance waits this long for the
+                                         # singleton lease before alert_system_halt + exit(1)
+                                         # (Railway restarts it; retry begins anew)
+LEASE_RENEW_INTERVAL_SECONDS = 30        # the singleton renew task ticks at this interval
+                                         # (the spec's "every 30s" — named home)
+
 RESOLUTION_CACHE_TTL_HOURS = 24
 RSS_POLL_INTERVAL_SECONDS = 10
 # Fallback time-to-resolution (hours) for the Trade Decision prompt when a market's
