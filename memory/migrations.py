@@ -294,6 +294,41 @@ SQL_MIGRATIONS = [
         """
     },
     {
+        # List-B.md Step 3 (B4): cross-process market lease (D-B02, D-B13).
+        # PostgREST-compatible mutex: one row per market held by an instance
+        # identity (owner) until lease_until. claim_market_lease is the ONLY
+        # write path — one atomic statement (row-locked conditional upsert);
+        # the RPC returns true iff the claim succeeded (fresh insert, expired-
+        # lease steal, or same-owner re-claim = renewal). Canonical DDL lives
+        # in scratch/migration_market_leases.sql — keep the two in sync.
+        "table": "market_leases",
+        "sql": """
+        CREATE TABLE IF NOT EXISTS market_leases (
+            market_id   TEXT PRIMARY KEY,
+            owner       TEXT NOT NULL,
+            lease_until TIMESTAMPTZ NOT NULL
+        );
+        CREATE OR REPLACE FUNCTION claim_market_lease(
+            p_market_id   TEXT,
+            p_owner       TEXT,
+            p_ttl_seconds INTEGER
+        ) RETURNS BOOLEAN
+        LANGUAGE SQL
+        SET search_path TO 'public'
+        AS $func$
+            INSERT INTO market_leases (market_id, owner, lease_until)
+            VALUES (p_market_id, p_owner, now() + make_interval(secs => p_ttl_seconds))
+            ON CONFLICT (market_id) DO UPDATE
+                SET owner       = EXCLUDED.owner,
+                    lease_until = EXCLUDED.lease_until
+                WHERE market_leases.lease_until < now()
+                   OR market_leases.owner = EXCLUDED.owner
+            RETURNING true;
+        $func$;
+        GRANT EXECUTE ON FUNCTION claim_market_lease(TEXT, TEXT, INTEGER) TO anon;
+        """
+    },
+    {
         # Strategy 5: Copy Edge -- per-wallet trust score aggregation
         # Recomputed every time a copy trade resolves.
         # trust_score = Bayesian-damped win rate + PnL quality bonus.
@@ -374,6 +409,16 @@ async def test_table(client, table_name: str):
             "headline_hash": "test_hash",
             "t0": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
+    elif table_name == "market_leases":
+        # List-B.md Step 3 (B4): a short-lived row; the unique market_id keeps
+        # repeated startups idempotent and the DELETE below cleans it up.
+        mock_data = {
+            "market_id": f"test_mkt_unique_{uid}",
+            "owner": "migration_smoke_test",
+            "lease_until": (
+                datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=30)
+            ).isoformat(),
+        }
     else:
         mock_data = {}
 
@@ -392,12 +437,15 @@ async def test_table(client, table_name: str):
             # first made the SELECT below miss forever, so the cleanup DELETE
             # never ran and every startup left its mock row behind (the exact
             # orphan that blocked the equity service on 2026-10-30).
-            inserted_id = (
-                res.data[0].get("date") or res.data[0].get("id") or uid
-                if table_name == "daily_performance"
-                else res.data[0].get("id") or uid
+            # PK varies per table: daily_performance is keyed by `date`,
+            # market_leases by `market_id` (no id column); everything else by
+            # the auto `id`.
+            pk_col = (
+                'date' if table_name == 'daily_performance'
+                else 'market_id' if table_name == 'market_leases'
+                else 'id'
             )
-            pk_col = 'date' if table_name == 'daily_performance' else 'id'
+            inserted_id = res.data[0].get(pk_col) or uid
             
             async with asyncio.timeout(config.SUPABASE_TIMEOUT_SECONDS):
                 sel = client.table(table_name).select("*").eq(pk_col, inserted_id).execute()
