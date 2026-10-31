@@ -138,6 +138,14 @@ async def main():
         asyncio.create_task(run_equity_snapshot_supervisor(), name="equity_snapshot")
         logger.info("[EQUITY] Equity snapshot supervisor started (supervisor task).")
 
+        # Start the Step 2 health evaluation supervisor (List-B.md B1). Computes
+        # the six component scores, persists daily_performance.health_score,
+        # caches the enforcement mode, and fires mode-transition / probation /
+        # Brier-crossing alerts every HEALTH_CHECK_INTERVAL_SECONDS.
+        from monitoring.health_score import run_health_check_supervisor
+        asyncio.create_task(run_health_check_supervisor(), name="health_check")
+        logger.info("[HEALTH] Health check supervisor started (supervisor task).")
+
         # Validate News Analyst models before starting signal processing
         from llm.news_analyst import validate_models
         logger.info("Validating news analyst models...")

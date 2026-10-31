@@ -114,6 +114,34 @@ EQUITY_MAX_MARKED_POSITIONS = 50         # cap on live book fetches per snapshot
 MIN_CASH_RESERVE_PCT = 0.20
 HEALTH_SCORE_DEFENSIVE_THRESHOLD = 65
 HEALTH_SCORE_HALT_THRESHOLD = 40
+
+# ── HEALTH SCORE (List-B.md Step 2 — B1) ──────────────────────────────────────
+# monitoring/health_score.py computes the six component scores and persists the
+# composite into daily_performance.health_score; the entry paths enforce the
+# cached mode (FULL_HALT blocks new entries on both paths — NEVER exits,
+# D-B04; DEFENSIVE_MODE halves entry sizes). Producers fail soft to a neutral
+# 50 when their data is absent — logged, never faked healthy.
+HEALTH_CHECK_INTERVAL_SECONDS = 300      # health evaluation task interval (supervisor pattern)
+HEALTH_DEFENSIVE_SIZE_MULTIPLIER = 0.5   # DEFENSIVE_MODE entry-size multiplier; stacks
+                                         # multiplicatively with the allocation weight and
+                                         # the probation multiplier (hard caps still bind)
+HEALTH_ALERT_COOLDOWN_SECONDS = 3600     # anti-spam floor for repeating health alerts
+                                         # (mode transitions, probation, Brier crossing);
+                                         # global DO-NOT: cooldowns required on repeating alerts
+HEALTH_SLIPPAGE_MAX_UNITS = 0.02         # slippage component maps mean signed slippage
+                                         # 0 → 100, this value → 0, linear between
+HEALTH_FEED_FAST_TARGET_SECONDS = 5.0    # fast-path pipeline target (CLAUDE.md); at target
+                                         # → 100, at 2× target → 0
+HEALTH_FEED_FULL_TARGET_SECONDS = 22.0   # full-pipeline hard limit (CLAUDE.md); same mapping
+HEALTH_FEED_LATENCY_SAMPLES = 20         # bounded ring buffer of recorded signal latencies
+HEALTH_WIN_RATE_SAMPLE_SIZE = 20         # win-rate component window: last N closed trades
+HEALTH_WIN_RATE_MIN_RESOLVED = 2         # fewer resolved trades → neutral 50 (no data ≠ data)
+HEALTH_BRIER_WINDOW_DAYS = 30            # rolling agent-Brier window for the brier component
+                                         # and the BRIER_SCORE_THRESHOLD crossing alert
+HEALTH_BRIER_MIN_RESOLVED = 10           # fewer resolved observations → neutral 50
+HEALTH_SLIPPAGE_SAMPLE_LIMIT = 50        # max rows fetched per table for the slippage
+                                         # component (query safety valve; NULL fills skipped)
+
 RESOLUTION_CACHE_TTL_HOURS = 24
 RSS_POLL_INTERVAL_SECONDS = 10
 # Fallback time-to-resolution (hours) for the Trade Decision prompt when a market's

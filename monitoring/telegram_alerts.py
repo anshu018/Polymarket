@@ -28,14 +28,21 @@ async def _send_to_telegram(message: str) -> None:
     except Exception as e:
         logger.error(f"Telegram alert failed: {e}")
 
-async def alert_system_halt(reason: str, drawdown_pct: float, portfolio_value: float) -> None:
-    """Alert for complete trading system halt."""
+async def alert_system_halt(reason: str, drawdown_pct: float, portfolio_value: float, detail: str | None = None) -> None:
+    """Alert for complete trading system halt.
+
+    `detail` is an optional extra context line (List-B.md Step 2 health halt:
+    the health trigger is not a drawdown, so the real story rides in Detail
+    while the fields keep their meanings — drawdown_pct stays the measured
+    worst-period drawdown). Existing drawdown callers are unaffected."""
     now = datetime.now(timezone.utc).isoformat()
     msg = (f"[ZERO-ALPHA] CRITICAL | SYSTEM_HALT\n"
            f"Time: {now}\n"
            f"Trigger: Drawdown {drawdown_pct*100:.2f}% (Reason: {reason})\n"
            f"State: Portfolio Value ${portfolio_value:.2f}\n"
            f"Action: ALL TRADES HALTED. Wait for human review.")
+    if detail:
+        msg += f"\nDetail: {detail}"
     asyncio.create_task(_send_to_telegram(msg))
 
 async def alert_circuit_breaker(breaker_type: str, current_pct: float, threshold_pct: float, portfolio_value: float) -> None:
@@ -107,6 +114,55 @@ async def alert_equity_warning(event: str, trigger: str, state: str, action: str
            f"Time: {now}\n"
            f"Trigger: {trigger}\n"
            f"State: {state}\n"
+           f"Action: {action}")
+    asyncio.create_task(_send_to_telegram(msg))
+
+async def alert_health_score(level: str, score: float, mode: str, components: dict[str, float]) -> None:
+    """Health-score mode-transition alert (List-B.md Step 2 — B1). Fired only
+    on mode TRANSITIONS (NORMAL→DEFENSIVE_MODE→FULL_HALT and recoveries); the
+    caller owns the cooldown. `level` is the severity (INFO/WARNING/CRITICAL)
+    and `mode` one of the interpret_health_score modes."""
+    now = datetime.now(timezone.utc).isoformat()
+    comps = " ".join(f"{k}={v:.0f}" for k, v in components.items())
+    if mode == "FULL_HALT":
+        action = ("FULL_HALT: new entries blocked on BOTH entry paths. Exits "
+                  "unaffected. Human review required.")
+    elif mode == "DEFENSIVE_MODE":
+        action = (f"DEFENSIVE_MODE: new entries sized ×{config.HEALTH_DEFENSIVE_SIZE_MULTIPLIER}. "
+                  "Exits unaffected.")
+    else:
+        action = "Health recovered to NORMAL — full entry sizing restored."
+    msg = (f"[ZERO-ALPHA] {level} | HEALTH_SCORE\n"
+           f"Time: {now}\n"
+           f"Trigger: Health score {score:.1f} → mode {mode}\n"
+           f"State: components {comps}\n"
+           f"Action: {action}")
+    asyncio.create_task(_send_to_telegram(msg))
+
+async def alert_strategy_probation(strategy: str, window_stats: dict) -> None:
+    """Strategy probation/retirement transition alert (List-B.md Step 2 — B1).
+    Fired when risk/edge_monitor.derive_allocations marks a False→True
+    transition; the caller owns the cooldown. `window_stats` carries the
+    allocation state that triggered the alert."""
+    now = datetime.now(timezone.utc).isoformat()
+    retired = bool(window_stats.get("retired"))
+    severity = "CRITICAL" if retired else "WARNING"
+    event = "STRATEGY_RETIRED" if retired else "STRATEGY_PROBATION"
+    if retired:
+        action = ("Two consecutive failing windows: this strategy's capital "
+                  "weight is 0 (mechanical, derive_allocations). Human review advised.")
+    else:
+        action = (f"Mean net edge of the last {config.STRATEGY_PROBATION_TRADE_COUNT} trades is "
+                  f"below {config.STRATEGY_PROBATION_EDGE_THRESHOLD_CENTS}: sizes ×"
+                  f"{config.PROBATION_SIZE_MULTIPLIER} (mechanical).")
+    msg = (f"[ZERO-ALPHA] {severity} | {event}\n"
+           f"Time: {now}\n"
+           f"Trigger: Strategy '{strategy}' entered "
+           f"{'retirement' if retired else 'probation'}\n"
+           f"State: n={window_stats.get('n', 0)} "
+           f"rolling_net_edge={window_stats.get('rolling_net_edge', 0.0):.4f} "
+           f"rolling_sharpe={window_stats.get('rolling_sharpe', 0.0):.4f} "
+           f"weight={window_stats.get('weight', 1.0):.2f}\n"
            f"Action: {action}")
     asyncio.create_task(_send_to_telegram(msg))
 

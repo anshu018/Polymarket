@@ -504,6 +504,16 @@ def get_entry_gate(now: Optional[datetime] = None) -> Optional[EquityGate]:
     return None
 
 
+def get_cached_snapshot() -> Optional[EquityGate]:
+    """Read-only view of the latest equity snapshot (List-B.md Step 2: the
+    health drawdown/correlation producers consume it).
+
+    Unlike get_entry_gate this never blocks an entry, increments a counter,
+    or fires an alert — staleness/freshness is the caller's concern; the
+    entry gate keeps its own fail-closed semantics untouched."""
+    return _snapshot_cache
+
+
 async def get_current_portfolio_value() -> float:
     """Current marked equity for sizing/exposure reads.
 
