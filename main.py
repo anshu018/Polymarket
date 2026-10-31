@@ -67,6 +67,22 @@ async def main():
         except Exception as e:
             logger.error(f"Supabase connection verification failed: {e}")
 
+        # 4b. Singleton instance guard (List-B.md Step 3 — B4). Claims the
+        # global __singleton__ lease BEFORE reconciliation or any trading
+        # task starts: two overlapping instances must never reconcile or
+        # trade concurrently. A second instance waits (retrying every 30s)
+        # up to SINGLETON_CLAIM_MAX_WAIT_SECONDS, then alerts and exits(1) —
+        # Railway's ALWAYS restart policy makes that a supervised retry
+        # cycle. A hard-killed holder cannot release, so a legitimate
+        # restart waits out the remaining ≤90s TTL by design (documented in
+        # coordinator/lease.py). The renewer task starts immediately after a
+        # successful claim and joins the supervised set (E-B13); a definitive
+        # lease loss later is split-brain and exits the process.
+        from coordinator.lease import acquire_singleton_or_exit, run_singleton_lease_renewer
+        await acquire_singleton_or_exit()
+        asyncio.create_task(run_singleton_lease_renewer(), name="singleton_lease_renewer")
+        logger.info("[SINGLETON] Instance guard active (renewer task started).")
+
         # 5. Layer 7: startup reconciliation runs here
         from execution.reconciliation import reconcile_on_startup
         try:
