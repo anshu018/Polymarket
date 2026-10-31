@@ -565,7 +565,13 @@ async def _execute_class_a(signal: dict) -> None:
 
     finally:
         if lease_held:
-            await lease.release_lease(market_id, lease_owner)
+            try:
+                await lease.release_lease(market_id, lease_owner)
+            except asyncio.CancelledError:
+                # Shutdown-only: a cancellation inside the lease release must
+                # not strand the lock in-process — free it before propagating.
+                market_lock.release()
+                raise
         market_lock.release()
 
     elapsed_ms = (time.monotonic() - start_ts) * 1000

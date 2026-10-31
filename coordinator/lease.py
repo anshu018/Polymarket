@@ -144,16 +144,26 @@ async def acquire_lease(market_id: str, owner: str, ttl_seconds: int) -> LeaseOu
     CONFLICT — a conflicting live lease exists (lease:conflict counter).
     ERROR    — the claim could not be verified: RPC failed or timed out
                (lease:error counter). Callers gate capital, so anything but
-               CLAIMED is fail-closed: an unguardable entry never proceeds."""
+               CLAIMED is fail-closed: an unguardable entry never proceeds.
+
+    The RPC execute runs via asyncio.to_thread: supabase-py's execute() is a
+    blocking HTTP call, and asyncio.timeout can only cancel at await points —
+    to_thread makes the SUPABASE_TIMEOUT_SECONDS bound real (the stricter
+    pattern of market_state.load_market_state, our neighbor inside the same
+    critical section) instead of the loose direct-execute precedent. If the
+    timeout fires while the orphaned thread completes server-side, the row
+    is leaked under our owner — it self-heals via the TTL and reads as a
+    same-owner renewal on our next claim: fail-closed direction."""
     _validate_ttl(ttl_seconds)
     try:
         async with asyncio.timeout(config.SUPABASE_TIMEOUT_SECONDS):
             client = await get_client()
-            res = client.rpc("claim_market_lease", {
+            builder = client.rpc("claim_market_lease", {
                 "p_market_id": market_id,
                 "p_owner": owner,
                 "p_ttl_seconds": ttl_seconds,
-            }).execute()
+            })
+            res = await asyncio.to_thread(builder.execute)
     except asyncio.TimeoutError:
         record_drop("lease:error")
         logger.warning(
@@ -193,17 +203,19 @@ async def release_lease(market_id: str, owner: str) -> bool:
     The one fail-soft path in this module: a failed release leaves the row
     to expire via its TTL, which self-heals in LEASE_TTL_SECONDS; it must
     never raise through a caller's `finally` and mask an in-flight
-    exception from the critical section."""
+    exception from the critical section. Same to_thread bound as
+    acquire_lease; a timed-out orphaned DELETE is harmless — the row merely
+    lives until its TTL."""
     try:
         async with asyncio.timeout(config.SUPABASE_TIMEOUT_SECONDS):
             client = await get_client()
-            res = (
+            builder = (
                 client.table("market_leases")
                 .delete()
                 .eq("market_id", market_id)
                 .eq("owner", owner)
-                .execute()
             )
+            res = await asyncio.to_thread(builder.execute)
             released = bool(getattr(res, "data", None))
             if not released:
                 logger.info(

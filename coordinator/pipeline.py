@@ -1655,8 +1655,15 @@ async def _run_pipeline_impl(
 
     finally:
         if lease_held:
-            await lease.release_lease(market_id, lease_owner)
+            try:
+                await lease.release_lease(market_id, lease_owner)
+            except asyncio.CancelledError:
+                # Shutdown-only: a cancellation inside the lease release must
+                # not strand the lock in-process — free it before propagating.
+                market_lock.release()
+                raise
         market_lock.release()
+
     # Log to copytrade_log for trust scoring and audit trail (Class B)
     if strategy_override == "copy_edge_class_b" and wallet_address:
         try:
