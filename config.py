@@ -163,6 +163,27 @@ SINGLETON_CLAIM_MAX_WAIT_SECONDS = 600   # a second instance waits this long for
 LEASE_RENEW_INTERVAL_SECONDS = 30        # the singleton renew task ticks at this interval
                                          # (the spec's "every 30s" — named home)
 
+# ── RUNTIME RECONCILIATION (List-B.md Step 4 — B3) ────────────────────────────
+# execution/runtime_reconciliation.py. Startup reconciliation still gates all
+# trading (unchanged); this additive loop re-checks state every tick: resolved
+# positions close through the ONE shared close path (execution/
+# position_close.py, D-B08) under the Step 3 market lease, stuck pending
+# idempotency entries are swept (D-B14 classification), and in-flight counts
+# are logged + digested daily. All fail-soft telemetry — a failed tick retries
+# and NEVER blocks trading (resolution closes are not entries).
+RUNTIME_RECON_INTERVAL_SECONDS = 900     # loop interval; a resolved position
+                                         # waits at most one tick to be closed
+PENDING_STUCK_MINUTES = 15               # idempotency_log rows pending longer
+                                         # than this are swept (a crash between
+                                         # the pending write and its confirm)
+RECON_MAX_RESOLUTION_FETCHES = 50        # Gamma fetch cap per tick (rate-limit
+                                         # aware; oldest positions first — the
+                                         # equity snapshot's cap pattern)
+RECON_ALERT_COOLDOWN_SECONDS = 3600      # anti-spam floor for repeating recon
+                                         # WARNINGs (void-skipped, stuck-pending
+                                         # failed); global DO-NOT: cooldowns
+                                         # required on repeating alerts
+
 RESOLUTION_CACHE_TTL_HOURS = 24
 RSS_POLL_INTERVAL_SECONDS = 10
 # Fallback time-to-resolution (hours) for the Trade Decision prompt when a market's

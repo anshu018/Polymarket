@@ -150,6 +150,17 @@ async def _cancel_order(row: dict[str, Any]) -> None:
         )
 
 
+async def cancel_unfilled_maker(row: dict[str, Any]) -> None:
+    """Public cancel primitive for a never-filled maker order (deletes the
+    open_positions row + marks the idempotency entry 'cancelled').
+
+    List-B.md Step 4 (B3, D-B15): the runtime resolution sweep cancels a
+    resting maker whose market resolved — a never-filled order owns no shares
+    and must never be closed into the ledger as a trade. Delegates to the
+    monitor's own best-effort cancel flow (one implementation, D-13)."""
+    await _cancel_order(row)
+
+
 async def _resolve_row(row: dict[str, Any], now: datetime) -> None:
     """Resolve one resting maker order: fill, taker-fallback, or cancel."""
     row_id = str(row.get("id"))

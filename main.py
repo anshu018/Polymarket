@@ -162,6 +162,16 @@ async def main():
         asyncio.create_task(run_health_check_supervisor(), name="health_check")
         logger.info("[HEALTH] Health check supervisor started (supervisor task).")
 
+        # Start the Step 4 runtime reconciliation supervisor (List-B.md B3).
+        # Every RUNTIME_RECON_INTERVAL_SECONDS: resolved positions close
+        # through the ONE shared close path under the Step 3 market lease,
+        # stuck pending idempotency entries are swept (D-B14), and in-flight
+        # counts are logged + digested daily. Additive and fail-soft — the
+        # startup reconciliation still gates all trading (E-B13, unchanged).
+        from execution.runtime_reconciliation import run_runtime_reconciliation
+        asyncio.create_task(run_runtime_reconciliation(), name="runtime_reconciliation")
+        logger.info("[RECON] Runtime reconciliation supervisor started (supervisor task).")
+
         # Validate News Analyst models before starting signal processing
         from llm.news_analyst import validate_models
         logger.info("Validating news analyst models...")

@@ -211,3 +211,36 @@ async def alert_copy_trade_executed(
            f"Entry: {entry_price:.4f} | Slippage: {slippage:.4f}\n"
            f"Action: Position logged and idempotency confirmed.")
     asyncio.create_task(_send_to_telegram(msg))
+
+
+async def alert_inflight_digest(
+    open_positions: int,
+    resting_makers: int,
+    pending_idempotency: int,
+    closed_today: int,
+) -> None:
+    """Daily in-flight visibility digest (List-B.md Step 4 — B3).
+
+    One message per UTC day, sent by the runtime reconciliation loop on the
+    first tick of a new day (restarts do NOT re-send — the startup alert
+    already covers boot). Format-consistent with the alert list."""
+    now = datetime.now(timezone.utc).isoformat()
+    msg = (f"[ZERO-ALPHA] INFO | INFLIGHT_DIGEST\n"
+           f"Time: {now}\n"
+           f"State: open_positions={open_positions} resting_makers={resting_makers} "
+           f"pending_idempotency={pending_idempotency} closed_by_runtime_today={closed_today}\n"
+           f"Action: Routine visibility. No action required unless counts look wrong.")
+    asyncio.create_task(_send_to_telegram(msg))
+
+
+async def alert_recon_warning(trigger: str, detail: str, action: str) -> None:
+    """Runtime-reconciliation WARNING (cooldown-gated by the caller — the
+    global DO-NOT list requires cooldowns on repeating alerts): void markets
+    the sweep refuses to auto-resolve (D-B15) and stuck pending idempotency
+    entries marked failed (D-B14)."""
+    now = datetime.now(timezone.utc).isoformat()
+    msg = (f"[ZERO-ALPHA] WARNING | {trigger}\n"
+           f"Time: {now}\n"
+           f"Trigger: {detail}\n"
+           f"Action: {action}")
+    asyncio.create_task(_send_to_telegram(msg))
