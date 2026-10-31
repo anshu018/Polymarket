@@ -482,3 +482,25 @@ async def test_supervisor_re_raises_cancellation(recon_db, silent_alerts):
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+@pytest.mark.anyio
+async def test_poisoned_close_does_not_wedge_the_tick(recon_db, silent_alerts):
+    """Self-review regression: a close that CRASHES (malformed row — NULL
+    entry_price) must not abort the tick; the healthy rows keep closing and
+    the poisoned row retries next tick."""
+    client, db = recon_db
+    poisoned = _position_row(market_id="mkt-poison", entry_price=None)  # float(None) → TypeError
+    good = _position_row(market_id="mkt-good")
+    db["open_positions"].extend([poisoned, good])
+    script = _ResolutionScript()
+    script.results["mkt-poison"] = MarketResolution(ResolutionStatus.RESOLVED, 1.0, 1.0)
+    script.results["mkt-good"] = MarketResolution(ResolutionStatus.RESOLVED, 1.0, 1.0)
+
+    with patch("execution.runtime_reconciliation.fetch_market_resolution", script):
+        await rr.run_reconciliation_once(now=NOW)
+
+    assert len(db["closed_trades"]) == 1                       # the healthy row closed
+    assert db["closed_trades"][0]["market_id"] == "mkt-good"
+    assert len(db["open_positions"]) == 1                      # the poisoned row retries later
+    assert db["open_positions"][0]["market_id"] == "mkt-poison"

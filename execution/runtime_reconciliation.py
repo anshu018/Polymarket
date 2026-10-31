@@ -171,10 +171,15 @@ async def _mark_idempotency_status(
     client: Any, log_id: str, status: str, reason: Optional[str] = None
 ) -> bool:
     """Update one idempotency row's status (mirrors startup reconciliation's
-    update — same fields; injected client). Best-effort: a failed mark leaves
-    the row pending and the next tick retries (pending never blocks a future
-    order UUID — D-13)."""
-    payload: dict[str, Any] = {"status": status}
+    update — same fields incl. confirmed_at on confirm; injected client).
+    Best-effort: a failed mark leaves the row pending and the next tick
+    retries (pending never blocks a future order UUID — D-13)."""
+    payload: dict[str, Any] = {
+        "status": status,
+        "confirmed_at": (
+            datetime.now(timezone.utc).isoformat() if status == "confirmed" else None
+        ),
+    }
     if reason:
         payload["failure_reason"] = reason
 
@@ -304,7 +309,18 @@ async def _resolution_sweep(client: Any, rows: list[dict[str, Any]], now: dateti
             )
             continue
 
-        await _close_under_lease(client, row, float(resolution.exit_price))
+        try:
+            await _close_under_lease(client, row, float(resolution.exit_price))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # Per-row isolation: one poisoned close (a malformed row, a DB
+            # blip) must never wedge the tick — the next tick retries this
+            # row while the others keep closing.
+            logger.error(
+                "[RECON] Close failed for %s (retries next tick): %s: %s",
+                market_id[:16], type(e).__name__, e,
+            )
 
     _fetch_offset = (_fetch_offset + fetches) % count if count else 0
 

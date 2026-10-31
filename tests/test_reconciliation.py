@@ -353,10 +353,11 @@ async def test_copy_trade_resolution_updates_trust_score(
 
     Flow under test:
         reconcile_on_startup() [paper mode]
-          -> _supabase_move_to_closed()
-          -> _resolve_copy_trade()           <- new wiring in reconciliation.py
-              -> copytrade_log status -> "won"
-              -> tracked_wallets: wins_count +1, trust_score recomputed
+          -> execution.position_close.close_position()   [shared close path,
+             List-B Step 4 — B3, D-B08]
+              -> resolve_copy_trade() inside the shared path
+                  -> copytrade_log status -> "won"
+                  -> tracked_wallets: wins_count +1, trust_score recomputed
     """
     wallet_addr = "0xDeAdBeEf000000000000000000000000000000AA"
     idem_uuid = "idem-copy-trade-abc-123"
