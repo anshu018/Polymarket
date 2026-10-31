@@ -1181,3 +1181,121 @@ async def test_class_a_defensive_mode_halves_size(mock_db):
 
     assert len(mock_db["open_positions"]) == 1
     assert mock_db["open_positions"][0]["position_size_usdc"] == pytest.approx(4.25)
+
+
+# ── List-B.md Step 3 (B4): lease guard on the Class A entry critical section ──
+
+def _flat_equity_gate_for_lease(current: float) -> "equity.EquityGate":
+    """Alias of _flat_equity_gate kept for readability in the lease tests."""
+    return _flat_equity_gate(current)
+
+
+def class_a_lease_patches() -> list:
+    """Fresh executor patch contexts for the lease tests — patch objects are
+    single-use, so they must be created per call, never shared at module
+    level (the shared equity/health/DB fixtures stay untouched)."""
+    return [
+        patch("coordinator.equity.get_entry_gate", lambda now=None: _flat_equity_gate_for_lease(10_000.0)),
+        patch("copytrade.executor._fetch_exposure", AsyncMock(return_value=(0.0, 0.0))),
+        patch("copytrade.executor.get_market_book",
+              AsyncMock(return_value=BookSnapshot(best_bid=0.48, best_ask=0.49, depth_usd=5000.0))),
+        patch("copytrade.executor.get_trust_score", return_value=0.85),
+        patch("copytrade.executor.get_wallet_state", return_value="ACTIVE"),
+        patch("copytrade.executor.compute_state_multiplier", return_value=1.0),
+        patch("copytrade.executor._tracker_log_trade", AsyncMock()),
+    ]
+
+
+@pytest.mark.anyio
+async def test_class_a_lease_conflict_blocks_entry(mock_db):
+    """Another live process holds the market lease → the Class A entry drops
+    before load_market_state inside the section: no position, no idempotency
+    reservation, lease:conflict counter (in coordinator.lease) incremented."""
+    from coordinator import lease as lease_module
+    from datetime import timedelta
+
+    mock_db.setdefault("market_leases", []).append({
+        "market_id": _CLASS_A_SIGNAL["market_id"],
+        "owner": "other-process",
+        "lease_until": (
+            datetime.now(timezone.utc) + timedelta(seconds=3600)
+        ).isoformat(),
+    })
+    drops_before = lease_module.get_drop_counters()["lease:conflict"]
+
+    with nested_patch(class_a_lease_patches()):
+        await _execute_class_a(dict(_CLASS_A_SIGNAL))
+
+    assert len(mock_db["open_positions"]) == 0
+    assert len(mock_db["idempotency_log"]) == 0
+    assert lease_module.get_drop_counters()["lease:conflict"] == drops_before + 1
+
+
+@pytest.mark.anyio
+async def test_class_a_releases_lease_after_success(mock_db):
+    """The success path releases the lease in the finally — no row survives
+    the critical section (a leaked row would block the market for a TTL)."""
+    with nested_patch(class_a_lease_patches()):
+        await _execute_class_a(dict(_CLASS_A_SIGNAL))
+
+    assert len(mock_db["open_positions"]) == 1
+    assert mock_db.get("market_leases", []) == []
+
+
+@pytest.mark.anyio
+async def test_two_processes_cannot_double_enter_same_market(mock_db):
+    """DoD (List-B Step 3): a two-process simulation cannot double-enter.
+
+    Process A is mid-critical-section (its asyncio lock held and its live
+    lease row seeded under instance id 'proc-A'). Process B — a real
+    _execute_class_a task with instance id 'proc-B' — must fail closed at
+    the bounded lock wait (never queue-jump), write nothing, and leave A's
+    entry as the only one. After A releases, a same-owner entry succeeds,
+    proving the drop was guard-driven, not a market-level ban."""
+    from coordinator import lease as lease_module
+    from coordinator.market_state import get_market_lock
+    from datetime import timedelta
+
+    market_id = _CLASS_A_SIGNAL["market_id"]
+    mock_db.setdefault("market_leases", []).append({
+        "market_id": market_id,
+        "owner": "proc-A",
+        "lease_until": (
+            datetime.now(timezone.utc) + timedelta(seconds=3600)
+        ).isoformat(),
+    })
+    drops_before = lease_module.get_drop_counters()["lock:timeout"]
+
+    # Process A holds the per-market lock (mid-section simulation).
+    lock = get_market_lock(market_id)
+    await lock.acquire()
+    try:
+        with nested_patch(class_a_lease_patches()), \
+             patch.object(config, "LOCK_ACQUIRE_TIMEOUT_SECONDS", 0.05), \
+             patch.object(lease_module, "_instance_id", "proc-B"):
+            await _execute_class_a(dict(_CLASS_A_SIGNAL))
+    finally:
+        lock.release()
+
+    # B wrote nothing: exactly the simulated A-side state exists.
+    assert len(mock_db["open_positions"]) == 0
+    assert len(mock_db["idempotency_log"]) == 0
+    assert lease_module.get_drop_counters()["lock:timeout"] == drops_before + 1
+    # A's lease is untouched — B never stole or released another holder's row.
+    assert mock_db["market_leases"][0]["owner"] == "proc-A"
+
+    # Once the section is free, process A itself is enterable again: the
+    # same-owner re-claim succeeds — the guards gate concurrency, never the
+    # market itself.
+    with nested_patch(class_a_lease_patches()),          patch.object(lease_module, "_instance_id", "proc-A"):
+        await _execute_class_a(dict(_CLASS_A_SIGNAL))
+    assert len(mock_db["open_positions"]) == 1
+
+
+def nested_patch(patterns):
+    """Stack freshly-created patch contexts as one context manager."""
+    from contextlib import ExitStack
+    stack = ExitStack()
+    for p in patterns:
+        stack.enter_context(p)
+    return stack

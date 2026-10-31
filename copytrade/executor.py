@@ -39,6 +39,7 @@ import aiohttp
 
 import config
 from coordinator import equity
+from coordinator import lease
 from monitoring import health_score
 from memory.supabase_client import get_client
 from risk import risk_engine
@@ -381,8 +382,51 @@ async def _execute_class_a(signal: dict) -> None:
         return
 
     # ── Risk Gate 4: Per-market tranche gate & concurrency lock ───────────────
+    # Bounded wait (List-B.md Step 3 — B4): the wait for the process-local
+    # lock is capped at LOCK_ACQUIRE_TIMEOUT_SECONDS; a timeout is a
+    # fail-closed drop (lock:timeout) — never queue-jump, never proceed
+    # unguarded. asyncio.timeout is deliberate (ground rule 9: wait_for
+    # swallows external cancellation). A TimeoutError can only mean the
+    # acquire was cancelled mid-wait — asyncio.Lock never leaves the lock
+    # held on a cancelled acquire — so dropping here cannot strand it.
     market_lock = get_market_lock(market_id)
-    async with market_lock:
+    try:
+        async with asyncio.timeout(config.LOCK_ACQUIRE_TIMEOUT_SECONDS):
+            await market_lock.acquire()
+    except TimeoutError:
+        lease.record_drop("lock:timeout")
+        logger.warning(
+            "[COPY_EXECUTOR][CLASS_A][DROP:lock:timeout] market=%s waited "
+            ">%ds for the market lock — dropping fail-closed",
+            market_id[:12], config.LOCK_ACQUIRE_TIMEOUT_SECONDS,
+        )
+        return
+
+    # Cross-process lease (Step 3 — B4, D-B02/D-B13): the asyncio lock only
+    # guards THIS process; an overlapping deploy runs its own registry. The
+    # lease is claimed second (process-local lock first, lease second —
+    # defense in depth) and released in the finally below — every path out
+    # of this section releases both, in LIFO order. A non-CLAIMED outcome is
+    # fail-closed (lease:conflict / lease:error — the counters live in
+    # coordinator.lease; residual risk: a hung holder's lease expires, the
+    # DB-level re-checks below are the second line of defense).
+    lease_owner = lease.get_instance_id()
+    lease_held = False
+    try:
+        lease_outcome = await lease.acquire_lease(
+            market_id, lease_owner, config.LEASE_TTL_SECONDS
+        )
+        if lease_outcome is not lease.LeaseOutcome.CLAIMED:
+            logger.warning(
+                "[COPY_EXECUTOR][CLASS_A][DROP:%s] market=%s could not claim "
+                "the cross-process lease — dropping fail-closed",
+                "lease:conflict" if lease_outcome is lease.LeaseOutcome.CONFLICT
+                else "lease:error",
+                market_id[:12],
+            )
+            return
+        lease_held = True
+
         state = await load_market_state(market_id, direction)
         if state is None:
             logger.warning("[COPY_EXECUTOR][CLASS_A][DROP:exposure_unavailable] market=%s", market_id[:12])
@@ -518,6 +562,11 @@ async def _execute_class_a(signal: dict) -> None:
             idempotency_uuid=order_uuid,
             was_priority_pick=was_priority_pick,
         )
+
+    finally:
+        if lease_held:
+            await lease.release_lease(market_id, lease_owner)
+        market_lock.release()
 
     elapsed_ms = (time.monotonic() - start_ts) * 1000
     logger.info(
