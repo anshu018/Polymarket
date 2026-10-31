@@ -66,7 +66,7 @@ import math
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable, Coroutine, Optional
+from typing import Any, Callable, Coroutine, Optional
 
 import config
 from memory.supabase_client import get_client
@@ -195,10 +195,14 @@ def _optional_float(raw: Any) -> Optional[float]:
     return value if math.isfinite(value) else None
 
 
-def _dispatch_health_alert(event: str, alert: Coroutine[Any, Any, None], now: datetime) -> None:
+def _dispatch_health_alert(
+    event: str, alert_factory: Callable[[], Coroutine[Any, Any, None]], now: datetime
+) -> None:
     """Send a health alert with a per-event cooldown (global DO-NOT list:
     cooldowns required on repeating alerts — the caller owns the cooldown,
     the telegram_alerts functions stay cooldown-free, equity precedent).
+    The coroutine is built via `alert_factory` ONLY when actually dispatched
+    (never building an unawaited coroutine on a suppressed call).
     Fire-and-forget; suppressed when no event loop is running (unit tests)."""
     last = _last_alert_at.get(event)
     if last is not None and (now - last).total_seconds() < config.HEALTH_ALERT_COOLDOWN_SECONDS:
@@ -209,7 +213,7 @@ def _dispatch_health_alert(event: str, alert: Coroutine[Any, Any, None], now: da
     except RuntimeError:
         logger.warning("[HEALTH] %s alert suppressed (no running event loop)", event)
         return
-    asyncio.create_task(alert)
+    asyncio.create_task(alert_factory())
 
 
 # ── Producers (each 0-100; fail-soft to NEUTRAL_SCORE on absent data) ────────
@@ -340,6 +344,10 @@ async def _slippage_component(client: Any) -> float:
         fill = _optional_float(row.get("fill_price"))
         reference = _optional_float(row.get("market_price_at_entry"))
         direction = str(row.get("direction") or "").strip().upper()
+        if fill is None or reference is None:
+            # NULL fill (resting maker / legacy row) or missing reference is a
+            # non-measurement — skipped, never coerced to zero slippage.
+            continue
         slippage = fill_simulator.signed_slippage_units(fill, reference, direction)
         if slippage is not None:
             observations.append(slippage)
@@ -508,9 +516,14 @@ def _announce_mode(
         _last_announced_mode = mode
         return
 
+    # Per-target-mode cooldown key: a DEFENSIVE→FULL_HALT escalation must
+    # never be suppressed by an earlier, less-severe transition alert — each
+    # distinct mode's entry alerts at most once per cooldown window.
     _dispatch_health_alert(
-        "HEALTH_TRANSITION",
-        alert_health_score(_MODE_SEVERITY[mode], score, mode, components),
+        f"HEALTH_TRANSITION:{mode}",
+        lambda m=mode, s=score, c=components: alert_health_score(
+            _MODE_SEVERITY[m], s, m, c
+        ),
         now,
     )
     if mode == "FULL_HALT":
@@ -522,21 +535,23 @@ def _announce_mode(
 
         snapshot = equity.get_cached_snapshot()
         equity_value = snapshot.current_equity if snapshot is not None else 0.0
+        halt_reason = f"health_full_halt (score={score:.1f})"
         _dispatch_health_alert(
             "HEALTH_HALT",
-            alert_system_halt(
-                reason=f"health_full_halt (score={score:.1f})",
-                drawdown_pct=worst_drawdown_pct if worst_drawdown_pct is not None else 0.0,
-                portfolio_value=equity_value,
-                detail=(
-                    "Health score entered FULL_HALT: new entries are blocked on "
-                    "both paths; exits are unaffected."
-                    if snapshot is not None
-                    else "Health score entered FULL_HALT and the equity snapshot is "
-                    "unavailable (equity gate independently blocks entries); exits "
-                    "are unaffected."
+            lambda r=halt_reason, dd=worst_drawdown_pct, ev=equity_value, snap=snapshot:
+                alert_system_halt(
+                    reason=r,
+                    drawdown_pct=dd if dd is not None else 0.0,
+                    portfolio_value=ev,
+                    detail=(
+                        "Health score entered FULL_HALT: new entries are blocked on "
+                        "both paths; exits are unaffected."
+                        if snap is not None
+                        else "Health score entered FULL_HALT and the equity snapshot is "
+                        "unavailable (equity gate independently blocks entries); exits "
+                        "are unaffected."
+                    ),
                 ),
-            ),
             now,
         )
     _last_announced_mode = mode
@@ -546,7 +561,12 @@ async def _check_probation_transitions(client: Any, now: datetime) -> None:
     """Diff derive_allocations states against last-known; alert on a
     probation/retirement ENTRY (False→True). Same ledger read conventions as
     the pipeline's allocation fetch (2s timeout, ALLOCATION_HISTORY_LIMIT,
-    oldest first, unknown-strategy bucket). First tick seeds silently."""
+    oldest first, unknown-strategy bucket).
+
+    A strategy FIRST SEEN already on probation/retired alerts too — the same
+    semantics as booting into a degraded health mode (the operator must know;
+    the cooldown keeps a restart from storming). Only a first tick with NO
+    strategy in a failing state stays fully silent."""
     async with asyncio.timeout(config.SUPABASE_TIMEOUT_SECONDS):
         res = (
             client.table("closed_trades")
@@ -565,15 +585,13 @@ async def _check_probation_transitions(client: Any, now: datetime) -> None:
     global _last_allocations
     previous = _last_allocations
     _last_allocations = current
-    if previous is None:
-        return
 
     for strategy, alloc in current.items():
         prev = previous.get(strategy)
-        if prev is None:
-            continue
-        if not (alloc.probation and not prev.probation) and not (
-            alloc.retired and not prev.retired
+        was_probation = prev.probation if prev is not None else False
+        was_retired = prev.retired if prev is not None else False
+        if not (alloc.probation and not was_probation) and not (
+            alloc.retired and not was_retired
         ):
             continue
         window_stats: dict[str, Any] = {
@@ -586,20 +604,26 @@ async def _check_probation_transitions(client: Any, now: datetime) -> None:
         }
         event = f"retired:{strategy}" if alloc.retired else f"probation:{strategy}"
         _dispatch_health_alert(
-            event, alert_strategy_probation(strategy, window_stats), now
+            event,
+            lambda s=strategy, w=window_stats: alert_strategy_probation(s, w),
+            now,
         )
 
 
 # ── Evaluation task ──────────────────────────────────────────────────────────
 
 async def _produce_neutral_on_error(
-    name: str, producer: Callable[[], Awaitable[Any]], neutral: Any
+    name: str, producer: Callable[[], Any], neutral: Any
 ) -> Any:
     """Run one producer; ANY failure (except cancellation) yields the
     neutral value with a loud error — fail-soft telemetry, never faked
-    healthy, never crash-the-loop."""
+    healthy, never crash-the-loop. Accepts sync producers (the in-process
+    feed-latency/drawdown readers) and async ones (DB-backed)."""
     try:
-        return await producer()
+        result = producer()
+        if asyncio.iscoroutine(result):
+            result = await result
+        return result
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -684,8 +708,8 @@ async def evaluate_health_once(now: Optional[datetime] = None) -> HealthEvaluati
         if crossed:
             _dispatch_health_alert(
                 "BRIER_EXCEEDED",
-                alert_brier_score_exceeded(
-                    brier_sample.raw_brier,
+                lambda s=brier_sample.raw_brier: alert_brier_score_exceeded(
+                    s,
                     config.BRIER_SCORE_THRESHOLD,
                     config.HEALTH_BRIER_WINDOW_DAYS,
                 ),
