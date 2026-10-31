@@ -51,6 +51,7 @@ from coordinator.market_state import (
     _MARKET_LOCKS,
 )
 from copytrade.executor import _execute_class_a, _execute_class_b
+from monitoring import health_score
 from llm.news_analyst import NewsAnalystOutput
 from llm.contract_parser import ContractParserOutput
 from llm.trade_decision import TradeDecisionOutput
@@ -73,12 +74,22 @@ def _flat_equity_gate(current: float) -> "equity.EquityGate":
 
 @pytest.fixture(autouse=True)
 def clean_test_environment():
-    """Reset market locks and drop counters before and after every test."""
+    """Reset market locks and drop counters before and after every test, plus
+    the health module's process-wide enforcement state (List-B Step 2 — a
+    leaked FULL_HALT would block every test that runs after it)."""
     reset_market_locks()
     for k in _drop_counters:
         _drop_counters[k] = 0
+    health_score.set_current_mode("NORMAL")
+    health_score._last_announced_mode = None
+    health_score._gate_drops.update({"health:full_halt": 0})
+    health_score._latency_observations.clear()
     yield
     reset_market_locks()
+    health_score.set_current_mode("NORMAL")
+    health_score._last_announced_mode = None
+    health_score._gate_drops.update({"health:full_halt": 0})
+    health_score._latency_observations.clear()
 
 
 @pytest.fixture
@@ -1099,3 +1110,57 @@ async def test_repeat_entry_price_delta_signed(mock_db, caplog, estimator_has_da
     assert "price_delta=-0.0500" in caplog.text
     assert "price_delta=0.0500" in caplog.text
 
+
+
+# ── List-B.md Step 2 (B1): health enforcement at the Class A entry ────────────
+
+_CLASS_A_SIGNAL = {
+    "market_id": "test-class-a-health",
+    "outcome": "Yes",
+    "live_ask": 0.50,
+    "tracker_price": 0.495,
+    "trader_name": "ProTrader",
+    "wallet_address": "0x123",
+    "was_priority_pick": False,
+    "trust_score": 0.85,
+    "market_volume_usd": 50000.0,
+}
+
+
+@pytest.mark.anyio
+async def test_class_a_health_full_halt_blocks_entry(mock_db):
+    """FULL_HALT drops the copy signal at Risk Gate 0 — before the drawdown
+    gate, before any DB write (no position, no idempotency reservation);
+    counter health:full_halt lives in monitoring.health_score. Exits are
+    never gated (D-B04)."""
+    health_score.set_current_mode("FULL_HALT")
+
+    with patch("coordinator.equity.get_entry_gate", lambda now=None: _flat_equity_gate(10_000.0)):
+        await _execute_class_a(dict(_CLASS_A_SIGNAL))
+
+    assert len(mock_db["open_positions"]) == 0
+    assert len(mock_db["idempotency_log"]) == 0
+    assert health_score.get_gate_drop_counters()["health:full_halt"] == 1
+
+
+@pytest.mark.anyio
+async def test_class_a_defensive_mode_halves_size(mock_db):
+    """DEFENSIVE_MODE: raw $8.50 (ceiling $10 × state 1.0 × trust 0.85) halves
+    to $4.25 BEFORE the portfolio-percentage cap (which still binds anything
+    larger); the Sizing log carries health_mode/health_mult."""
+    health_score.set_current_mode("DEFENSIVE_MODE")
+
+    async def fake_class_a_book(token_id: str):
+        return BookSnapshot(best_bid=0.48, best_ask=0.49, depth_usd=5000.0)
+
+    with patch("coordinator.equity.get_entry_gate", lambda now=None: _flat_equity_gate(10_000.0)), \
+         patch("copytrade.executor._fetch_exposure", AsyncMock(return_value=(0.0, 0.0))), \
+         patch("copytrade.executor.get_market_book", fake_class_a_book), \
+         patch("copytrade.executor.get_trust_score", return_value=0.85), \
+         patch("copytrade.executor.get_wallet_state", return_value="ACTIVE"), \
+         patch("copytrade.executor.compute_state_multiplier", return_value=1.0), \
+         patch("copytrade.executor._tracker_log_trade", AsyncMock()):
+        await _execute_class_a(dict(_CLASS_A_SIGNAL))
+
+    assert len(mock_db["open_positions"]) == 1
+    assert mock_db["open_positions"][0]["position_size_usdc"] == pytest.approx(4.25)

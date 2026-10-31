@@ -22,6 +22,7 @@ import config
 from coordinator.pipeline import run_pipeline, get_drop_counters, _drop_counters
 from coordinator.market_state import reset_market_locks
 from coordinator import equity
+from monitoring import health_score
 
 
 @pytest.fixture(autouse=True)
@@ -104,8 +105,19 @@ def clean_test_environment():
     reset_market_locks()
     for k in _drop_counters:
         _drop_counters[k] = 0
+    # List-B Step 2 (B1): the health module holds process-wide enforcement
+    # state — reset around every test (a leaked FULL_HALT would block every
+    # pipeline test that runs after it in the same pytest process).
+    health_score.set_current_mode("NORMAL")
+    health_score._last_announced_mode = None
+    health_score._gate_drops.update({"health:full_halt": 0})
+    health_score._latency_observations.clear()
     yield
     reset_market_locks()
+    health_score.set_current_mode("NORMAL")
+    health_score._last_announced_mode = None
+    health_score._gate_drops.update({"health:full_halt": 0})
+    health_score._latency_observations.clear()
 
 
 @pytest.fixture
@@ -614,3 +626,85 @@ async def test_fill_log_line_records_decision_vs_fill(mock_db, book_holder, capl
     for field in ("decision_price=0.5000", "fill_price=0.5200",
                   "slippage_units=0.0200", "fill_type=taker"):
         assert field in line, f"fill log line missing {field}"
+
+
+# ── List-B.md Step 2 (B1): health enforcement at the pipeline entry ───────────
+
+@pytest.mark.anyio
+async def test_health_full_halt_blocks_pipeline_entries(mock_db):
+    """FULL_HALT drops the signal at the TOP with counter health:full_halt —
+    before the News Analyst (zero LLM token burn) and before any Supabase
+    call (cache-only gate: the documented call-order ordinals are unchanged).
+    Exits are never consulted here (D-B04)."""
+    health_score.set_current_mode("FULL_HALT")
+
+    with patch("coordinator.pipeline.classify_signal", AsyncMock()) as spy_analyst:
+        result = await run_default_pipeline()
+
+    assert result == {"status": "blocked", "reason": "health_full_halt"}
+    assert health_score.get_gate_drop_counters()["health:full_halt"] == 1
+    spy_analyst.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_defensive_mode_halves_pipeline_size(mock_db, caplog):
+    """DEFENSIVE_MODE stacks HEALTH_DEFENSIVE_SIZE_MULTIPLIER multiplicatively
+    with the allocation multipliers (kelly $625 → $312.50) BEFORE the hard
+    caps, and the mandatory [SIZING] log documents the stacking."""
+    import logging
+
+    health_score.set_current_mode("DEFENSIVE_MODE")
+
+    with caplog.at_level(logging.INFO, logger="coordinator.pipeline"):
+        result = await run_default_pipeline()
+
+    assert result is not None and result["status"] == "success"
+    pos = mock_db["open_positions"][0]
+    assert pos["position_size_usdc"] == pytest.approx(312.50)
+    sizing_lines = [line for line in caplog.text.splitlines()
+                    if "[OBSERVABILITY][SIZING]" in line]
+    assert len(sizing_lines) == 1
+    assert "health_mode=DEFENSIVE_MODE" in sizing_lines[0]
+    assert "health_mult=0.50" in sizing_lines[0]
+
+
+@pytest.mark.anyio
+async def test_normal_mode_keeps_full_size_and_logs_mult_1(mock_db, caplog):
+    """NORMAL mode: no size change ($500 fixture baseline) and the SIZING log
+    still carries health_mode/health_mult for observability."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="coordinator.pipeline"):
+        result = await run_default_pipeline()
+
+    assert result is not None and result["status"] == "success"
+    assert mock_db["open_positions"][0]["position_size_usdc"] == pytest.approx(500.0)
+    sizing_lines = [line for line in caplog.text.splitlines()
+                    if "[OBSERVABILITY][SIZING]" in line]
+    assert "health_mode=NORMAL" in sizing_lines[0]
+    assert "health_mult=1.00" in sizing_lines[0]
+
+
+@pytest.mark.anyio
+async def test_latency_wrapper_records_analyst_reached_signals(mock_db):
+    """The run_pipeline timing wrapper records one (duration, fast_path)
+    observation for a signal that reached the News Analyst (full path here —
+    fixture confidence 0.80)."""
+    result = await run_default_pipeline()
+
+    assert result is not None and result["status"] == "success"
+    assert len(health_score._latency_observations) == 1
+    duration, fast = health_score._latency_observations[0]
+    assert fast is False
+    assert duration > 0.0
+
+
+@pytest.mark.anyio
+async def test_latency_wrapper_skips_pre_analyst_drops(mock_db):
+    """Signals dropped before the News Analyst (FULL_HALT here) do not
+    exercise the feed — no latency observation, no flattered component."""
+    health_score.set_current_mode("FULL_HALT")
+
+    await run_default_pipeline()
+
+    assert len(health_score._latency_observations) == 0
