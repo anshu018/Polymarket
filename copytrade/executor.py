@@ -39,6 +39,7 @@ import aiohttp
 
 import config
 from coordinator import equity
+from monitoring import health_score
 from memory.supabase_client import get_client
 from risk import risk_engine
 from risk import cost_model
@@ -274,6 +275,17 @@ async def _execute_class_a(signal: dict) -> None:
         was_priority_pick,
     )
 
+    # ── Risk Gate 0: Health mode (List-B.md Step 2 — B1, D-B04) ───────────────
+    # FULL_HALT blocks new entries at the TOP. Cache-only read (zero DB calls
+    # on the trade path); counters live in monitoring.health_score. Exits are
+    # NEVER gated here.
+    if health_score.get_current_mode() == "FULL_HALT":
+        health_score.increment_gate_drop("health:full_halt")
+        logger.warning(
+            "[COPY_EXECUTOR][CLASS_A][DROP:health:full_halt] market=%s", market_id[:12]
+        )
+        return
+
     # ── Risk Gate 1: Drawdown circuit breakers (List-B.md Step 1 — B2) ────────
     # Real period-start anchors from the equity snapshot service. The old code
     # fed check_drawdown the same value as both start and current (E-B3), so
@@ -334,6 +346,15 @@ async def _execute_class_a(signal: dict) -> None:
     raw_size = config.COPY_CLASS_A_MAX_SIZE_USDC * state_multiplier * trust_score
     # Apply class-specific absolute ceiling (copy-trade business logic — stays here).
     class_capped = min(raw_size, config.COPY_CLASS_A_MAX_SIZE_USDC)
+    # Health-mode sizing throttle (List-B.md Step 2 — B1, D-B04): DEFENSIVE_MODE
+    # halves new entries, stacking multiplicatively with the wallet state
+    # multiplier already inside raw_size; the portfolio-percentage cap below
+    # still binds. FULL_HALT never reaches this line (dropped at Risk Gate 0).
+    health_mode = health_score.get_current_mode()
+    health_multiplier = (
+        config.HEALTH_DEFENSIVE_SIZE_MULTIPLIER if health_mode == "DEFENSIVE_MODE" else 1.0
+    )
+    class_capped *= health_multiplier
     # Route the portfolio-percentage cap through the single authoritative function,
     # matching coordinator/pipeline.py:733.  "copy_edge_class_a" falls through the
     # else-branch in position_size_check() to the standard MAX_SINGLE_TRADE_PCT (5%) cap.
@@ -343,8 +364,9 @@ async def _execute_class_a(signal: dict) -> None:
 
     logger.info(
         "[COPY_EXECUTOR][CLASS_A] Sizing | trust=%.3f state=%s multiplier=%.1f "
-        "raw=$%.2f capped=$%.2f",
+        "raw=$%.2f capped=$%.2f health_mode=%s health_mult=%.2f",
         trust_score, wallet_state, state_multiplier, raw_size, final_size,
+        health_mode, health_multiplier,
     )
 
     # ── Risk Gate 3: Portfolio exposure ───────────────────────────────────────

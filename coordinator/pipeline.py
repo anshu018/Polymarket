@@ -38,6 +38,7 @@ from monitoring.telegram_alerts import (
 )
 from coordinator.market_state import load_market_state, get_market_lock
 from coordinator import equity
+from monitoring import health_score
 
 logger = logging.getLogger(__name__)
 
@@ -676,6 +677,13 @@ async def _instrument_signal(
     return outcome_id, verdict, factor, headline_hash
 
 
+# Feed-latency probe state (List-B.md Step 2 — B1): the timing wrapper below
+# records end-to-end signal latency for the health feed-latency component for
+# signals that actually reached the News Analyst (pre-analyst drops — no market
+# match, equity/health gate — do not exercise the feed and are not observed).
+_LATENCY_PROBE: dict[str, Any] = {"used_analyst": False, "fast": None}
+
+
 async def run_pipeline(
     headline: str,
     source: str,
@@ -698,9 +706,80 @@ async def run_pipeline(
     """
     Executes the Dual-Path trading pipeline coordinating News Analyst, Contract Parser,
     Trade Decision Agent, risk engine checks, aggregate coordinators, and idempotency.
+
+    Thin timing wrapper (List-B.md Step 2 — B1): measures end-to-end wall time
+    and records it for the health feed-latency component when the signal
+    reached the News Analyst; the pipeline body is _run_pipeline_impl.
+    """
+    started = time.monotonic()
+    _LATENCY_PROBE["used_analyst"] = False
+    _LATENCY_PROBE["fast"] = None
+    try:
+        result = await _run_pipeline_impl(
+            headline=headline,
+            source=source,
+            market_id=market_id,
+            market_question=market_question,
+            resolution_criteria=resolution_criteria,
+            market_price=market_price,
+            portfolio_value=portfolio_value,
+            starting_balances=starting_balances,
+            current_balances=current_balances,
+            available_liquidity=available_liquidity,
+            current_market_liquidity=current_market_liquidity,
+            signal_source=signal_source,
+            strategy_override=strategy_override,
+            wallet_address=wallet_address,
+            was_priority_pick=was_priority_pick,
+            slippage=slippage,
+            trader_name=trader_name,
+        )
+    except asyncio.CancelledError:
+        # A cancelled signal was truncated, not processed — never a latency
+        # observation (it would read as fast and flatter the component).
+        raise
+    else:
+        if _LATENCY_PROBE["used_analyst"]:
+            health_score.record_signal_latency(
+                time.monotonic() - started, fast_path=bool(_LATENCY_PROBE["fast"])
+            )
+        return result
+
+
+async def _run_pipeline_impl(
+    headline: str,
+    source: str,
+    market_id: Optional[str] = None,
+    market_question: Optional[str] = None,
+    resolution_criteria: Optional[str] = None,
+    market_price: Optional[float] = None,
+    portfolio_value: Optional[float] = None,
+    starting_balances: Optional[dict[str, float]] = None,
+    current_balances: Optional[dict[str, float]] = None,
+    available_liquidity: float = 10000.0,
+    current_market_liquidity: float = 10000.0,
+    signal_source: Optional[str] = "news_velocity",
+    strategy_override: Optional[str] = None,
+    wallet_address: Optional[str] = None,
+    was_priority_pick: bool = False,
+    slippage: float = 0.0,
+    trader_name: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """
+    Pipeline body (called by the run_pipeline timing wrapper).
     """
     now_str = datetime.now(timezone.utc).isoformat()
     logger.info(f"[{now_str}] [PIPELINE] Received new signal: '{headline}' from {source}")
+
+    # Part B Step 2 (B1): health-mode enforcement — FULL_HALT drops the signal
+    # at the TOP, before any LLM token burn (counter + alert live in
+    # monitoring.health_score). Cache-only read: zero DB calls on the trade
+    # path (the Supabase call-order tests are unaffected). Exits are NEVER
+    # gated here (D-B04).
+    if health_score.get_current_mode() == "FULL_HALT":
+        health_score.increment_gate_drop("health:full_halt")
+        logger.warning(f"[PIPELINE][DROP:health:full_halt] market_id={market_id}")
+        return {"status": "blocked", "reason": "health_full_halt"}
 
     # Part B Step 1 (B2): real period-start anchors from the equity snapshot
     # service (daily_performance). Fail-closed: stale or unavailable equity
@@ -855,6 +934,8 @@ async def run_pipeline(
 
     # Update category based on analyst decision
     category = news_output.event_category
+    # The signal exercised the feed (analyst ran) — it is a latency observation.
+    _LATENCY_PROBE["used_analyst"] = True
 
     # 3. Cache check for Fast Path eligibility
     # Fast path: News Analyst confidence > 0.87 AND category pre-validated
@@ -882,6 +963,7 @@ async def run_pipeline(
                     logger.info(f"[PIPELINE] FAST PATH TRIGGERED for market {market_id}!")
 
     # 4. Pipeline Execution Routing
+    _LATENCY_PROBE["fast"] = is_fast_path
     was_memoryless = False
     
     if is_fast_path:
@@ -1223,6 +1305,17 @@ async def run_pipeline(
     raw_size *= allocation.weight
     if allocation.probation:
         raw_size *= config.PROBATION_SIZE_MULTIPLIER
+    # Health-mode sizing throttle (List-B.md Step 2 — B1, D-B04): DEFENSIVE_MODE
+    # halves new entries. Stacks MULTIPLICATIVELY with the allocation weight and
+    # the probation multiplier above (both are safety multipliers); the hard
+    # position/market caps below still bind the stacked size. FULL_HALT never
+    # reaches this line (dropped at the top). The stacking is documented in the
+    # mandatory [OBSERVABILITY][SIZING] line below.
+    health_mode = health_score.get_current_mode()
+    health_multiplier = (
+        config.HEALTH_DEFENSIVE_SIZE_MULTIPLIER if health_mode == "DEFENSIVE_MODE" else 1.0
+    )
+    raw_size *= health_multiplier
     if raw_size <= 0.0:
         _increment_drop("allocation:zero_weight")
         logger.info(
@@ -1384,12 +1477,16 @@ async def run_pipeline(
         # records the Kelly inputs/outputs and which limit actually bound the
         # final size (kelly_fraction | position_cap | market_ceiling |
         # cash_reserve | net_edge_zero — the last two on their drop paths).
+        # health_mode/health_mult (List-B.md Step 2 — B1) document the
+        # DEFENSIVE multiplier's stacking with the allocation multipliers.
         logger.info(
             "[OBSERVABILITY][SIZING] market=%s strategy=%s p_model=%.4f n=%d w=%.4f "
-            "p_used=%.4f p_side=%.4f kelly_raw=$%.2f kelly_capped=$%.2f binding_constraint=%s",
+            "p_used=%.4f p_side=%.4f kelly_raw=$%.2f kelly_capped=$%.2f binding_constraint=%s "
+            "health_mode=%s health_mult=%.2f",
             market_id, strategy_for_check, estimated_probability,
             estimate.sample_size, kelly_shrink_weight, p_used_yes, p_side,
             kelly_raw, final_trade_size, binding_constraint,
+            health_mode, health_multiplier,
         )
 
         # Book-aware paper fill (List A.md Step 5 — A5): no more idealized fills.
