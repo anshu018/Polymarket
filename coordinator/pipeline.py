@@ -38,6 +38,7 @@ from monitoring.telegram_alerts import (
 )
 from coordinator.market_state import load_market_state, get_market_lock
 from coordinator import equity
+from coordinator import lease
 from monitoring import health_score
 
 logger = logging.getLogger(__name__)
@@ -1403,8 +1404,51 @@ async def _run_pipeline_impl(
     logger.info(f"[PIPELINE] Initial risk gates passed! Checking per-market tranche gate...")
 
     # ── Per-Market Tranche Gate & Concurrency Lock ──────────────────────────
+    # Bounded wait (List-B.md Step 3 — B4): the wait for the process-local
+    # lock is capped at LOCK_ACQUIRE_TIMEOUT_SECONDS; a timeout is a
+    # fail-closed drop (lock:timeout) — never queue-jump, never proceed
+    # unguarded. asyncio.timeout is deliberate (ground rule 9: wait_for
+    # swallows external cancellation). A TimeoutError can only mean the
+    # acquire was cancelled mid-wait — asyncio.Lock never leaves the lock
+    # held on a cancelled acquire — so dropping here cannot strand it.
     market_lock = get_market_lock(market_id)
-    async with market_lock:
+    try:
+        async with asyncio.timeout(config.LOCK_ACQUIRE_TIMEOUT_SECONDS):
+            await market_lock.acquire()
+    except TimeoutError:
+        lease.record_drop("lock:timeout")
+        logger.warning(
+            "[PIPELINE][DROP:lock:timeout] market_id=%s waited >%ds for the "
+            "market lock — dropping fail-closed",
+            market_id, config.LOCK_ACQUIRE_TIMEOUT_SECONDS,
+        )
+        return {"status": "blocked", "reason": "lock_timeout"}
+
+    # Cross-process lease (Step 3 — B4, D-B02/D-B13): the asyncio lock only
+    # guards THIS process; an overlapping deploy runs its own registry. The
+    # lease is claimed second (process-local lock first, lease second —
+    # defense in depth) and released in the finally below — every path out
+    # of this section releases both, in LIFO order. A non-CLAIMED outcome is
+    # fail-closed (lease:conflict / lease:error — the counters live in
+    # coordinator.lease; residual risk: a hung holder's lease expires, the
+    # DB-level re-checks below are the second line of defense).
+    lease_owner = lease.get_instance_id()
+    lease_held = False
+    try:
+        lease_outcome = await lease.acquire_lease(
+            market_id, lease_owner, config.LEASE_TTL_SECONDS
+        )
+        if lease_outcome is not lease.LeaseOutcome.CLAIMED:
+            logger.warning(
+                "[PIPELINE][DROP:%s] market_id=%s could not claim the "
+                "cross-process lease — dropping fail-closed",
+                "lease:conflict" if lease_outcome is lease.LeaseOutcome.CONFLICT
+                else "lease:error",
+                market_id,
+            )
+            return {"status": "blocked", "reason": "lease_conflict"}
+        lease_held = True
+
         state = await load_market_state(market_id, decision_direction)
         if state is None:
             logger.warning("[PIPELINE] Could not load market state for market %s — fail closed", market_id)
@@ -1609,6 +1653,10 @@ async def _run_pipeline_impl(
             resting_price=resting_price,
         )
 
+    finally:
+        if lease_held:
+            await lease.release_lease(market_id, lease_owner)
+        market_lock.release()
     # Log to copytrade_log for trust scoring and audit trail (Class B)
     if strategy_override == "copy_edge_class_b" and wallet_address:
         try:

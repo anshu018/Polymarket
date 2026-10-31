@@ -175,6 +175,15 @@ class MockSupabaseClient:
     def table(self, name: str) -> MockTableBuilder:
         return MockTableBuilder(self.db_state, name)
 
+    def rpc(self, fn_name: str, params: dict[str, Any]) -> Any:
+        # List-B Step 3 (B4): the entry critical sections claim a cross-process
+        # lease via client.rpc("claim_market_lease", ...) before
+        # load_market_state. The shared builder in tests/lease_mock.py mirrors
+        # the SQL function's atomic conditional upsert so every mock's lease
+        # semantics cannot drift.
+        from tests.lease_mock import MockRpcBuilder
+        return MockRpcBuilder(self.db_state, fn_name, params)
+
 
 @pytest.fixture
 def db_state() -> dict[str, list[dict[str, Any]]]:
@@ -225,6 +234,7 @@ def mock_supabase_client(db_state: dict[str, list[dict[str, Any]]]) -> Generator
     try:
         with patch("coordinator.pipeline.get_client", fake_get_client), \
              patch("coordinator.equity.get_client", fake_get_client), \
+             patch("coordinator.lease.get_client", fake_get_client), \
              patch("llm.contract_parser.get_client", fake_get_client), \
              patch("llm.trade_decision.get_client", fake_get_client), \
              patch("strategies.calibration.get_client", fake_get_client), \
@@ -951,7 +961,9 @@ async def test_6_9_idempotency_timeout_fails_closed(
     # Supabase call sequence with market tranche checks (Step 2 adds the
     # novelty window read as Call 1 — the pipeline hook runs before the analyst;
     # Step 3 adds the allocation ledger read as Call 6 — after the net-edge
-    # gate, before the exposure fetch):
+    # gate, before the exposure fetch; List-B Step 3 adds the lease-claim RPC
+    # as Call 8 — INSIDE the market-lock critical section, between the
+    # exposure fetch and load_market_state):
     # Call 1: novelty window read (succeeds)
     # Call 2: load_market_state pre-check (succeeds)
     # Call 3: _check_cache (no hit)
@@ -959,9 +971,10 @@ async def test_6_9_idempotency_timeout_fails_closed(
     # Call 5: fetch_relevant_lessons (succeeds)
     # Call 6: allocation history read (closed_trades — succeeds)
     # Call 7: fetch_open_positions_exposure (succeeds)
-    # Call 8: load_market_state inside market_lock (succeeds)
-    # Call 9: check_pre_order_idempotency (times out!)
-    mock_supabase_client.timeout_on_calls = {9}
+    # Call 8: claim_market_lease RPC inside market_lock (succeeds)
+    # Call 9: load_market_state inside market_lock (succeeds)
+    # Call 10: check_pre_order_idempotency (times out!)
+    mock_supabase_client.timeout_on_calls = {10}
 
     with pytest.raises(RuntimeError, match="Trading halted due to idempotency (check|write) timeout"):
         await run_pipeline(
@@ -975,6 +988,11 @@ async def test_6_9_idempotency_timeout_fails_closed(
             starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
             current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
         )
+
+    # List-B Step 3 (B4): the lease is released on the exception path too —
+    # the section's finally runs before the RuntimeError propagates, so the
+    # market is not stranded behind a TTL for the next legitimate entry.
+    assert mock_supabase_client.db_state.get("market_leases", []) == []
 
 
 @pytest.mark.anyio
@@ -1194,3 +1212,117 @@ async def test_copy_trade_class_b_end_to_end_flow(
     # Bayesian: (18+1+5)/(18+2+1+10) = 24/31
     expected_trust = 24.0 / 31.0
     assert abs(w["trust_score"] - expected_trust) < 0.001
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# List-B Step 3 (B4): bounded lock wait + cross-process lease on the entry
+# critical section. Counters live in coordinator.lease (service-module
+# precedent); drop deltas are asserted (the module is process-wide).
+# ─────────────────────────────────────────────────────────────────────────────
+
+from coordinator import lease as _lease_module
+from coordinator.market_state import get_market_lock as _get_market_lock
+from coordinator.market_state import reset_market_locks as _reset_market_locks
+
+
+def _seed_foreign_lease(db_state: dict[str, list[dict[str, Any]]], market_id: str) -> None:
+    """A live lease held by another process (never expires inside a test)."""
+    db_state.setdefault("market_leases", []).append({
+        "market_id": market_id,
+        "owner": "other-process",
+        "lease_until": (datetime.now(timezone.utc) + timedelta(seconds=3600)).isoformat(),
+    })
+
+
+@pytest.mark.anyio
+async def test_lock_timeout_drops_fail_closed(
+    mock_supabase_client: MockSupabaseClient,
+    mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
+) -> None:
+    """A stuck in-process lock holder must not queue entries forever: the
+    bounded wait expires → fail-closed drop (lock:timeout), BEFORE any lease
+    claim — no DB row may exist and no order may be written."""
+    _reset_market_locks()
+    lock = _get_market_lock("P1")
+    await lock.acquire()  # simulate a stuck holder inside this process
+    drops_before = _lease_module.get_drop_counters()["lock:timeout"]
+    try:
+        with patch.object(config, "LOCK_ACQUIRE_TIMEOUT_SECONDS", 0.05):
+            res = await run_pipeline(
+                headline="Donald Trump impeachment",
+                source="AP News",
+                market_id="P1",
+                market_question="Question?",
+                resolution_criteria="Resolves YES.",
+                market_price=0.55,
+                portfolio_value=10000.0,
+                starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+                current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+            )
+    finally:
+        lock.release()
+    assert res is not None
+    assert res["status"] == "blocked"
+    assert res["reason"] == "lock_timeout"
+    assert _lease_module.get_drop_counters()["lock:timeout"] == drops_before + 1
+    # Dropped before the lease section — nothing claimed, nothing written.
+    assert mock_supabase_client.db_state.get("market_leases", []) == []
+    assert mock_supabase_client.db_state["open_positions"] == []
+    assert mock_supabase_client.db_state["idempotency_log"] == []
+
+
+@pytest.mark.anyio
+async def test_lease_conflict_drops_fail_closed(
+    mock_supabase_client: MockSupabaseClient,
+    mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
+) -> None:
+    """Another live process holds the market lease → the entry drops before
+    load_market_state inside the section (no state mutation, no order)."""
+    mock_llm_apis["news_analyst_confidence"] = 0.80
+    _seed_foreign_lease(mock_supabase_client.db_state, "P1")
+    drops_before = _lease_module.get_drop_counters()["lease:conflict"]
+
+    res = await run_pipeline(
+        headline="Donald Trump impeachment",
+        source="AP News",
+        market_id="P1",
+        market_question="Question?",
+        resolution_criteria="Resolves YES.",
+        market_price=0.55,
+        portfolio_value=10000.0,
+        starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+        current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+    )
+
+    assert res is not None
+    assert res["status"] == "blocked"
+    assert res["reason"] == "lease_conflict"
+    assert _lease_module.get_drop_counters()["lease:conflict"] == drops_before + 1
+    assert mock_supabase_client.db_state["open_positions"] == []
+    assert mock_supabase_client.db_state["idempotency_log"] == []
+
+
+@pytest.mark.anyio
+async def test_lease_released_after_successful_entry(
+    mock_supabase_client: MockSupabaseClient,
+    mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
+) -> None:
+    """The success path releases the lease in the finally — no row survives
+    the critical section (a leaked row would block this market for a TTL)."""
+    res = await run_pipeline(
+        headline="Donald Trump impeachment",
+        source="AP News",
+        market_id="P1",
+        market_question="Question?",
+        resolution_criteria="Resolves YES.",
+        market_price=0.55,
+        portfolio_value=10000.0,
+        starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+        current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+    )
+    assert res is not None
+    assert res["status"] == "success"
+    assert mock_supabase_client.db_state.get("market_leases", []) == []

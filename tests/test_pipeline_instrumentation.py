@@ -128,6 +128,15 @@ class MockSupabaseClient:
     def table(self, name: str) -> MockTableBuilder:
         return MockTableBuilder(self.db_state, name, self.fail_tables)
 
+    def rpc(self, fn_name: str, params: dict[str, Any]) -> Any:
+        # List-B Step 3 (B4): the entry critical sections claim a cross-process
+        # lease via client.rpc("claim_market_lease", ...) before
+        # load_market_state. The shared builder in tests/lease_mock.py mirrors
+        # the SQL function's atomic conditional upsert so every mock's lease
+        # semantics cannot drift.
+        from tests.lease_mock import MockRpcBuilder
+        return MockRpcBuilder(self.db_state, fn_name, params)
+
 
 # ── Fixtures + helpers ────────────────────────────────────────────────────────
 
@@ -165,6 +174,7 @@ def patch_db(db_state: dict[str, list[dict[str, Any]]],
     for target in (
         "memory.supabase_client.get_client",
         "coordinator.pipeline.get_client",
+        "coordinator.lease.get_client",
         "llm.contract_parser.get_client",
         "strategies.estimator.get_client",
         "copytrade.performance_tracker.get_client",

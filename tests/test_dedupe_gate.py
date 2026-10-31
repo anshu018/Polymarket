@@ -160,6 +160,13 @@ class MockTableBuilder:
                     break
             if match:
                 matched.append(r.copy())
+        # List-B Step 3 (B4): honor delete — the lease release path DELETEs its
+        # row in a finally, and the mock must reflect production semantics so
+        # release-behavior assertions stay honest. (The attribute existed but
+        # execute() ignored it; no prior test relied on the no-op.)
+        if self._is_delete:
+            kept = [r for r in rows if not all(r.get(c) == v for c, v in self.filters)]
+            self.db_state[self.table_name] = kept
         return Result(matched)
 
     def insert(self, data: Any) -> "MockTableBuilder":
@@ -194,6 +201,15 @@ class MockSupabaseClient:
     def table(self, name: str) -> MockTableBuilder:
         return MockTableBuilder(self.db_state, name)
 
+    def rpc(self, fn_name: str, params: dict[str, Any]) -> Any:
+        # List-B Step 3 (B4): the entry critical sections claim a cross-process
+        # lease via client.rpc("claim_market_lease", ...) before
+        # load_market_state. The shared builder in tests/lease_mock.py mirrors
+        # the SQL function's atomic conditional upsert so every mock's lease
+        # semantics cannot drift.
+        from tests.lease_mock import MockRpcBuilder
+        return MockRpcBuilder(self.db_state, fn_name, params)
+
 
 @pytest.fixture
 def mock_db():
@@ -212,6 +228,7 @@ def mock_db():
 
     with patch("memory.supabase_client.get_client", fake_get_client), \
          patch("coordinator.pipeline.get_client", fake_get_client), \
+         patch("coordinator.lease.get_client", fake_get_client), \
          patch("copytrade.executor.get_client", fake_get_client), \
          patch("llm.contract_parser.get_client", fake_get_client):
         yield state
