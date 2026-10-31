@@ -540,7 +540,11 @@ async def test_non_copy_trade_resolution_does_not_call_resolve_copy_trade(
             nonlocal resolve_call_count
             resolve_call_count += 1
 
-        with patch("execution.reconciliation.get_polymarket_client", return_value=mock_clob),              patch("httpx.AsyncClient.get", mock_get),              patch("config.PAPER_TRADING", True),              patch("execution.reconciliation._resolve_copy_trade", fake_resolve_copy_trade):
+        with patch("execution.reconciliation.get_polymarket_client", return_value=mock_clob),              patch("httpx.AsyncClient.get", mock_get),              patch("config.PAPER_TRADING", True),              patch("copytrade.performance_tracker.resolve_copy_trade", fake_resolve_copy_trade):
+            # Patch target moved (List-B Step 4 — B3): the trust update is now
+            # called INSIDE the shared close path (execution/position_close.py,
+            # D-B08), late-bound on the performance_tracker module; the intent
+            # (non-copy resolutions must not touch wallet trust) is unchanged.
             await reconcile_on_startup()
 
         assert resolve_call_count == 0, (

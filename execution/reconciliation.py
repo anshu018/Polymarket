@@ -13,11 +13,11 @@ from typing import Any, Tuple, Optional
 import config
 from memory.supabase_client import get_client
 from execution.polymarket_auth import get_polymarket_client
+from execution.position_close import close_position
 from monitoring.telegram_alerts import (
     alert_reconciliation_failure,
     alert_system_halt,
 )
-from copytrade.performance_tracker import resolve_copy_trade as _resolve_copy_trade
 
 # Try importing CLOB types safely
 try:
@@ -75,66 +75,26 @@ async def _supabase_delete_position(pos_id: str) -> None:
     await asyncio.wait_for(_delete(), timeout=config.SUPABASE_TIMEOUT_SECONDS)
 
 
-async def _supabase_move_to_closed(pos: dict[str, Any], exit_price: float, outcome: str) -> None:
-    """Move a resolved position to closed_trades under 2s timeout."""
-    async def _move() -> None:
-        client = await get_client()
-        
-        # Calculate PnL
-        entry_price = float(pos["entry_price"])
-        size_usdc = float(pos["position_size_usdc"])
-        qty = size_usdc / entry_price
-        
-        exit_value = qty * exit_price
-        pnl = exit_value - size_usdc
-        pnl_pct = (pnl / size_usdc) * 100.0 if size_usdc > 0 else 0.0
-        
-        # Approximate Brier score contribution: (prob_estimate - outcome_value)^2
-        agent_est = float(pos.get("agent_estimate") or entry_price)
-        outcome_val = 1.0 if outcome == "win" else 0.0
-        brier = (agent_est - outcome_val) ** 2
-        
-        # Insert closed trade record
-        client.table("closed_trades").insert({
-            "market_id": pos["market_id"],
-            "market_question": pos.get("market_question"),
-            "direction": pos["direction"],
-            "entry_price": entry_price,
-            "exit_price": exit_price,
-            "position_size_usdc": size_usdc,
-            "pnl_usdc": pnl,
-            "pnl_percent": pnl_pct,
-            "strategy": pos.get("strategy", "recalibration"),
-            "agent_estimate": agent_est,
-            "confidence_at_entry": pos.get("confidence_at_entry"),
-            "brier_contribution": brier,
-            "category": pos.get("category"),
-            "outcome": outcome,
-            "exit_reason": "resolved",
-            "opened_at": pos.get("opened_at"),
-            "closed_at": datetime.now(timezone.utc).isoformat(),
-            "was_memoryless": False,
-            "notes": "Resolved during agent downtime startup reconciliation.",
-            # Attribution passthrough (List A.md Step 3 — A7): the entry's
-            # self-description rides along so every closed trade keeps its
-            # thesis and edge context. NULL for pre-Step-3 open rows.
-            "thesis_id": pos.get("thesis_id"),
-            "p_model_at_entry": pos.get("p_model_at_entry"),
-            "market_price_at_entry": pos.get("market_price_at_entry"),
-            "net_edge_at_entry": pos.get("net_edge_at_entry"),
-            "costs_paid_usdc": pos.get("costs_paid_usdc"),
-            "order_type": pos.get("order_type"),
-            # Fill passthrough (List A.md Step 5 — A5): the simulated fill rides
-            # along so the gate report can measure decision-vs-fill slippage on
-            # closed trades. NULL for pre-Step-5 open rows.
-            "fill_price": pos.get("fill_price"),
-            "fill_type": pos.get("fill_type")
-        }).execute()
-        
-        # Delete from open_positions
-        client.table("open_positions").delete().eq("id", pos["id"]).execute()
+async def fetch_order_status(order_id: str) -> Optional[str]:
+    """Query the live Polymarket order status (uppercased; "" when the order
+    carries no status). None means the query FAILED — the caller leaves the
+    pending log untouched for a later pass.
 
-    await asyncio.wait_for(_move(), timeout=config.SUPABASE_TIMEOUT_SECONDS)
+    Shared by startup reconciliation and the runtime stuck-pending sweep's
+    live branch (Step 4 — B3); extracted verbatim from the startup
+    pending-log block so there is one order-status implementation."""
+    try:
+        client = get_polymarket_client()
+
+        async def _fetch_ord() -> dict[str, Any]:
+            return client.get_order(order_id)
+
+        order_details = await asyncio.wait_for(_fetch_ord(), timeout=config.POLYMARKET_API_TIMEOUT_SECONDS)
+        return str(order_details.get("status", "")).upper()
+
+    except Exception as e:
+        logger.error(f"[RECONCILIATION] Failed to fetch order {order_id} status: {e}")
+        return None
 
 
 async def _supabase_update_idempotency_log(log_id: str, status: str, order_id: Optional[str] = None, reason: Optional[str] = None) -> None:
@@ -256,7 +216,7 @@ async def reconcile_on_startup() -> None:
                         outcome_prices = json.loads(outcome_prices)
                     if isinstance(outcomes, str):
                         outcomes = json.loads(outcomes)
-                    
+
                     exit_price = 0.0
                     if outcomes and outcome_prices:
                         dir_match = "Yes" if direction.upper() == "YES" else "No"
@@ -265,34 +225,20 @@ async def reconcile_on_startup() -> None:
                             exit_price = float(outcome_prices[idx])
                         except (ValueError, IndexError):
                             pass
-                    
-                    outcome = "win" if exit_price == 1.0 else "loss"
-                    logger.info(f"[RECONCILIATION] [PAPER_TRADING] Market {market_id} resolved (exit price={exit_price}). Closing position.")
-                    await _supabase_move_to_closed(pos, exit_price, outcome)
 
-                    # Wire trust-score update for copy-trade positions.
-                    # Only fires for copy_edge_class_a / copy_edge_class_b strategy tags.
-                    # Uses idempotency_uuid (not market_id) to avoid attributing the
-                    # resolution to the wrong wallet when two wallets copied the same market.
-                    if pos.get("strategy", "").startswith("copy_edge_class_"):
-                        try:
-                            await _resolve_copy_trade(
-                                market_id=market_id,
-                                direction=direction,
-                                exit_price=exit_price,
-                                entry_price=entry_price,
-                                size_usdc=size_usdc,
-                                idempotency_uuid=pos.get("idempotency_uuid"),
-                            )
-                            logger.info(
-                                "[RECONCILIATION] [PAPER_TRADING] Trust score updated for copy-trade %s",
-                                market_id,
-                            )
-                        except Exception as ct_err:
-                            logger.error(
-                                "[RECONCILIATION] [PAPER_TRADING] resolve_copy_trade failed for %s: %s",
-                                market_id, ct_err,
-                            )
+                    logger.info(f"[RECONCILIATION] [PAPER_TRADING] Market {market_id} resolved (exit price={exit_price}). Closing position.")
+                    # The ONE shared close path (List-B.md Step 4 — B3, D-B08):
+                    # ledger row, open-row deletion, and the copy-trade trust
+                    # update all flow through execution/position_close.py.
+                    db_client = await get_client()
+                    await close_position(
+                        db_client,
+                        pos,
+                        exit_price=exit_price,
+                        exit_type="resolved",
+                        exit_reason="resolved",
+                        notes="Resolved during agent downtime startup reconciliation.",
+                    )
                 else:
                     logger.info(f"[RECONCILIATION] [PAPER_TRADING] Market {market_id} is active. Keeping position.")
                 continue
@@ -353,9 +299,18 @@ async def reconcile_on_startup() -> None:
                 winning_outcome = market.get("outcome") or market.get("winning_outcome")
                 outcome = "win" if winning_outcome == direction else "loss"
                 exit_price = 1.0 if outcome == "win" else 0.0
-                
+
                 logger.info(f"[RECONCILIATION] Market {market_id} resolved as {winning_outcome} during downtime. Closing position.")
-                await _supabase_move_to_closed(pos, exit_price, outcome)
+                # The ONE shared close path (List-B.md Step 4 — B3, D-B08).
+                db_client = await get_client()
+                await close_position(
+                    db_client,
+                    pos,
+                    exit_price=exit_price,
+                    exit_type="resolved",
+                    exit_reason="resolved",
+                    notes="Resolved during agent downtime startup reconciliation.",
+                )
             else:
                 # Active market, but actual balance is 0: unresolvable mismatch!
                 logger.critical(f"[RECONCILIATION] Mismatch on active market {market_id}: Supabase shows active position but Polymarket holds 0 shares.")
@@ -382,14 +337,9 @@ async def reconcile_on_startup() -> None:
 
         # If order_id was recorded, query Polymarket API for order status
         if order_id:
-            try:
-                async def _fetch_ord() -> dict[str, Any]:
-                    return client.get_order(order_id)
-                
-                order_details = await asyncio.wait_for(_fetch_ord(), timeout=config.POLYMARKET_API_TIMEOUT_SECONDS)
-                
+            status = await fetch_order_status(order_id)
+            if status is not None:
                 # Check status
-                status = order_details.get("status", "").upper()
                 if status in ["FILLED", "LIVE", "PARTIALLY_FILLED"]:
                     logger.info(f"[RECONCILIATION] Pending idempotency log {uuid_str} confirmed executed on Polymarket.")
                     await _supabase_update_idempotency_log(uuid_str, "confirmed")
@@ -397,11 +347,8 @@ async def reconcile_on_startup() -> None:
                     logger.info(f"[RECONCILIATION] Pending idempotency log {uuid_str} resolved as failed on Polymarket.")
                     await _supabase_update_idempotency_log(uuid_str, "failed", reason=f"Order status: {status}")
 
-            except Exception as e:
-                logger.error(f"[RECONCILIATION] Failed to fetch order {order_id} for idempotency log: {e}")
-                # We can't resolve this without confirming if we have the position on Polymarket
-                # If we don't have the position in Supabase and wallet shares show 0, we can flag it as failed.
-                pass
+            # status None: the order query failed — leave the log pending; a
+            # later pass re-checks (original behavior: log + pass).
         else:
             # No order_id recorded (e.g. timed out during post/submit)
             # Check if there is an active open position in Supabase matching this idempotency UUID
