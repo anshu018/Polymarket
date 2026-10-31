@@ -62,6 +62,17 @@ def test_claim_function_parameters_match_rpc_call_shape() -> None:
     assert "p_ttl_seconds INTEGER" in sql
 
 
+def test_rls_convergence_guard_registered() -> None:
+    """The migration converges a bare-RLS table (platform default, zero
+    policies — blocks the anon-key claim RPC entirely) back to the project's
+    RLS-off state, WITHOUT touching a table that has real policies (the
+    owner's future RLS enablement must never be fought by startup)."""
+    sql = _migration_sql()
+    assert "DISABLE ROW LEVEL SECURITY" in sql
+    assert "pg_policy" in sql, "guard must check for real policies, not blind-disable"
+    assert "relrowsecurity" in sql
+
+
 def test_scratch_sql_mirror_in_sync() -> None:
     """The operator-facing scratch mirror carries the same DDL (skip on a
     fresh clone — scratch/ is gitignored by design)."""

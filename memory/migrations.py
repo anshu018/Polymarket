@@ -326,6 +326,30 @@ SQL_MIGRATIONS = [
             RETURNING true;
         $func$;
         GRANT EXECUTE ON FUNCTION claim_market_lease(TEXT, TEXT, INTEGER) TO anon;
+        -- RLS convergence guard: the platform has been observed enabling RLS
+        -- on newly created tables (2026-10-31: market_leases came up with RLS
+        -- on and zero policies — a bare RLS gate blocks the bot's anon-key
+        -- claim RPC with 42501 entirely). Project-wide state is RLS-off until
+        -- the owner's RLS decision lands, so disable ONLY the bare case:
+        -- when real policies exist (the owner's future enablement), leave
+        -- the table untouched — this migration must never fight it.
+        DO $rls_guard$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public' AND c.relname = 'market_leases'
+                  AND c.relrowsecurity
+            ) AND NOT EXISTS (
+                SELECT 1 FROM pg_policy pol
+                JOIN pg_class c ON c.oid = pol.polrelid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public' AND c.relname = 'market_leases'
+            ) THEN
+                ALTER TABLE public.market_leases DISABLE ROW LEVEL SECURITY;
+            END IF;
+        END
+        $rls_guard$;
         """
     },
     {
