@@ -44,7 +44,18 @@ async def _market_cache_loop() -> None:
 async def main():
     try:
         logger.info("Starting up Polymarket Agent (Layer 1 Foundation)...")
-        
+
+        # 0. Liveness endpoint FIRST (crash hardening, 2026-11-01): the Docker
+        # HEALTHCHECK curls it. Serving from the very top covers the whole
+        # initialization window (spaCy load, migrations, reconciliation) —
+        # with the old `import main` probe, 3 slow checks during startup or a
+        # signal burst made Docker kill the container (the hard-kill crash
+        # signature of 2026-10-30/31). It runs on THIS event loop: a hung
+        # loop cannot answer → restart. True liveness, near-zero cost.
+        from monitoring.health_server import run_health_server
+        asyncio.create_task(run_health_server(), name="health_server")
+        logger.info("[HEALTH_SERVER] Liveness endpoint task started (first task).")
+
         # 3. Derive Polymarket credentials
         try:
             await initialize_polymarket_client()

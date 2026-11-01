@@ -15,7 +15,7 @@ RUN useradd -m appuser
 # Copy requirements first to leverage Docker layer caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN python -m spacy download en_core_web_lg
+RUN python -m spacy download en_core_web_sm
 
 # Copy all source code
 COPY . .
@@ -26,9 +26,19 @@ RUN chown -R appuser:appuser /app
 # Switch to the non-root user
 USER appuser
 
-# Use a healthcheck to ensure the container verifies main is importable
-HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
-  CMD python -c "import main" || exit 1
+# glibc malloc arena fragmentation is a notorious RSS creeper in threaded
+# Python containers (spaCy NER runs in executor threads); capping arenas is
+# standard practice and costs nothing.
+ENV MALLOC_ARENA_MAX=2
+
+# REAL liveness probe (crash hardening 2026-11-01): curl the bot's own
+# in-process /health endpoint instead of spawning a second Python importing
+# the whole app (`import main` cost ~200MB + CPU contention and probed nothing
+# about the running process; 3 slow checks during a signal burst or the
+# startup window made Docker kill the container). start-period covers
+# initialization; a hung event loop cannot answer → restart.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=120s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8077/health || exit 1
 
 # Environment variables are expected to be injected via --env-file from systemd
 # Command to run the agent

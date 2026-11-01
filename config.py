@@ -361,7 +361,26 @@ COPY_SIGNAL_QUEUE_MAXSIZE = 50         # Max in-flight unclassified signals
 COPY_EXECUTION_QUEUE_MAXSIZE = 20      # Max in-flight signals per execution class
 COPY_LIMIT_PRICE_BUFFER = 0.005        # +0.5 cents above tracker price for limit orders
 GAMMA_API_TIMEOUT_SECONDS = 8          # HTTP timeout for Gamma API calls
-SPACY_MODEL = "en_core_web_lg"            # Aligned with GEMINI.md (lg = higher NER accuracy)
+# ── LIVENESS PROBE (crash hardening, 2026-11-01) ─────────────────────────────
+# main.py serves a minimal HTTP liveness endpoint on localhost and the Docker
+# HEALTHCHECK curls it (execution of `import main` as a probe was REMOVED: it
+# spawned a full second Python importing the whole app chain every 60s —
+# ~200MB + CPU contention against the running bot — and probed nothing about
+# the running process; 3 slow checks = Docker killed the container, the exact
+# hard-kill crash signature seen 2026-10-30/31). The endpoint lives on the
+# same event loop, so a hung/blocked loop = no response = restart: true
+# liveness, near-zero cost.
+HEALTH_CHECK_PORT = 8077                 # localhost-only liveness endpoint port
+
+SPACY_MODEL = "en_core_web_sm"           # was en_core_web_lg (GEMINI.md alignment
+                                         # note): measured 708 MB RSS vs ~90 MB —
+                                         # the single largest allocation in the
+                                         # container and a primary OOM-crash
+                                         # contributor (D-B16). The junk filter
+                                         # only needs NER; on 10 real headlines
+                                         # lg and sm produced IDENTICAL
+                                         # pass/block decisions. Change back only
+                                         # with a re-measurement of container memory.
 
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 MIN_MARKET_VOLUME_USD = 500.0
