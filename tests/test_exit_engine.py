@@ -659,3 +659,193 @@ class TestReentryCooldown:
                 for node in ast.walk(tree) if isinstance(node, ast.Call)
             }
             assert "check_reentry_cooldown" in called, f"{rel} no longer enforces R6"
+
+
+
+# ── R5: exit-weakest-for-stronger (pipeline-only swap) ────────────────────────
+
+def _swap_victim(**overrides: Any) -> dict[str, Any]:
+    """A same-category position the engine would independently exit (R1: a
+    thin book), with a recorded edge the proxy math can move."""
+    overrides.setdefault("category", "politics")
+    overrides.setdefault("net_edge_at_entry", 0.02)
+    return _position_row(**overrides)
+
+
+def _swap_call(**overrides: Any):
+    kwargs: dict[str, Any] = {
+        "category": "politics",
+        "portfolio_value": 10000.0,
+        "proposed_pct": 0.04,
+        "category_exposure_pct": 0.10,
+        "incoming_net_edge": 0.05,
+        "now": NOW,
+    }
+    kwargs.update(overrides)
+    return ee.evaluate_swap_for_entry(**kwargs)
+
+
+class TestR5Swap:
+    @pytest.mark.anyio
+    async def test_swap_exits_the_victim_through_the_shared_path(self, exit_env):
+        victim = _swap_victim()
+        exit_env.db["open_positions"].append(victim)
+        exit_env.books[victim["market_id"]] = _book(depth=2500.0)  # R1 fires
+
+        out = await _swap_call()
+
+        assert out.performed is True
+        assert out.victim_market_id == victim["market_id"]
+        ledger = exit_env.db["closed_trades"]
+        assert len(ledger) == 1
+        assert ledger[0]["exit_type"] == "exit_swap"
+        assert "R5 swap" in ledger[0]["exit_reason"]
+        assert exit_env.db["open_positions"] == []
+        assert exit_env.db["market_leases"] == []  # lease released
+
+    @pytest.mark.anyio
+    async def test_no_incoming_edge_never_swaps(self, exit_env):
+        """Class A has no measured net edge — R5 never fires there (D-B09)."""
+        victim = _swap_victim()
+        exit_env.db["open_positions"].append(victim)
+        exit_env.books[victim["market_id"]] = _book(depth=2500.0)
+        out = await _swap_call(incoming_net_edge=None)
+        assert out.performed is False
+        assert len(exit_env.db["open_positions"]) == 1
+
+    @pytest.mark.anyio
+    async def test_no_victims_no_swap(self, exit_env):
+        out = await _swap_call()
+        assert out.performed is False
+
+    @pytest.mark.anyio
+    async def test_victim_must_be_independently_exit_worthy(self, exit_env):
+        victim = _swap_victim()
+        exit_env.db["open_positions"].append(victim)
+        exit_env.books[victim["market_id"]] = _book()  # healthy book — no rule
+        out = await _swap_call()
+        assert out.performed is False
+        assert "not independently exit-worthy" in out.reason
+        assert len(exit_env.db["open_positions"]) == 1
+
+    @pytest.mark.anyio
+    async def test_r4_partial_victim_frees_no_seat(self, exit_env):
+        victim = _swap_victim(entry_price=0.50)
+        exit_env.db["open_positions"].append(victim)
+        exit_env.books[victim["market_id"]] = _book(bid=0.50, ask=0.54)
+        exit_env.metadata[victim["market_id"]] = {
+            "end_date_iso": _iso(NOW + timedelta(hours=48))
+        }
+        out = await _swap_call()
+        assert out.performed is False
+        assert len(exit_env.db["open_positions"]) == 1  # not even reduced
+
+    @pytest.mark.anyio
+    async def test_margin_gates_the_swap(self, exit_env):
+        victim = _swap_victim()
+        exit_env.db["open_positions"].append(victim)
+        exit_env.books[victim["market_id"]] = _book(depth=2500.0)
+        # proxy = 0.02 + (0.50 − 0.60) = −0.08; incoming 0.05 → margin 0.13.
+        out = await _swap_call(incoming_net_edge=0.05)
+        assert out.performed is True
+
+    @pytest.mark.anyio
+    async def test_margin_not_met_no_swap(self, exit_env):
+        victim = _swap_victim(net_edge_at_entry=0.20)
+        exit_env.db["open_positions"].append(victim)
+        exit_env.books[victim["market_id"]] = _book(depth=2500.0)
+        # proxy = 0.20 + (0.50 − 0.60) = 0.10 > incoming 0.05 → no swap.
+        out = await _swap_call(incoming_net_edge=0.05)
+        assert out.performed is False
+        assert "margin not met" in out.reason
+
+    @pytest.mark.anyio
+    async def test_margin_boundary_exactly_at_threshold_no_swap(self, exit_env):
+        # proxy = 0.02 + (0.61 − 0.60) = 0.03; incoming 0.05 → margin exactly
+        # 0.02 — "more than SWAP_MARGIN_CENTS" is strict → no swap.
+        victim = _swap_victim()
+        exit_env.db["open_positions"].append(victim)
+        exit_env.books[victim["market_id"]] = _book(bid=0.59, ask=0.63, depth=2500.0)
+        out = await _swap_call(incoming_net_edge=0.05)
+        assert out.performed is False
+
+    @pytest.mark.anyio
+    async def test_weakest_victim_is_selected_and_only_one_swap(self, exit_env):
+        weak = _swap_victim(net_edge_at_entry=0.02)
+        strong = _swap_victim(net_edge_at_entry=0.05)
+        exit_env.db["open_positions"] = [weak, strong]
+        exit_env.books[weak["market_id"]] = _book(depth=2500.0)  # weak: R1 fires
+        exit_env.books[strong["market_id"]] = _book()            # strong: healthy
+
+        out = await _swap_call()
+
+        assert out.performed is True
+        assert out.victim_market_id == weak["market_id"]
+        assert [r["market_id"] for r in exit_env.db["open_positions"]] == [strong["market_id"]]
+        assert len(exit_env.db["closed_trades"]) == 1  # one swap, never multi
+
+    @pytest.mark.anyio
+    async def test_null_edge_sorts_weakest(self, exit_env):
+        """Class A rows record net_edge_at_entry=NULL — the weakest rank."""
+        class_a = _swap_victim(strategy="copy_edge_class_a", net_edge_at_entry=None)
+        pipeline_pos = _swap_victim(net_edge_at_entry=0.05)
+        exit_env.db["open_positions"] = [class_a, pipeline_pos]
+        exit_env.books[class_a["market_id"]] = _book(depth=2500.0)
+        exit_env.books[pipeline_pos["market_id"]] = _book()
+
+        out = await _swap_call()
+
+        assert out.performed is True
+        assert out.victim_market_id == class_a["market_id"]
+        # The proxy for a NULL-edge victim is the pure price move (0.0 base).
+        assert "proxy" in exit_env.db["closed_trades"][0]["exit_reason"]
+
+    @pytest.mark.anyio
+    async def test_swap_must_free_room_under_the_cap(self, exit_env):
+        victim = _swap_victim(position_size_usdc=10.0)  # victim_pct 0.001
+        exit_env.db["open_positions"].append(victim)
+        exit_env.books[victim["market_id"]] = _book(depth=2500.0)
+        # 0.29 − 0.001 + 0.04 = 0.329 > 0.30 → the swap buys nothing.
+        out = await _swap_call(category_exposure_pct=0.29)
+        assert out.performed is False
+        assert "not free room" in out.reason
+
+        # A larger victim frees real room: 0.29 − 0.04 + 0.04 = 0.29 <= 0.30.
+        big = _swap_victim(position_size_usdc=400.0)
+        exit_env.db["open_positions"] = [big]
+        exit_env.books[big["market_id"]] = _book(depth=2500.0)
+        out = await _swap_call(category_exposure_pct=0.29)
+        assert out.performed is True
+
+    @pytest.mark.anyio
+    async def test_category_read_failure_fails_closed(self):
+        class ExplodingClient:
+            def table(self, name: str) -> Any:
+                raise ConnectionError("mocked supabase outage")
+
+        async def fake_get_client():
+            return ExplodingClient()
+
+        with patch("execution.exit_engine.get_client", fake_get_client):
+            out = await _swap_call()
+        assert out.performed is False  # the signal stays dropped, as before
+
+    def test_r5_is_pipeline_only(self):
+        """Wiring contract: evaluate_swap_for_entry is called in the pipeline
+        and NOWHERE on the Class A executor path (estimate-free — no margin
+        comparison is possible honestly)."""
+        import ast
+        from pathlib import Path
+        root = Path(__file__).resolve().parent.parent
+        pipeline_tree = ast.parse((root / "coordinator/pipeline.py").read_text(encoding="utf-8"))
+        pipeline_calls = {
+            node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
+            for node in ast.walk(pipeline_tree) if isinstance(node, ast.Call)
+        }
+        assert "evaluate_swap_for_entry" in pipeline_calls
+        executor_tree = ast.parse((root / "copytrade/executor.py").read_text(encoding="utf-8"))
+        executor_calls = {
+            node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
+            for node in ast.walk(executor_tree) if isinstance(node, ast.Call)
+        }
+        assert "evaluate_swap_for_entry" not in executor_calls

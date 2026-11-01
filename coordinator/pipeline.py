@@ -1345,13 +1345,34 @@ async def _run_pipeline_impl(
     proposed_pct = final_trade_size / portfolio_value
 
     if risk_engine.check_category_exposure(cat_exp, proposed_pct) == "BLOCK":
-        logger.warning(
-            f"[PIPELINE] Risk check: category exposure would exceed 30%% cap | conf={clamped_conf:.4f} size=${final_trade_size:.2f}. Blocking."
+        # R5 exit-weakest-for-stronger (List-B Step 5 — B5): the ONE rule that
+        # runs on the ENTRY path. Strictly bounded: ONE swap attempt per
+        # signal, never recursive — the victim must independently hit a
+        # full-exit rule, trail the incoming edge by more than
+        # SWAP_MARGIN_CENTS, and free room. Any failure leaves the signal
+        # dropped exactly as before (no swap is fabricated). Correlation-cap
+        # swaps wait for Step 6 clusters.
+        swap = await exit_engine.evaluate_swap_for_entry(
+            category=category,
+            portfolio_value=portfolio_value,
+            proposed_pct=proposed_pct,
+            category_exposure_pct=cat_exp,
+            incoming_net_edge=breakdown.net_edge,
         )
-        _increment_drop("risk_gate:max_category_exposure")
-        _increment_drop("risk_gate:portfolio_capacity")
-        logger.info(f"[PIPELINE][DROP:risk_gate:max_category_exposure] market_id={market_id}")
-        return {"status": "blocked", "reason": "portfolio_capacity_full"}
+        if swap.performed:
+            logger.info(
+                "[PIPELINE][R5] swapped out %s (%s) — re-checking the cap once",
+                str(swap.victim_market_id)[:16], swap.reason,
+            )
+            cat_exp, corr_exp, open_pos_value = await fetch_open_positions_exposure(category)
+        if risk_engine.check_category_exposure(cat_exp, proposed_pct) == "BLOCK":
+            logger.warning(
+                f"[PIPELINE] Risk check: category exposure would exceed 30%% cap | conf={clamped_conf:.4f} size=${final_trade_size:.2f}. Blocking."
+            )
+            _increment_drop("risk_gate:max_category_exposure")
+            _increment_drop("risk_gate:portfolio_capacity")
+            logger.info(f"[PIPELINE][DROP:risk_gate:max_category_exposure] market_id={market_id}")
+            return {"status": "blocked", "reason": "portfolio_capacity_full"}
 
     if risk_engine.check_correlation_exposure(corr_exp + proposed_pct) == "BLOCK":
         logger.warning(

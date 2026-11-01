@@ -376,6 +376,10 @@ async def _execute_class_a(signal: dict) -> None:
     proposed_pct = final_size / portfolio_value
 
     if risk_engine.check_category_exposure(cat_exp, proposed_pct) == "BLOCK":
+        # R5 (List-B Step 5) is PIPELINE-ONLY by construction: the swap margin
+        # compares the incoming signal's MEASURED net edge, which the
+        # estimate-free Class A path does not have (and one is never
+        # fabricated — D-B09). The signal drops exactly as before.
         logger.warning("[COPY_EXECUTOR][CLASS_A][DROP:category_exposure] market=%s", market_id[:12])
         return
     if risk_engine.check_correlation_exposure(corr_exp + proposed_pct) == "BLOCK":

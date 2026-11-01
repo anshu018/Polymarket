@@ -632,6 +632,186 @@ async def check_reentry_cooldown(
     return CooldownVerdict(blocked=False, reason=f"cooldown expired ({age_hours:.1f}h ago)")
 
 
+# ── R5: exit-weakest-for-stronger (ENTRY path only — pipeline) ────────────────
+
+@dataclass(frozen=True)
+class SwapOutcome:
+    """R5's answer for one incoming signal."""
+
+    performed: bool
+    victim_market_id: Optional[str] = None
+    victim_direction: Optional[str] = None
+    reason: str = ""
+
+
+async def _fetch_category_positions(client: Any, category: str) -> list[dict[str, Any]]:
+    """Same-category open positions, oldest first."""
+    async def _read() -> list[dict[str, Any]]:
+        builder = (
+            client.table("open_positions")
+            .select("*")
+            .eq("category", category)
+            .order("opened_at")
+        )
+        res = await asyncio.to_thread(builder.execute)
+        return list(res.data or [])
+
+    async with asyncio.timeout(config.SUPABASE_TIMEOUT_SECONDS):
+        return await _read()
+
+
+def _victim_edge_proxy(row: dict[str, Any], own_mid: float) -> float:
+    """The victim's CURRENT net edge under the interim price-move proxy
+    (D-B09 family): the edge it recorded at entry (NULL = no measured edge —
+    never a fabricated model probability, so 0.0) drifted by its price move.
+    Upgrades to a real mark-vs-model edge when List A Step 6 lands."""
+    recorded = row.get("net_edge_at_entry")
+    entry_edge = float(recorded) if recorded is not None else 0.0
+    return entry_edge + (own_mid - float(row["entry_price"]))
+
+
+async def evaluate_swap_for_entry(
+    *,
+    category: str,
+    portfolio_value: float,
+    proposed_pct: float,
+    category_exposure_pct: float,
+    incoming_net_edge: Optional[float],
+    now: Optional[datetime] = None,
+) -> SwapOutcome:
+    """R5 (List-B Step 5): when an incoming signal passes every gate EXCEPT
+    the category-exposure cap, exit the weakest same-category position IF it
+    is independently exit-worthy, frees room, and trails the incoming edge.
+
+    Strictly bounded by spec: ONE swap attempt per signal (the single victim
+    = lowest net_edge_at_entry, NULL weakest), never recursive — the caller
+    re-checks the cap once and drops the signal if it still blocks.
+    Correlation-cap swaps wait for Step 6 clusters.
+
+    PIPLELINE-ONLY by construction: the margin compares the incoming
+    signal's MEASURED net edge, which only the pipeline computes — Class A
+    is estimate-free and fabricating an edge is forbidden (D-B09). No swap
+    is ever attempted without one.
+
+    The victim must trigger a FULL-exit rule via the same evaluator the
+    monitor loop uses (R1/R2/R3 — an R4 partial reduction frees no seat).
+    Every failure mode returns performed=False (the signal stays dropped —
+    exactly today's behavior); the swap exit itself runs under the victim's
+    market lease through the shared close path with exit_type='exit_swap'."""
+    checked_at = now or datetime.now(timezone.utc)
+    if incoming_net_edge is None:
+        return SwapOutcome(
+            False,
+            reason="no incoming net edge to compare (estimate-free path)",
+        )
+
+    try:
+        client = await get_client()
+        rows = await _fetch_category_positions(client, category)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning(
+            "[EXIT] R5 category read failed for %s — no swap (signal stays dropped): %s: %s",
+            category, type(e).__name__, e,
+        )
+        return SwapOutcome(False, reason="category position read failed")
+
+    candidates = [r for r in rows if not _is_resting_maker(r)]
+    if not candidates:
+        return SwapOutcome(False, reason="no same-category positions to swap")
+
+    candidates.sort(key=lambda r: (
+        float(r["net_edge_at_entry"])
+        if r.get("net_edge_at_entry") is not None else float("-inf")
+    ))
+    victim = candidates[0]
+    victim_market_id = str(victim.get("market_id") or "")
+    victim_direction = str(victim.get("direction") or "")
+
+    book = await get_market_book(victim_market_id)
+    if book is None:
+        return SwapOutcome(
+            False, victim_market_id=victim_market_id,
+            reason="victim book unavailable (no blind exits)",
+        )
+    end_dt = await _get_end_dt(victim_market_id, checked_at)
+
+    underlying = evaluate_exit_rules(
+        direction=victim_direction,
+        entry_price=float(victim["entry_price"]),
+        opened_at=_parse_ts(victim.get("opened_at")) or checked_at,
+        book=book,
+        end_dt=end_dt,
+        now=checked_at,
+    )
+    if underlying is None or underlying.partial:
+        return SwapOutcome(
+            False, victim_market_id=victim_market_id,
+            reason=(
+                "victim is not independently exit-worthy "
+                f"({underlying.rule + ' (partial)' if underlying else 'no rule hit'})"
+            ),
+        )
+
+    own_mid = _own_side_mid(book, victim_direction)
+    edge_proxy = _victim_edge_proxy(victim, own_mid)
+    if not (incoming_net_edge - edge_proxy > config.SWAP_MARGIN_CENTS):
+        return SwapOutcome(
+            False, victim_market_id=victim_market_id,
+            reason=(
+                f"margin not met: incoming {incoming_net_edge:.4f} vs victim "
+                f"proxy {edge_proxy:.4f} (need > {config.SWAP_MARGIN_CENTS})"
+            ),
+        )
+
+    victim_pct = float(victim["position_size_usdc"]) / portfolio_value
+    if (
+        category_exposure_pct - victim_pct + proposed_pct
+        > config.MAX_CATEGORY_EXPOSURE_PCT
+    ):
+        return SwapOutcome(
+            False, victim_market_id=victim_market_id,
+            reason="selling the victim would not free room under the category cap",
+        )
+
+    decision = ExitDecision(
+        rule=RULE_SWAP,
+        reason=(
+            f"R5 swap ({underlying.rule}: {underlying.reason}) — replaced by a "
+            f"stronger same-category signal (edge {incoming_net_edge:.4f} vs "
+            f"proxy {edge_proxy:.4f})"
+        ),
+        partial=False,
+        mark_price=underlying.mark_price,
+    )
+    logger.info(
+        "[OBSERVABILITY][R5] swap candidate market=%s dir=%s underlying=%s "
+        "edge_proxy=%.4f incoming=%.4f victim_pct=%.4f",
+        victim_market_id[:16], victim_direction, underlying.rule,
+        edge_proxy, incoming_net_edge, victim_pct,
+    )
+    try:
+        ran = await _exit_under_lease(client, victim, decision, book, checked_at)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error(
+            "[EXIT] R5 swap exit failed for %s (signal stays dropped): %s: %s",
+            victim_market_id[:16], type(e).__name__, e,
+        )
+        return SwapOutcome(
+            False, victim_market_id=victim_market_id,
+            reason="swap exit failed (signal stays dropped)",
+        )
+    return SwapOutcome(
+        performed=ran,
+        victim_market_id=victim_market_id,
+        victim_direction=victim_direction,
+        reason=decision.reason if ran else "swap exit did not complete (signal stays dropped)",
+    )
+
+
 # ── Tick + supervisor ────────────────────────────────────────────────────────
 
 async def run_exit_engine_once(now: Optional[datetime] = None) -> None:
