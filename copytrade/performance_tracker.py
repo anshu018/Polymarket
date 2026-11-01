@@ -533,6 +533,96 @@ async def resolve_copy_trade(
         logger.error("[TRUST] Failed to update tracked_wallets for %s: %s", wallet_address[:10], e)
 
 
+async def record_early_exit(
+    market_id: str,
+    direction: str,
+    exit_price: float,
+    entry_price: float,
+    size_usdc: float,
+    exit_type: str,
+    idempotency_uuid: Optional[str] = None,
+) -> bool:
+    """
+    Record an EARLY exit on the open copytrade_log row (List-B Step 5, D-B06/D-B20).
+
+    Called by the shared close path (execution/position_close.py) when a
+    copy-trade position is closed by an exit-engine rule (exit_type !=
+    'resolved'). Records WHAT happened on the copied position's ledger row —
+    status 'exited_early' + exit_type + the realized P&L for the audit trail —
+    and deliberately does NOT touch tracked_wallets or the trust caches:
+    wallet W/L/trust measures the WALLET's picks, and an early exit is the
+    operator's trade management, not the wallet's call. Only true resolutions
+    (resolve_copy_trade) move wallet state.
+
+    Args:
+        idempotency_uuid: Required. Same guard as resolve_copy_trade — the
+            copytrade_log row is looked up exclusively by this UUID; a
+            missing UUID logs CRITICAL and records nothing (a market_id
+            fallback would risk attributing the exit to the wrong wallet).
+
+    Returns:
+        True when a copytrade_log row was recorded; False when there was
+        nothing to record (missing UUID or no open row — e.g. already closed).
+    """
+    if entry_price <= 0:
+        return False
+
+    if not idempotency_uuid:
+        logger.critical(
+            "[TRUST] record_early_exit called without idempotency_uuid for market=%s "
+            "direction=%s — cannot safely identify the copytrade_log row. Recording "
+            "nothing to avoid wrong-wallet attribution. Investigate caller.",
+            market_id, direction,
+        )
+        return False
+
+    shares = size_usdc / entry_price
+    pnl = shares * (exit_price - entry_price)
+    pnl_percent = (exit_price - entry_price) / entry_price
+
+    async def _record() -> bool:
+        client = await get_client()
+        res = (
+            client.table("copytrade_log")
+            .select("id,wallet_address,trader_name")
+            .eq("idempotency_uuid", idempotency_uuid)
+            .eq("status", "open")
+            .limit(1)
+            .execute()
+        )
+        if not res.data:
+            return False
+        row = res.data[0]
+        client.table("copytrade_log").update({
+            "status": "exited_early",
+            "exit_type": exit_type,
+            "exit_price": exit_price,
+            "pnl_usdc": round(pnl, 4),
+            "pnl_percent": round(pnl_percent, 6),
+            "resolved_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", row["id"]).execute()
+        logger.info(
+            "[TRUST] Early exit recorded for %s (%s) | exit_type=%s pnl=%.4f — "
+            "wallet W/L/trust intentionally untouched (D-B06)",
+            row.get("trader_name", "unknown"), market_id[:12], exit_type, pnl,
+        )
+        return True
+
+    try:
+        async with asyncio.timeout(config.SUPABASE_TIMEOUT_SECONDS):
+            return await _record()
+    except asyncio.TimeoutError:
+        logger.error(
+            "[TRUST] record_early_exit timed out for %s — the copytrade_log row "
+            "may stay 'open' for a closed position (audit-trail gap, no wallet impact)",
+            market_id[:12],
+        )
+        return False
+    except Exception as e:
+        logger.error("[TRUST] Failed to record early exit for %s: %s", market_id[:12], e)
+        return False
+
+
 # ── Ranked wallet view ────────────────────────────────────────────────────────
 
 async def get_ranked_wallets() -> list[dict]:
