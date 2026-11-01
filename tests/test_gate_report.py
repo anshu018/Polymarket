@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from scripts.gate_report import (
+    aggregate_per_exit_type,
     aggregate_per_strategy,
     brier_bootstrap_ci,
     brier_pairs,
@@ -19,6 +20,8 @@ from scripts.gate_report import (
     cluster_values,
     evaluate_gate,
     evaluate_market_brier,
+    exit_type_stats,
+    is_resolution_row,
     market_yes_outcome,
     mean_brier,
     order_type_stats,
@@ -41,12 +44,14 @@ def closed_row(
     market_p: float | None = 0.50,
     fill: float | None = 0.52,
     fill_type: str | None = "taker",
+    exit_type: str | None = None,
 ) -> dict[str, Any]:
     return {
         "market_id": "mkt",
         "direction": direction,
         "strategy": strategy,
         "outcome": outcome,
+        "exit_type": exit_type,
         "thesis_id": thesis,
         "pnl_usdc": pnl,
         "net_edge_at_entry": 0.05,
@@ -375,3 +380,86 @@ class TestBuildReportAndRender:
 def datetime_now():
     from datetime import datetime, timezone
     return datetime.now(timezone.utc)
+
+
+
+# ââ Step 5 (B5): exit accounting â early exits leave the Brier sample, never the P&L ââ
+
+class TestExitAccounting:
+    def test_legacy_null_rows_are_resolutions(self):
+        # Rows predating the Step 5 column are all resolutions.
+        assert is_resolution_row({"exit_type": None}) is True
+        assert is_resolution_row({}) is True
+        assert is_resolution_row({"exit_type": "resolved"}) is True
+        assert is_resolution_row({"exit_type": "exit_swap"}) is False
+
+    def test_early_exits_leave_the_brier_sample_but_not_the_pnl(self):
+        rows = [
+            closed_row(),
+            closed_row(pnl=-4.0, outcome="loss", exit_type="exit_stop"),
+        ]
+        report = build_report(rows, [])
+        assert report["n_resolved"] == 1  # only the resolution feeds Brier/CI
+        assert report["exit_buckets"]["n_early"] == 1
+        assert report["exit_buckets"]["early"] == {"exit_stop": 1}
+        # Early exits COUNT in P&L (D-B05) â total over both rows.
+        assert report["total_net_pnl"] == pytest.approx(6.0)
+
+    def test_explicit_resolved_tag_stays_in_the_sample(self):
+        report = build_report([closed_row(exit_type="resolved")], [])
+        assert report["n_resolved"] == 1
+        assert report["exit_buckets"]["n_early"] == 0
+
+    def test_exit_type_stats_buckets_every_tag(self):
+        rows = [
+            closed_row(),
+            closed_row(exit_type="exit_stop"),
+            closed_row(exit_type="exit_stop"),
+            closed_row(exit_type="exit_swap"),
+        ]
+        stats = exit_type_stats(rows)
+        assert stats["resolved"] == 1
+        assert stats["early"] == {"exit_stop": 2, "exit_swap": 1}
+        assert stats["n_early"] == 3
+
+    def test_per_exit_type_buckets_with_pnl(self):
+        rows = [
+            closed_row(exit_type="exit_stop", pnl=-4.0),
+            closed_row(exit_type="exit_stop", pnl=-2.0),
+            closed_row(exit_type="exit_liquidity", pnl=1.0),
+            closed_row(),  # resolution â never bucketed
+        ]
+        assert aggregate_per_exit_type(rows) == [
+            {"exit_type": "exit_liquidity", "n": 1, "net_pnl": 1.0},
+            {"exit_type": "exit_stop", "n": 2, "net_pnl": -6.0},
+        ]
+
+    def test_per_strategy_counts_early_exits(self):
+        rows = [
+            closed_row(strategy="recalibration"),
+            closed_row(strategy="recalibration", exit_type="exit_stop"),
+        ]
+        agg = aggregate_per_strategy(rows)
+        assert agg[0]["n"] == 2
+        assert agg[0]["early_exits"] == 1
+
+    def test_render_separates_early_exits_printed_never_merged(self):
+        rows = [
+            closed_row(),
+            closed_row(pnl=-4.0, outcome="loss", exit_type="exit_stop"),
+        ]
+        report = build_report(rows, [])
+        md = render_markdown(report, 7, datetime_now())
+        assert "Exit accounting (D-B05" in md
+        assert "exit_stop" in md
+        assert "EXCLUDED from the agent-vs-market" in md
+        assert "| exit_stop | 1 | -4.00 |" in md
+        tg = render_telegram_summary(report, 7)
+        assert "Early exits: 1" in tg
+
+    def test_render_without_early_exits_still_prints_the_buckets(self):
+        report = build_report([closed_row()], [])
+        md = render_markdown(report, 7, datetime_now())
+        assert "Early exits: 0" in md
+        tg = render_telegram_summary(report, 7)
+        assert "Early exits" not in tg  # the Telegram line stays quiet at zero

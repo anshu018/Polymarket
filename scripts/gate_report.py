@@ -253,6 +253,52 @@ def thesis_dedup_count(rows: list[dict[str, Any]]) -> dict[str, int]:
     return {"rows": len(rows), "distinct_theses": len(theses), "null_thesis_rows": null_thesis_rows}
 
 
+def is_resolution_row(row: dict[str, Any]) -> bool:
+    """True when the row is a true RESOLUTION — exit_type 'resolved' or NULL
+    (legacy rows predate the Step 5 column and are all resolutions). Early
+    exits carry the exit engine's own tags and are NOT resolution forecasts
+    (D-B05): a sold position's win/loss is a trade-management outcome, not
+    the market's answer."""
+    exit_type = (row.get("exit_type") or "").strip().lower()
+    return exit_type in ("", "resolved")
+
+
+def exit_type_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Exit-bucket accounting over closed trades (D-B05: early exits are
+    tagged, counted in P&L, and bucketed separately — never silently merged
+    into the resolution sample)."""
+    resolved = 0
+    early: dict[str, int] = {}
+    for row in rows:
+        if is_resolution_row(row):
+            resolved += 1
+        else:
+            tag = (row.get("exit_type") or "unknown").strip() or "unknown"
+            early[tag] = early.get(tag, 0) + 1
+    return {"resolved": resolved, "early": early, "n_early": sum(early.values())}
+
+
+def aggregate_per_exit_type(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per early-exit bucket: n and net P&L (early exits count in P&L even
+    though they leave the Brier sample — D-B05)."""
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if is_resolution_row(row):
+            continue
+        tag = (row.get("exit_type") or "unknown").strip() or "unknown"
+        buckets.setdefault(tag, []).append(row)
+    out: list[dict[str, Any]] = []
+    for tag, tag_rows in buckets.items():
+        pnl_values = [v for v in (to_float(r.get("pnl_usdc")) for r in tag_rows) if v is not None]
+        out.append({
+            "exit_type": tag,
+            "n": len(tag_rows),
+            "net_pnl": sum(pnl_values) if pnl_values else None,
+        })
+    out.sort(key=lambda b: b["exit_type"])
+    return out
+
+
 def aggregate_per_strategy(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Per-strategy: n, net P&L, mean net edge, agent-vs-market Brier on that
     strategy's own resolved sample (Class A renders honestly as no-Brier)."""
@@ -267,6 +313,7 @@ def aggregate_per_strategy(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         pairs = brier_pairs(strat_rows)
         agent_brier = mean_brier([p[0] for p in pairs], [int(p[2]) for p in pairs]) if pairs else None
         market_brier = mean_brier([p[1] for p in pairs], [int(p[2]) for p in pairs]) if pairs else None
+        early_exits = sum(1 for r in strat_rows if not is_resolution_row(r))
         out.append({
             "strategy": strategy,
             "n": len(strat_rows),
@@ -274,6 +321,7 @@ def aggregate_per_strategy(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "mean_net_edge": statistics.fmean(edge_values) if edge_values else None,
             "agent_brier": agent_brier,
             "market_brier": market_brier,
+            "early_exits": early_exits,
         })
     out.sort(key=lambda s: s["strategy"])
     return out
@@ -428,13 +476,30 @@ def render_markdown(
     lines.append("")
     lines.append("## Per-strategy breakdown")
     lines.append("")
-    lines.append("| Strategy | n | Net P&L | Mean net edge | Agent Brier | Market Brier |")
-    lines.append("|---|---|---|---|---|---|")
+    lines.append("| Strategy | n | Net P&L | Mean net edge | Early exits | Agent Brier | Market Brier |")
+    lines.append("|---|---|---|---|---|---|---|")
     for s in report["per_strategy"]:
         lines.append(
             f"| {s['strategy']} | {s['n']} | {_fmt(s['net_pnl'], 2)} | "
-            f"{_fmt(s['mean_net_edge'])} | {_fmt(s['agent_brier'])} | {_fmt(s['market_brier'])} |"
+            f"{_fmt(s['mean_net_edge'])} | {s['early_exits']} | "
+            f"{_fmt(s['agent_brier'])} | {_fmt(s['market_brier'])} |"
         )
+    lines.append("")
+    buckets = report["exit_buckets"]
+    lines.append("## Exit accounting (D-B05 — early exits are not Brier observations)")
+    lines.append("")
+    lines.append(
+        f"Resolutions (Brier sample): {buckets['resolved']} | "
+        f"Early exits: {buckets['n_early']} — EXCLUDED from the agent-vs-market "
+        "Brier sample (a forecast at exit price is not a resolution forecast), "
+        "counted in P&L, bucketed below. Never silently merged."
+    )
+    if report["per_exit_type"]:
+        lines.append("")
+        lines.append("| Exit type | n | Net P&L |")
+        lines.append("|---|---|---|")
+        for b in report["per_exit_type"]:
+            lines.append(f"| {b['exit_type']} | {b['n']} | {_fmt(b['net_pnl'], 2)} |")
     lines.append("")
     lines.append(
         "*Bootstrap CIs: pure-Python percentile bootstrap, "
@@ -473,6 +538,11 @@ def render_telegram_summary(report: dict[str, Any], window_days: int) -> str:
     lines.append(
         f"Theses: {dedup['distinct_theses']} distinct over {dedup['rows']} rows"
     )
+    if report["exit_buckets"]["n_early"]:
+        lines.append(
+            f"Early exits: {report['exit_buckets']['n_early']} "
+            "(excluded from the Brier sample, counted in P&L — D-B05)"
+        )
     if report["failed_conditions"]:
         lines.append("FAILED: " + "; ".join(report["failed_conditions"]))
     return "\n".join(lines)
@@ -528,7 +598,7 @@ async def fetch_closed_trades(days: int, limit: int) -> list[dict[str, Any]]:
     res = (
         client.table("closed_trades")
         .select(
-            "market_id,direction,strategy,outcome,thesis_id,pnl_usdc,net_edge_at_entry,"
+            "market_id,direction,strategy,outcome,exit_type,thesis_id,pnl_usdc,net_edge_at_entry,"
             "p_model_at_entry,market_price_at_entry,fill_price,fill_type,closed_at"
         )
         .gte("closed_at", cutoff)
@@ -642,7 +712,13 @@ def build_report(
     outcomes_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Pure report assembly: every number the gate verdict rests on."""
-    resolved_rows = [r for r in closed_rows if yes_line_outcome(r) is not None]
+    # D-B05: the Brier/P&L-CI sample is RESOLUTIONS only — early exits carry
+    # win/loss by P&L sign and would corrupt the skill metric if merged
+    # (a forecast at exit price is not a resolution forecast).
+    resolved_rows = [
+        r for r in closed_rows
+        if is_resolution_row(r) and yes_line_outcome(r) is not None
+    ]
     n_resolved = len(resolved_rows)
 
     pnl_values = [v for v in (to_float(r.get("pnl_usdc")) for r in closed_rows) if v is not None]
@@ -693,6 +769,8 @@ def build_report(
         "slippage": slippage_stats(closed_rows),
         "order_types": order_type_stats(closed_rows),
         "thesis_dedup": thesis_dedup_count(closed_rows),
+        "exit_buckets": exit_type_stats(closed_rows),
+        "per_exit_type": aggregate_per_exit_type(closed_rows),
         "per_strategy": aggregate_per_strategy(closed_rows),
     }
 
