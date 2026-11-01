@@ -235,6 +235,7 @@ def mock_supabase_client(db_state: dict[str, list[dict[str, Any]]]) -> Generator
         with patch("coordinator.pipeline.get_client", fake_get_client), \
              patch("coordinator.equity.get_client", fake_get_client), \
              patch("coordinator.lease.get_client", fake_get_client), \
+             patch("execution.exit_engine.get_client", fake_get_client), \
              patch("llm.contract_parser.get_client", fake_get_client), \
              patch("llm.trade_decision.get_client", fake_get_client), \
              patch("strategies.calibration.get_client", fake_get_client), \
@@ -963,7 +964,9 @@ async def test_6_9_idempotency_timeout_fails_closed(
     # Step 3 adds the allocation ledger read as Call 6 — after the net-edge
     # gate, before the exposure fetch; List-B Step 3 adds the lease-claim RPC
     # as Call 8 — INSIDE the market-lock critical section, between the
-    # exposure fetch and load_market_state):
+    # exposure fetch and load_market_state; List-B Step 5 adds the R6
+    # re-entry-cooldown read as Call 10 — inside the critical section, after
+    # load_market_state, before the idempotency check):
     # Call 1: novelty window read (succeeds)
     # Call 2: load_market_state pre-check (succeeds)
     # Call 3: _check_cache (no hit)
@@ -973,8 +976,9 @@ async def test_6_9_idempotency_timeout_fails_closed(
     # Call 7: fetch_open_positions_exposure (succeeds)
     # Call 8: claim_market_lease RPC inside market_lock (succeeds)
     # Call 9: load_market_state inside market_lock (succeeds)
-    # Call 10: check_pre_order_idempotency (times out!)
-    mock_supabase_client.timeout_on_calls = {10}
+    # Call 10: R6 re-entry cooldown read, closed_trades (succeeds)
+    # Call 11: check_pre_order_idempotency (times out!)
+    mock_supabase_client.timeout_on_calls = {11}
 
     with pytest.raises(RuntimeError, match="Trading halted due to idempotency (check|write) timeout"):
         await run_pipeline(
@@ -993,6 +997,46 @@ async def test_6_9_idempotency_timeout_fails_closed(
     # the section's finally runs before the RuntimeError propagates, so the
     # market is not stranded behind a TTL for the next legitimate entry.
     assert mock_supabase_client.db_state.get("market_leases", []) == []
+
+
+@pytest.mark.anyio
+async def test_6_9c_reentry_cooldown_blocks_entry_after_recent_exit(
+    mock_supabase_client: MockSupabaseClient,
+    mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
+) -> None:
+    """List-B Step 5 (B5) R6, end-to-end on the entry path: a closed_trades
+    exit on (market_id, direction) within REENTRY_COOLDOWN_HOURS blocks the
+    entry inside the critical section — BEFORE the idempotency write, so no
+    order UUID is reserved for a trade that must not happen. (The fail-closed
+    read semantics are unit-tested in tests/test_exit_engine.py.)"""
+    mock_llm_apis["news_analyst_confidence"] = 0.80
+    mock_supabase_client.db_state.setdefault("closed_trades", []).append({
+        "market_id": "P1",
+        "direction": "YES",
+        "closed_at": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+        "exit_type": "exit_stop",
+        "strategy": "recalibration",
+        "net_edge_at_entry": 0.03,
+    })
+
+    result = await run_pipeline(
+        headline="Donald Trump impeachment",
+        source="AP News",
+        market_id="P1",
+        market_question="Question?",
+        resolution_criteria="Resolves YES.",
+        market_price=0.55,
+        portfolio_value=10000.0,
+        starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+        current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+    )
+
+    assert result is not None
+    assert result["status"] == "blocked"
+    assert result["reason"] == "reentry_cooldown"
+    # Blocked inside the critical section, before any order machinery ran.
+    assert mock_supabase_client.db_state.get("idempotency_log", []) == []
 
 
 @pytest.mark.anyio

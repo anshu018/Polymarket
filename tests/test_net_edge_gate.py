@@ -195,6 +195,7 @@ def mock_db(book_holder: dict[str, Any], estimate_holder: dict[str, Any]):
     with patch("memory.supabase_client.get_client", fake_get_client), \
          patch("coordinator.pipeline.get_client", fake_get_client), \
          patch("coordinator.lease.get_client", fake_get_client), \
+         patch("execution.exit_engine.get_client", fake_get_client), \
          patch("llm.contract_parser.get_client", fake_get_client), \
          patch("strategies.estimator.get_client", fake_get_client), \
          patch("copytrade.performance_tracker.get_client", fake_get_client), \

@@ -559,6 +559,79 @@ async def _process_position(
         _pending_exits[position_id] = decision.rule
 
 
+# ── R6: re-entry cooldown (enforced on BOTH entry paths) ─────────────────────
+
+@dataclass(frozen=True)
+class CooldownVerdict:
+    """R6's answer for one (market_id, direction)."""
+
+    blocked: bool
+    reason: str  # human detail for the drop log
+
+
+async def check_reentry_cooldown(
+    market_id: str,
+    direction: str,
+    now: Optional[datetime] = None,
+) -> CooldownVerdict:
+    """R6 (List-B Step 5): after ANY exit on (market_id, direction), block
+    re-entry for REENTRY_COOLDOWN_HOURS — enforced by reading the LAST
+    closed_trades row for the key (no new table; the ledger is the truth).
+
+    FAIL-CLOSED by spec: a read failure BLOCKS the entry (an unreadable
+    cooldown guard is treated as armed), and so does an unparseable
+    closed_at — the cooldown must never silently read as expired.
+
+    Called inside both entry critical sections (pipeline + Class A) so the
+    read-then-enter is atomic with the market lock/lease."""
+    checked_at = now or datetime.now(timezone.utc)
+    client = await get_client()
+
+    async def _read() -> list[dict[str, Any]]:
+        builder = (
+            client.table("closed_trades")
+            .select("closed_at,exit_type")
+            .eq("market_id", market_id)
+            .eq("direction", direction)
+            .order("closed_at", desc=True)
+            .limit(1)
+        )
+        res = await asyncio.to_thread(builder.execute)
+        return list(res.data or [])
+
+    try:
+        async with asyncio.timeout(config.SUPABASE_TIMEOUT_SECONDS):
+            rows = await _read()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning(
+            "[EXIT] Cooldown read failed for %s/%s — FAIL CLOSED (entry blocked): %s: %s",
+            market_id[:16], direction, type(e).__name__, e,
+        )
+        return CooldownVerdict(blocked=True, reason="cooldown read failed (fail-closed)")
+
+    if not rows:
+        return CooldownVerdict(blocked=False, reason="no prior exit on this key")
+
+    last = rows[0]
+    closed_at = _parse_ts(last.get("closed_at"))
+    if closed_at is None:
+        return CooldownVerdict(
+            blocked=True, reason="last exit closed_at unparseable (fail-closed)"
+        )
+    age_hours = (checked_at - closed_at).total_seconds() / 3600.0
+    if age_hours < config.REENTRY_COOLDOWN_HOURS:
+        return CooldownVerdict(
+            blocked=True,
+            reason=(
+                f"last exit {age_hours:.1f}h ago (< {config.REENTRY_COOLDOWN_HOURS}h, "
+                f"exit_type={last.get('exit_type')})"
+            ),
+        )
+    return CooldownVerdict(blocked=False, reason=f"cooldown expired ({age_hours:.1f}h ago)")
+
+
 # ── Tick + supervisor ────────────────────────────────────────────────────────
 
 async def run_exit_engine_once(now: Optional[datetime] = None) -> None:

@@ -39,6 +39,7 @@ from monitoring.telegram_alerts import (
 from coordinator.market_state import load_market_state, get_market_lock
 from coordinator import equity
 from coordinator import lease
+from execution import exit_engine
 from monitoring import health_score
 
 logger = logging.getLogger(__name__)
@@ -1467,6 +1468,20 @@ async def _run_pipeline_impl(
             )
             _increment_drop("risk_gate:max_market_tranches")
             return {"status": "blocked", "reason": "max_tranches_reached"}
+
+        # R6 re-entry cooldown (List-B Step 5 — B5): after ANY exit on
+        # (market_id, direction), entry is blocked for REENTRY_COOLDOWN_HOURS.
+        # FAIL-CLOSED: a read failure blocks. Checked inside the lease so the
+        # read-then-enter is atomic with the lock (the exit engine's ledger
+        # is the truth — no new table).
+        cooldown = await exit_engine.check_reentry_cooldown(market_id, decision_direction)
+        if cooldown.blocked:
+            _increment_drop("reentry:cooldown")
+            logger.warning(
+                "[PIPELINE][DROP:reentry:cooldown] market_id=%s dir=%s %s",
+                market_id, decision_direction, cooldown.reason,
+            )
+            return {"status": "blocked", "reason": "reentry_cooldown"}
 
         permitted_size = risk_engine.market_position_check(
             existing_market_usdc=state.existing_usdc,

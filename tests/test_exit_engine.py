@@ -573,3 +573,89 @@ class TestReconDigestPendingExits:
 
         assert digest.await_count == 1
         assert digest.await_args.kwargs["pending_exits"] == 3
+
+
+# ── R6: re-entry cooldown (enforced on BOTH entry paths) ─────────────────────
+
+class TestReentryCooldown:
+    @pytest.mark.anyio
+    async def test_no_prior_exit_allows(self, exit_env):
+        v = await ee.check_reentry_cooldown("mkt-x", "YES", now=NOW)
+        assert v.blocked is False
+
+    @pytest.mark.anyio
+    async def test_recent_exit_blocks(self, exit_env):
+        exit_env.db["closed_trades"].append({
+            "market_id": "mkt-x", "direction": "YES",
+            "closed_at": _iso(NOW - timedelta(hours=2)), "exit_type": "exit_stop",
+        })
+        v = await ee.check_reentry_cooldown("mkt-x", "YES", now=NOW)
+        assert v.blocked is True
+        assert "exit_stop" in v.reason
+
+    @pytest.mark.anyio
+    async def test_direction_mismatch_does_not_block(self, exit_env):
+        """The cooldown is per (market_id, direction) — a NO exit never
+        blocks a YES entry."""
+        exit_env.db["closed_trades"].append({
+            "market_id": "mkt-x", "direction": "NO",
+            "closed_at": _iso(NOW - timedelta(hours=2)), "exit_type": "exit_stop",
+        })
+        v = await ee.check_reentry_cooldown("mkt-x", "YES", now=NOW)
+        assert v.blocked is False
+
+    @pytest.mark.anyio
+    async def test_boundary_exactly_24h_allows(self, exit_env):
+        exit_env.db["closed_trades"].append({
+            "market_id": "mkt-x", "direction": "YES",
+            "closed_at": _iso(NOW - timedelta(hours=config.REENTRY_COOLDOWN_HOURS)),
+            "exit_type": "exit_profit",
+        })
+        v = await ee.check_reentry_cooldown("mkt-x", "YES", now=NOW)
+        assert v.blocked is False  # age < 24h blocks; equality has served its time
+
+    @pytest.mark.anyio
+    async def test_most_recent_row_governs(self, exit_env):
+        db = exit_env.db["closed_trades"]
+        db.append({"market_id": "mkt-x", "direction": "YES",
+                   "closed_at": _iso(NOW - timedelta(hours=30)), "exit_type": "resolved"})
+        db.append({"market_id": "mkt-x", "direction": "YES",
+                   "closed_at": _iso(NOW - timedelta(hours=2)), "exit_type": "exit_swap"})
+        v = await ee.check_reentry_cooldown("mkt-x", "YES", now=NOW)
+        assert v.blocked is True  # the LAST exit is 2h old
+
+    @pytest.mark.anyio
+    async def test_read_failure_fails_closed(self):
+        class ExplodingClient:
+            def table(self, name: str) -> Any:
+                raise ConnectionError("mocked supabase outage")
+
+        async def fake_get_client():
+            return ExplodingClient()
+
+        with patch("execution.exit_engine.get_client", fake_get_client):
+            v = await ee.check_reentry_cooldown("mkt-x", "YES", now=NOW)
+        assert v.blocked is True  # an unreadable guard is treated as armed
+
+    @pytest.mark.anyio
+    async def test_unparseable_closed_at_fails_closed(self, exit_env):
+        exit_env.db["closed_trades"].append({
+            "market_id": "mkt-x", "direction": "YES",
+            "closed_at": "not-a-timestamp", "exit_type": "exit_stop",
+        })
+        v = await ee.check_reentry_cooldown("mkt-x", "YES", now=NOW)
+        assert v.blocked is True
+
+    def test_both_entry_paths_enforce_the_cooldown(self):
+        """Wiring contract: check_reentry_cooldown is called in BOTH critical
+        sections (pipeline + Class A executor)."""
+        import ast
+        from pathlib import Path
+        root = Path(__file__).resolve().parent.parent
+        for rel in ("coordinator/pipeline.py", "copytrade/executor.py"):
+            tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+            called = {
+                node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
+                for node in ast.walk(tree) if isinstance(node, ast.Call)
+            }
+            assert "check_reentry_cooldown" in called, f"{rel} no longer enforces R6"

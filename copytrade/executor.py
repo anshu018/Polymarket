@@ -48,6 +48,7 @@ from risk import fill_simulator
 from data.market_discovery import get_market_book
 from monitoring.telegram_alerts import alert_circuit_breaker, alert_supabase_degradation
 from coordinator.market_state import load_market_state, get_market_lock
+from execution import exit_engine
 from copytrade.performance_tracker import (
     log_copy_trade as _tracker_log_trade,
     get_trust_score,
@@ -436,6 +437,19 @@ async def _execute_class_a(signal: dict) -> None:
             return
         if state.tranches >= config.MAX_MARKET_TRANCHES:
             logger.warning("[COPY_EXECUTOR][CLASS_A][DROP:max_market_tranches] market=%s", market_id[:12])
+            return
+
+        # R6 re-entry cooldown (List-B Step 5 — B5): after ANY exit on
+        # (market_id, direction), entry is blocked for REENTRY_COOLDOWN_HOURS.
+        # FAIL-CLOSED: a read failure blocks. Checked inside the lease so the
+        # read-then-enter is atomic with the lock (the exit engine's ledger
+        # is the truth — no new table).
+        cooldown = await exit_engine.check_reentry_cooldown(market_id, direction)
+        if cooldown.blocked:
+            logger.warning(
+                "[COPY_EXECUTOR][CLASS_A][DROP:reentry:cooldown] market=%s %s",
+                market_id[:12], cooldown.reason,
+            )
             return
 
         class_a_conf = float(signal.get("confidence") or trust_score)
