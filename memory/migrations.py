@@ -75,6 +75,7 @@ SQL_MIGRATIONS = [
             category TEXT,
             outcome TEXT,
             exit_reason TEXT,
+            exit_type TEXT,
             opened_at TIMESTAMPTZ,
             closed_at TIMESTAMPTZ DEFAULT NOW(),
             was_memoryless BOOLEAN DEFAULT FALSE,
@@ -99,6 +100,12 @@ SQL_MIGRATIONS = [
         -- gate report can measure decision-vs-fill slippage on closed trades.
         ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS fill_price DECIMAL(10,4);
         ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS fill_type TEXT;
+        -- List-B.md Step 5 (B5): the exit-rule bucket ('resolved' for true
+        -- resolutions; the exit engine names its own). D-B05: early exits are
+        -- NOT Brier observations — tagged, counted in P&L, bucketed separately
+        -- by the gate report. Legacy NULL rows are resolutions. Canonical DDL
+        -- lives in scratch/migration_exit_engine.sql — keep the two in sync.
+        ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS exit_type TEXT;
         CREATE INDEX IF NOT EXISTS idx_closed_trades_strategy_closed_at
             ON closed_trades (strategy, closed_at DESC);
         """
@@ -247,8 +254,9 @@ SQL_MIGRATIONS = [
             slippage          DECIMAL(10,6),
             idempotency_uuid  UUID,
             status            TEXT        NOT NULL DEFAULT 'open'
-                              CHECK (status IN ('open', 'won', 'lost', 'cancelled')),
+                              CHECK (status IN ('open', 'won', 'lost', 'cancelled', 'exited_early')),
             exit_price        DECIMAL(10,4),
+            exit_type         TEXT,
             pnl_usdc          DECIMAL(12,4),
             opened_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             resolved_at       TIMESTAMPTZ
@@ -257,6 +265,46 @@ SQL_MIGRATIONS = [
             ON copytrade_log(wallet_address);
         CREATE INDEX IF NOT EXISTS idx_copytrade_log_market_open
             ON copytrade_log(market_id, status) WHERE status = 'open';
+        -- List-B.md Step 5 (B5, D-B06): an early exit is the operator's trade
+        -- management, not the wallet's pick — the copied position's row records
+        -- status 'exited_early' + exit_type while wallet W/L/trust stays
+        -- untouched. The status CHECK must carry the new value: the DO block
+        -- widens copytrade_log_status_check only when it does not already
+        -- (fresh DBs get the extended inline CHECK above; the block no-ops).
+        -- Canonical DDL lives in scratch/migration_exit_engine.sql — in sync.
+        ALTER TABLE copytrade_log ADD COLUMN IF NOT EXISTS exit_type TEXT;
+        DO $status_check_widen$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM pg_constraint con
+                JOIN pg_class c ON c.oid = con.conrelid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public'
+                  AND c.relname = 'copytrade_log'
+                  AND con.conname = 'copytrade_log_status_check'
+            ) THEN
+                IF (
+                    SELECT pg_get_constraintdef(con.oid)
+                    FROM pg_constraint con
+                    JOIN pg_class c ON c.oid = con.conrelid
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'public'
+                      AND c.relname = 'copytrade_log'
+                      AND con.conname = 'copytrade_log_status_check'
+                ) NOT LIKE '%exited_early%' THEN
+                    ALTER TABLE copytrade_log
+                        DROP CONSTRAINT copytrade_log_status_check;
+                    ALTER TABLE copytrade_log
+                        ADD CONSTRAINT copytrade_log_status_check
+                        CHECK (status IN ('open', 'won', 'lost', 'cancelled', 'exited_early'));
+                END IF;
+            ELSE
+                ALTER TABLE copytrade_log
+                    ADD CONSTRAINT copytrade_log_status_check
+                    CHECK (status IN ('open', 'won', 'lost', 'cancelled', 'exited_early'));
+            END IF;
+        END
+        $status_check_widen$;
         """
     },
     {

@@ -56,11 +56,28 @@ POLYMARKET_API_TIMEOUT_SECONDS = 10
 SILICONFLOW_HEALTH_CHECK_INTERVAL_SECONDS = 300
 SILICONFLOW_HEALTH_CHECK_LATENCY_THRESHOLD_SECONDS = 20
 
-# POST-TRADE MONITORING
-POSITION_MONITOR_INTERVAL_MINUTES = 15
-PRICE_TARGET_EXIT_THRESHOLD_CENTS = 0.03
-TIME_DECAY_EXIT_HOURS_REMAINING = 72
-TIME_DECAY_POSITION_REDUCTION_PCT = 0.50
+# ── EXIT ENGINE (List-B.md Step 5 — B5) ──────────────────────────────────────
+# execution/exit_engine.py evaluates the six exit rules (R1..R6) over open
+# positions every tick. Every exit flows through the ONE shared close path
+# (execution/position_close.py — D-B08); no halt (health, drawdown, kill
+# switch) ever blocks an exit (D-B04); halts gate ENTRIES only.
+EXIT_MONITOR_INTERVAL_SECONDS = 300      # monitor loop interval (supervisor pattern)
+EXIT_BOOK_DEAD_HOURS = 6                 # a book unreachable this long fires a cooldown-gated WARNING — still NEVER a blind exit (fail-soft retry until then)
+EXIT_ALERT_COOLDOWN_SECONDS = 3600       # anti-spam floor for repeating exit alerts (book-dead); global DO-NOT: cooldowns required on repeating alerts
+PROB_STOP_MOVE_CENTS = 0.15              # R2 interim stop (D-B09 price-move proxy): adverse own-side move beyond this AND held >= MIN_HOLD_HOURS; upgrades to a real p_model stop when List A Step 6 lands
+MIN_HOLD_HOURS = 24                      # R2 minimum holding period before the stop may fire (no panic exits on fresh positions)
+TAKE_PROFIT_GAIN_CENTS = 0.25            # R3 branch 1: own-side gain >= this exits (any day count — banking real profit, D-B17)
+TAKE_PROFIT_MIN_PRICE = 0.90             # R3 branch 2: own-side price >= this exits, but ONLY with days-to-resolution >= 1 (D-B17 — never sell near-certain value into the final-24h illiquid window)
+TIME_DECAY_EXIT_HOURS_REMAINING = 72     # R4 (REVIVED — dead key E-B9, now real semantics): days-to-resolution under this with the thesis unconfirmed triggers the partial reduction
+TIME_DECAY_BAND = 0.10                   # R4 "unconfirmed thesis": own-side price within this band of entry_price
+TIME_DECAY_POSITION_REDUCTION_PCT = 0.50 # R4 (REVIVED — dead key E-B9, now real semantics): fraction of the position sold in the partial reduction (fires at most once per position — D-B19)
+SWAP_MARGIN_CENTS = 0.02                 # R5: the incoming signal's net edge must beat the victim's edge proxy by MORE than this for the swap to fire
+REENTRY_COOLDOWN_HOURS = 24              # R6: no re-entry on (market_id, direction) within this window after ANY exit; checks fail-closed
+# R1's threshold is AUTO_EXIT_LIQUIDITY_FLOOR_USDC (POLYMARKET CONSTANTS block
+# above) — unchanged; the exit engine finally makes EXIT_NOW mean exit (E-B9).
+# DEPRECATED (kept for visibility; zero live callers — E-B9):
+POSITION_MONITOR_INTERVAL_MINUTES = 15   # superseded by EXIT_MONITOR_INTERVAL_SECONDS
+PRICE_TARGET_EXIT_THRESHOLD_CENTS = 0.03 # superseded by TAKE_PROFIT_MIN_PRICE
 
 # STRATEGY PROBATION
 STRATEGY_PROBATION_TRADE_COUNT = 20
