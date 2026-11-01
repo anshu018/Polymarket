@@ -325,7 +325,12 @@ async def _time_decay_already_applied(client: Any, market_id: str, direction: st
     carries an exit_time_decay row for this (market_id, direction). The
     ledger is the truth — no new open_positions column. FAIL-CLOSED for the
     reduction: a read failure reads as already-reduced (the guard must never
-    license a second sell), which merely skips this tick's reduction."""
+    license a second sell), which merely skips this tick's reduction.
+
+    Scope note: the guard is per (market_id, direction) — with two same-key
+    tranches (MAX_MARKET_TRANCHES=2), reducing tranche 1 arms the guard for
+    tranche 2. That is the fail-closed direction (under-reduction, never a
+    double sell)."""
     async def _read() -> list[dict[str, Any]]:
         builder = (
             client.table("closed_trades")
@@ -677,6 +682,8 @@ async def evaluate_swap_for_entry(
     proposed_pct: float,
     category_exposure_pct: float,
     incoming_net_edge: Optional[float],
+    incoming_market_id: str,
+    incoming_direction: str,
     now: Optional[datetime] = None,
 ) -> SwapOutcome:
     """R5 (List-B Step 5): when an incoming signal passes every gate EXCEPT
@@ -687,6 +694,12 @@ async def evaluate_swap_for_entry(
     = lowest net_edge_at_entry, NULL weakest), never recursive — the caller
     re-checks the cap once and drops the signal if it still blocks.
     Correlation-cap swaps wait for Step 6 clusters.
+
+    The victim NEVER shares the incoming signal's (market_id, direction):
+    selling a key to re-enter the same key is pure churn, and the R6
+    cooldown the swap's own ledger row creates would immediately block the
+    very entry the swap was meant to admit — same-key adds are governed by
+    the tranche/market-exposure gates instead.
 
     PIPLELINE-ONLY by construction: the margin compares the incoming
     signal's MEASURED net edge, which only the pipeline computes — Class A
@@ -717,9 +730,16 @@ async def evaluate_swap_for_entry(
         )
         return SwapOutcome(False, reason="category position read failed")
 
-    candidates = [r for r in rows if not _is_resting_maker(r)]
+    candidates = [
+        r for r in rows
+        if not _is_resting_maker(r)
+        and not (
+            str(r.get("market_id") or "") == incoming_market_id
+            and str(r.get("direction") or "") == incoming_direction
+        )
+    ]
     if not candidates:
-        return SwapOutcome(False, reason="no same-category positions to swap")
+        return SwapOutcome(False, reason="no swappable same-category positions")
 
     candidates.sort(key=lambda r: (
         float(r["net_edge_at_entry"])

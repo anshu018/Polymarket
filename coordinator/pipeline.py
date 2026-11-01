@@ -1358,6 +1358,8 @@ async def _run_pipeline_impl(
             proposed_pct=proposed_pct,
             category_exposure_pct=cat_exp,
             incoming_net_edge=breakdown.net_edge,
+            incoming_market_id=market_id,
+            incoming_direction=decision_direction,
         )
         if swap.performed:
             logger.info(

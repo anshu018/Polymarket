@@ -679,6 +679,8 @@ def _swap_call(**overrides: Any):
         "proposed_pct": 0.04,
         "category_exposure_pct": 0.10,
         "incoming_net_edge": 0.05,
+        "incoming_market_id": "mkt-incoming",
+        "incoming_direction": "YES",
         "now": NOW,
     }
     kwargs.update(overrides)
@@ -849,3 +851,32 @@ class TestR5Swap:
             for node in ast.walk(executor_tree) if isinstance(node, ast.Call)
         }
         assert "evaluate_swap_for_entry" not in executor_calls
+
+
+class TestR5SameKeyGuard:
+    @pytest.mark.anyio
+    async def test_victim_on_the_incoming_key_is_never_selected(self, exit_env):
+        """Self-review catch: a victim sharing the incoming signal's
+        (market_id, direction) must never be swapped — the swap's own ledger
+        row would trip the R6 cooldown and block the entry it was meant to
+        admit. Same-key adds are the tranche/market gates' business."""
+        same_key = _swap_victim(market_id="mkt-incoming", direction="YES")
+        other = _swap_victim(market_id="mkt-other")
+        exit_env.db["open_positions"] = [same_key, other]
+        exit_env.books["mkt-incoming"] = _book(depth=2500.0)  # R1-worthy
+        exit_env.books["mkt-other"] = _book(depth=2500.0)
+
+        out = await _swap_call()
+
+        assert out.performed is True
+        assert out.victim_market_id == "mkt-other"  # the same-key row survives
+        assert [r["market_id"] for r in exit_env.db["open_positions"]] == ["mkt-incoming"]
+
+    @pytest.mark.anyio
+    async def test_only_same_key_candidates_means_no_swap(self, exit_env):
+        same_key = _swap_victim(market_id="mkt-incoming", direction="YES")
+        exit_env.db["open_positions"] = [same_key]
+        exit_env.books["mkt-incoming"] = _book(depth=2500.0)
+        out = await _swap_call()
+        assert out.performed is False
+        assert len(exit_env.db["open_positions"]) == 1
