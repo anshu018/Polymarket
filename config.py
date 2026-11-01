@@ -73,6 +73,7 @@ TIME_DECAY_BAND = 0.10                   # R4 "unconfirmed thesis": own-side pri
 TIME_DECAY_POSITION_REDUCTION_PCT = 0.50 # R4 (REVIVED — dead key E-B9, now real semantics): fraction of the position sold in the partial reduction (fires at most once per position — D-B19)
 SWAP_MARGIN_CENTS = 0.02                 # R5: the incoming signal's net edge must beat the victim's edge proxy by MORE than this for the swap to fire
 REENTRY_COOLDOWN_HOURS = 24              # R6: no re-entry on (market_id, direction) within this window after ANY exit; checks fail-closed
+EXIT_END_DATE_TTL_SECONDS = 21600        # in-process end-date cache TTL (6h) — end dates are static market properties; a cached miss re-fetches after the TTL, never every tick
 # R1's threshold is AUTO_EXIT_LIQUIDITY_FLOOR_USDC (POLYMARKET CONSTANTS block
 # above) — unchanged; the exit engine finally makes EXIT_NOW mean exit (E-B9).
 # DEPRECATED (kept for visibility; zero live callers — E-B9):

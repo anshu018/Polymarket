@@ -183,6 +183,15 @@ async def main():
         asyncio.create_task(run_runtime_reconciliation(), name="runtime_reconciliation")
         logger.info("[RECON] Runtime reconciliation supervisor started (supervisor task).")
 
+        # Start the Step 5 exit engine supervisor (List-B.md B5). Every
+        # EXIT_MONITOR_INTERVAL_SECONDS the six-rule engine evaluates FILLED
+        # open positions and exits through the ONE shared close path under
+        # the market lease. No halt ever gates an exit (D-B04) — this task
+        # runs regardless of health/drawdown mode.
+        from execution.exit_engine import run_exit_engine
+        asyncio.create_task(run_exit_engine(), name="exit_engine")
+        logger.info("[EXIT] Exit engine supervisor started (supervisor task).")
+
         # Validate News Analyst models before starting signal processing
         from llm.news_analyst import validate_models
         logger.info("Validating news analyst models...")

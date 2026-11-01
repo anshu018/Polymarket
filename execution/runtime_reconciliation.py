@@ -167,6 +167,16 @@ def _parse_ts(raw: Any) -> Optional[datetime]:
         return None
 
 
+def _pending_exit_count_failsoft() -> int:
+    """The exit engine's pending-exit count (Step 5's "(after Step 5)" slot
+    in this digest). Late binding + fail-soft: visibility only, −1 unknown."""
+    try:
+        from execution.exit_engine import get_pending_exit_count
+        return get_pending_exit_count()
+    except Exception:
+        return -1
+
+
 async def _mark_idempotency_status(
     client: Any, log_id: str, status: str, reason: Optional[str] = None
 ) -> bool:
@@ -422,6 +432,7 @@ def _maybe_send_daily_digest(
     open_positions: int,
     resting_makers: int,
     pending_idempotency: Optional[int],
+    pending_exits: int = 0,
 ) -> None:
     """Send the in-flight digest on the first tick of a new UTC day. A boot
     does NOT send (the startup alert covers it) — the first tick seeds the
@@ -443,6 +454,7 @@ def _maybe_send_daily_digest(
         resting_makers=resting_makers,
         pending_idempotency=pending_idempotency if pending_idempotency is not None else -1,
         closed_today=_closed_today,
+        pending_exits=max(0, pending_exits),
     ))
     _closed_today = 0
 
@@ -466,16 +478,19 @@ async def run_reconciliation_once(now: Optional[datetime] = None) -> None:
         await _stuck_pending_sweep(client, rows, pending_rows, checked_at)
 
     resting = sum(1 for r in rows if _is_resting_maker(r))
+    pending_exits = _pending_exit_count_failsoft()
     logger.info(
         "[OBSERVABILITY][INFLIGHT] open_positions=%d resting_makers=%d "
-        "pending_idempotency=%s counters=%s",
+        "pending_idempotency=%s pending_exits=%d counters=%s",
         len(rows), resting,
         len(pending_rows) if pending_rows is not None else None,
+        pending_exits,
         {k: v for k, v in _tick_counters.items() if v},
     )
     _maybe_send_daily_digest(
         checked_at, open_positions=len(rows), resting_makers=resting,
         pending_idempotency=len(pending_rows) if pending_rows is not None else None,
+        pending_exits=pending_exits,
     )
 
 
