@@ -8,13 +8,16 @@ mirror logic is where a sign slip would silently book impossible fills.
 
 import pytest
 
-from risk.cost_model import BookSnapshot, FeeConfig
+from risk.cost_model import BookSnapshot, FeeConfig, taker_fee_units
 from risk.fill_simulator import (
     maker_fallback_net_edge,
     maker_is_filled,
     maker_resting_price,
+    signed_exit_slippage,
     signed_slippage_units,
     taker_depth_ok,
+    taker_exit_depth_ok,
+    taker_exit_price,
     taker_fill_price,
 )
 
@@ -188,3 +191,124 @@ class TestSignedSlippage:
         assert signed_slippage_units(0.52, 1.5, "YES") is None
         assert signed_slippage_units(0.52, 0.50, "LONG") is None
         assert signed_slippage_units(float("nan"), 0.50, "YES") is None
+
+
+class TestTakerExitPrice:
+    """Sell-side taker pricing (List-B.md Step 5 — B5): a sell hits the BUYER's
+    side of the book — YES realizes the bid, NO realizes 1 − the YES ask."""
+
+    def test_yes_sells_at_the_bid(self):
+        assert taker_exit_price(SANE_BOOK, "YES") == 0.48
+
+    def test_no_sells_at_the_mirror_of_the_yes_ask(self):
+        # Asymmetric book proves the mirroring, not coincidence:
+        # NO bid = 1 − YES ask = 1 − 0.55 = 0.45.
+        book = BookSnapshot(best_bid=0.40, best_ask=0.55, depth_usd=5000.0)
+        assert taker_exit_price(book, "NO") == pytest.approx(0.45)
+
+    def test_yes_uses_the_bid_not_the_ask_on_asymmetric_book(self):
+        book = BookSnapshot(best_bid=0.40, best_ask=0.55, depth_usd=5000.0)
+        assert taker_exit_price(book, "YES") == 0.40
+
+    def test_exit_is_the_mirror_of_the_entry_price(self):
+        # Selling back what a NO buyer bought: entry paid 1 − bid, exit
+        # realizes 1 − ask. The round-trip spread is the full book spread.
+        book = BookSnapshot(best_bid=0.40, best_ask=0.55, depth_usd=5000.0)
+        assert taker_fill_price(book, "NO") == pytest.approx(0.60)
+        assert taker_exit_price(book, "NO") == pytest.approx(0.45)
+
+    @pytest.mark.parametrize("side", ["YES", "NO"])
+    def test_invalid_book_fails_closed(self, side):
+        crossed = BookSnapshot(best_bid=0.60, best_ask=0.40, depth_usd=100.0)
+        assert taker_exit_price(crossed, side) is None
+
+    def test_unknown_side_fails_closed(self):
+        assert taker_exit_price(SANE_BOOK, "yes") is None
+        assert taker_exit_price(SANE_BOOK, "SELL") is None
+
+
+class TestTakerExitDepthOk:
+    """Sell-side depth: shares convert to USDC at the price the book would
+    actually PAY, compared against the conservative thinner-side depth."""
+
+    def test_non_positive_shares_vacuously_ok(self):
+        assert taker_exit_depth_ok(THIN_BOOK, 0.0, "YES") is True
+        assert taker_exit_depth_ok(THIN_BOOK, -3.0, "NO") is True
+
+    def test_yes_notional_within_depth_ok(self):
+        # 5000 shares × 0.48 = 2400 ≤ 5000.
+        assert taker_exit_depth_ok(SANE_BOOK, 5000.0, "YES") is True
+
+    def test_yes_notional_above_depth_rejected(self):
+        # 12000 shares × 0.48 = 5760 > 5000.
+        assert taker_exit_depth_ok(SANE_BOOK, 12000.0, "YES") is False
+
+    def test_no_notional_uses_the_no_exit_price(self):
+        # Asymmetric book: NO exit 0.45. 11000 shares × 0.45 = 4950 ≤ 5000;
+        # 11500 shares × 0.45 = 5175 > 5000 — the NO conversion is load-bearing.
+        book = BookSnapshot(best_bid=0.40, best_ask=0.55, depth_usd=5000.0)
+        assert taker_exit_depth_ok(book, 11000.0, "NO") is True
+        assert taker_exit_depth_ok(book, 11500.0, "NO") is False
+
+    def test_exact_at_depth_ok(self):
+        # 10000 shares × 0.48 = 4800 = depth.
+        book = BookSnapshot(best_bid=0.48, best_ask=0.52, depth_usd=4800.0)
+        assert taker_exit_depth_ok(book, 10000.0, "YES") is True
+
+    def test_zero_depth_rejects_any_real_size(self):
+        empty = BookSnapshot(best_bid=0.48, best_ask=0.52, depth_usd=0.0)
+        assert taker_exit_depth_ok(empty, 1.0, "YES") is False
+
+    def test_unpriceable_book_fails_closed(self):
+        crossed = BookSnapshot(best_bid=0.60, best_ask=0.40, depth_usd=100.0)
+        assert taker_exit_depth_ok(crossed, 10.0, "YES") is False
+
+
+class TestSignedExitSlippage:
+    """Exit slippage: POSITIVE = adverse = the sell realized LESS than the
+    own-side mark (mark − fill on the traded token's line)."""
+
+    def test_yes_sold_below_mark_is_positive(self):
+        # Mark (YES mid) 0.50, sold into the bid at 0.48 → paid 2¢ of spread.
+        assert signed_exit_slippage(0.48, 0.50, "YES") == pytest.approx(0.02)
+
+    def test_yes_sold_above_mark_is_negative(self):
+        assert signed_exit_slippage(0.52, 0.50, "YES") == pytest.approx(-0.02)
+
+    def test_no_sold_below_mark_is_positive(self):
+        # NO mid 0.50 (YES mid 0.50), NO fill 0.45 → 5¢ adverse.
+        assert signed_exit_slippage(0.45, 0.50, "NO") == pytest.approx(0.05)
+
+    def test_convention_is_mark_minus_fill_regardless_of_side(self):
+        # mark and fill are BOTH own-line numbers; the side argument only
+        # validates — the sell convention (mark − fill) is side-invariant.
+        assert signed_exit_slippage(0.45, 0.50, "YES") == pytest.approx(0.05)
+        assert signed_exit_slippage(0.45, 0.50, "NO") == pytest.approx(0.05)
+
+    def test_invalid_inputs_fail_closed(self):
+        assert signed_exit_slippage(0.0, 0.50, "YES") is None
+        assert signed_exit_slippage(1.0, 0.50, "YES") is None
+        assert signed_exit_slippage(0.48, 1.5, "YES") is None
+        assert signed_exit_slippage(0.48, 0.50, "LONG") is None
+        assert signed_exit_slippage(float("nan"), 0.50, "YES") is None
+
+
+class TestExitFeeSchedule:
+    """Exit fees ride the SAME cost_model taker schedule as entries (spec:
+    'taker fee formula applies on sells') — priced at the realized exit price."""
+
+    def test_exit_fee_priced_at_the_realized_sell_price(self):
+        fill = taker_exit_price(SANE_BOOK, "YES")
+        assert fill is not None
+        # D-09 schedule: shares × rate × p × (1 − p) at p = the exit price.
+        assert taker_fee_units(fill, POLITICS) == pytest.approx(
+            0.04 * 0.48 * 0.52
+        )
+
+    def test_no_exit_fee_priced_at_the_mirror(self):
+        book = BookSnapshot(best_bid=0.40, best_ask=0.55, depth_usd=5000.0)
+        fill = taker_exit_price(book, "NO")
+        assert fill is not None
+        assert taker_fee_units(fill, POLITICS) == pytest.approx(
+            0.04 * 0.45 * 0.55
+        )

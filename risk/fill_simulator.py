@@ -26,6 +26,11 @@ Line conventions (matches cost_model.compute_cost_breakdown):
     - Slippage is signed so that POSITIVE = paid worse than the decision reference:
       fill − reference on the traded token's line, where the reference is the YES
       mid for YES buys and 1 − the YES mid for NO buys.
+    - Sells (List-B.md Step 5 — B5) reverse the direction: a taker exit sells
+      INTO the book — selling YES realizes the YES bid, selling NO realizes the
+      NO bid (1 − the YES ask), the mirror of the NO-entry convention. Exit
+      slippage stays POSITIVE = adverse, which for a sell means RECEIVING less
+      than the own-side mark: mark − fill on the traded token's line.
     - Fail-closed: an invalid/crossed book yields None (caller must not fill).
 """
 
@@ -194,6 +199,59 @@ def maker_fallback_net_edge(
     )
 
 
+# ── Taker exits (List-B.md Step 5 — B5) ───────────────────────────────────────
+
+def taker_exit_price(book: BookSnapshot, side: str) -> Optional[float]:
+    """
+    Price a taker SELL realizes per share, on the traded token's line.
+
+    Selling YES hits the YES bid (the buyer's side of the book); selling NO
+    hits the NO bid, which mirrors the YES book at 1 − best_ask — the exact
+    mirror of the NO-entry convention (buying NO pays 1 − best_bid).
+
+    Args:
+        book: Live CLOB book snapshot (YES line).
+        side: Position direction being exited ("YES" or "NO").
+
+    Returns:
+        Exit price per share in (0, 1), or None when the book or side is
+        invalid (fail-closed: the caller must not sell).
+    """
+    if not _side_ok(side) or not _book_ok(book):
+        return None
+    if side == "YES":
+        return book.best_bid
+    return 1.0 - book.best_ask
+
+
+def taker_exit_depth_ok(book: BookSnapshot, size_shares: float, side: str) -> bool:
+    """
+    Whether visible book depth can absorb a taker sell of `size_shares`.
+
+    Mirrors the entry-side rule (taker_depth_ok) with sell semantics: the
+    shares are converted to USDC notional AT THE EXIT PRICE the book would
+    actually give (a sell's proceeds, not its cost) and compared against the
+    conservative thinner-side depth. An unpriceable book cannot carry the
+    sell (fail-closed).
+
+    Args:
+        book:         Live CLOB book snapshot (YES line).
+        size_shares:  Shares to sell (<= 0 = nothing to sell → True).
+        side:         Position direction being exited ("YES" or "NO").
+
+    Returns:
+        True when the sell is fillable within visible depth.
+    """
+    if size_shares <= 0.0:
+        return True
+    exit_price = taker_exit_price(book, side)
+    if exit_price is None:
+        return False
+    if book.depth_usd <= 0.0:
+        return False
+    return size_shares * exit_price <= book.depth_usd
+
+
 # ── Slippage measurement ──────────────────────────────────────────────────────
 
 def signed_slippage_units(
@@ -228,3 +286,37 @@ def signed_slippage_units(
         return None
     reference = decision_price if side == "YES" else 1.0 - decision_price
     return fill_price - reference
+
+
+def signed_exit_slippage(
+    fill_price: float,
+    mark_price: float,
+    side: str,
+) -> Optional[float]:
+    """
+    Signed slippage of an EXIT fill vs the position's own-side mark.
+
+    `mark_price` is the own-side reference the exit rule triggered on (the
+    traded token's mid: the YES mid for a YES position, 1 − the YES mid for a
+    NO position). For a sell, POSITIVE = ADVERSE: the fill realized LESS than
+    the mark (sold into the bid below the mid) — `mark − fill` on the traded
+    token's line; negative = the sell price-improved over the mark. This is
+    the exit-side observation that pairs with signed_slippage_units (entries)
+    so the empirical slippage curve covers both sides of the round trip.
+
+    Args:
+        fill_price: Actual exit fill price on the traded token's line (0, 1).
+        mark_price: Own-side mark in [0, 1] the rule triggered on.
+        side:       Position direction being exited ("YES" or "NO").
+
+    Returns:
+        Signed slippage in probability units (positive = adverse), or None on
+        invalid inputs.
+    """
+    if not _side_ok(side):
+        return None
+    if not (0.0 <= mark_price <= 1.0):
+        return None
+    if not 0.0 < fill_price < 1.0:
+        return None
+    return mark_price - fill_price
