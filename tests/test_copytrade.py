@@ -376,12 +376,14 @@ async def test_class_a_open_position_row_carries_attribution():
             class_type="A",
             trader_name="whale",
             idempotency_uuid="uuid-1",
+            event_key="mkt-copy-1",  # as the executor passes it (third fallback)
         )
 
     assert len(sink) == 1
     row = sink[0]
     assert row["strategy"] == "copy_edge_class_a"
     assert row["thesis_id"] == "mkt-copy-1:copy_edge_class_a:mkt-copy-1"
+    assert row["event_key"] == "mkt-copy-1"  # third fallback: no headline to hash
     assert row["p_model_at_entry"] is None          # estimate-free by design
     assert row["net_edge_at_entry"] is None         # no cost model runs here
     assert row["costs_paid_usdc"] is None

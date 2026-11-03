@@ -22,7 +22,8 @@ import config
 from llm.news_analyst import NewsAnalystOutput
 from llm.trade_decision import TradeDecisionOutput
 from llm.coordinator import CoordinatorOutput
-from coordinator.pipeline import run_pipeline
+from coordinator.pipeline import run_pipeline, extract_entities
+from data import novelty
 from coordinator import equity
 from strategies.estimator import EstimateResult
 from risk.cost_model import BookSnapshot
@@ -974,7 +975,7 @@ async def test_6_9_idempotency_timeout_fails_closed(
     # Call 4: _write_cache (succeeds)
     # Call 5: fetch_relevant_lessons (succeeds)
     # Call 6: allocation history read (closed_trades — succeeds)
-    # Call 7: fetch_open_positions_exposure (succeeds)
+    # Call 7: exposure read (coordinator.exposure — the shared fetcher, succeeds)
     # Call 8: claim_market_lease RPC inside market_lock (succeeds)
     # Call 9: load_market_state inside market_lock (succeeds)
     # Call 10: R6 re-entry cooldown read, closed_trades (succeeds)
@@ -1037,6 +1038,89 @@ async def test_6_9c_reentry_cooldown_blocks_entry_after_recent_exit(
     assert result["status"] == "blocked"
     assert result["reason"] == "reentry_cooldown"
     # Blocked inside the critical section, before any order machinery ran.
+    assert mock_supabase_client.db_state.get("idempotency_log", []) == []
+
+
+@pytest.mark.anyio
+async def _run_impeachment_pipeline(mock_supabase_client) -> dict[str, Any]:
+    return await run_pipeline(
+        headline="Donald Trump impeachment",
+        source="AP News",
+        market_id="P1",
+        market_question="Question?",
+        resolution_criteria="Resolves YES.",
+        market_price=0.55,
+        portfolio_value=10000.0,
+        starting_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+        current_balances={"daily": 10000.0, "weekly": 10000.0, "monthly": 10000.0},
+    )
+
+
+def _proposed_event_key() -> str:
+    """The exact cluster key the pipeline will derive for the test headline —
+    same functions, same process, so the seeded rows join the right cluster."""
+    return novelty.compute_event_key(
+        extract_entities("Donald Trump impeachment"),
+        novelty.compute_headline_hash("Donald Trump impeachment"),
+    )
+
+
+@pytest.mark.anyio
+async def test_6_9d_uncorrelated_clusters_do_not_block_each_other(
+    mock_supabase_client: MockSupabaseClient,
+    mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
+) -> None:
+    """List-B Step 6 DoD: MAX_CORRELATED_EXPOSURE_PCT binds PER EVENT CLUSTER.
+    Two open clusters at 15% each (30% total — the old total-based cap would
+    block here) leave every cluster under 20%, so the entry proceeds."""
+    mock_llm_apis["news_analyst_confidence"] = 0.80
+    unrelated_key = novelty.compute_event_key(
+        ["some other entity"], "totally-different-hash"
+    )
+    for i, key in enumerate((unrelated_key, unrelated_key + "|second")):
+        mock_supabase_client.db_state.setdefault("open_positions", []).append({
+            "market_id": f"mkt-other-{i}",
+            "direction": "YES",
+            "entry_price": 0.50,
+            "position_size_usdc": 1500.0,   # 15% of the 10k portfolio each
+            "category": "sports",           # keep the 30% category cap out of it
+            "event_key": key,
+            "order_type": "taker",
+            "fill_price": 0.50,
+        })
+
+    result = await _run_impeachment_pipeline(mock_supabase_client)
+
+    assert result is not None and result["status"] == "success"
+
+
+@pytest.mark.anyio
+async def test_6_9e_one_cluster_over_the_cap_blocks(
+    mock_supabase_client: MockSupabaseClient,
+    mock_llm_apis: dict[str, Any],
+    estimator_has_data: None,
+) -> None:
+    """List-B Step 6 DoD (mirror): a single cluster at 18% plus the ~5%
+    proposed trade crosses the 20% cluster cap — the signal drops with the
+    correlated-exposure counter, even though total exposure is small."""
+    mock_llm_apis["news_analyst_confidence"] = 0.80
+    mock_supabase_client.db_state.setdefault("open_positions", []).append({
+        "market_id": "mkt-cluster-mate",
+        "direction": "YES",
+        "entry_price": 0.50,
+        "position_size_usdc": 1800.0,       # 18% — same real-world event
+        "category": "sports",               # ...but not the signal's category
+        "event_key": _proposed_event_key(),
+        "order_type": "taker",
+        "fill_price": 0.50,
+    })
+
+    result = await _run_impeachment_pipeline(mock_supabase_client)
+
+    assert result is not None
+    assert result["status"] == "blocked"
+    assert result["reason"] == "portfolio_capacity_full"
     assert mock_supabase_client.db_state.get("idempotency_log", []) == []
 
 
