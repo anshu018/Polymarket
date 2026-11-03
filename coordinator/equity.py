@@ -48,7 +48,7 @@ This module performs I/O. It must NEVER be imported by risk/risk_engine.py
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -72,6 +72,7 @@ class MarkedEquity:
     positions_marked: int           # filled positions valued this pass
     fallback_positions: int         # valued at entry price (fetch failed, capped, or unusable row)
     skipped_resting: int            # resting makers: no shares, no committed cash
+    marked_by_key: dict[str, float] = field(default_factory=dict)  # Σ marked value per cluster key
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,10 @@ class EquityGate:
     current_equity: float
     starting_balances: dict[str, float]   # period-start equity per daily/weekly/monthly
     current_balances: dict[str, float]    # current equity per period (always the live marked value)
+    marked_by_key: dict[str, float] = field(default_factory=dict)  # Σ marked value per cluster key
+    # (Step 6: the correlated-exposure gate reads this instead of re-marking
+    # the book on the entry path; a default-empty dict keeps older
+    # constructors — tests, fixtures — valid.)
 
 
 # ── Snapshot cache & gate state (in-process; single event loop, no lock needed) ──
@@ -115,6 +120,20 @@ def _to_float(raw: Any, default: float = 0.0) -> float:
 def _is_resting_maker(row: dict[str, Any]) -> bool:
     """Resting maker = the unfilled-maker predicate of idx_open_positions_unfilled_maker."""
     return row.get("order_type") == "maker" and row.get("fill_price") is None
+
+
+def cluster_key(row: dict[str, Any]) -> str:
+    """The event-cluster key of one open position (Step 6, D-B22).
+
+    event_key when the row carries one (the real-world event it rides on,
+    written at entry from data/novelty.compute_event_key); a NULL key is its
+    own singleton cluster keyed by market_id. This is the SINGLE keying
+    rule — the snapshot's marks and the exposure gate group by the same
+    function, so they can never disagree."""
+    key = row.get("event_key")
+    if key is not None and str(key).strip():
+        return str(key).strip()
+    return str(row.get("market_id") or "")
 
 
 def _entry_price(row: dict[str, Any]) -> Optional[float]:
@@ -157,7 +176,7 @@ async def _fetch_open_positions() -> list[dict[str, Any]]:
             client.table("open_positions")
             .select(
                 "market_id,direction,entry_price,position_size_usdc,"
-                "fill_price,market_price_at_entry,order_type,opened_at"
+                "fill_price,market_price_at_entry,order_type,opened_at,event_key"
             )
             .order("opened_at")
             .execute()
@@ -251,12 +270,16 @@ async def mark_to_market_value(now: Optional[datetime] = None) -> MarkedEquity:
 
     marked_value = 0.0
     fallbacks = 0
+    marked_by_key: dict[str, float] = {}
     for index, row in enumerate(filled):
         fetch_live = index < config.EQUITY_MAX_MARKED_POSITIONS
         value, used_fallback = await _mark_position_row(row, fetch_live=fetch_live)
         marked_value += value
         if used_fallback:
             fallbacks += 1
+        key = cluster_key(row)
+        if key:
+            marked_by_key[key] = marked_by_key.get(key, 0.0) + value
 
     return MarkedEquity(
         value=cash + marked_value,
@@ -265,6 +288,7 @@ async def mark_to_market_value(now: Optional[datetime] = None) -> MarkedEquity:
         positions_marked=len(filled),
         fallback_positions=fallbacks,
         skipped_resting=skipped_resting,
+        marked_by_key=marked_by_key,
     )
 
 
@@ -434,6 +458,7 @@ async def take_equity_snapshot_once(now: Optional[datetime] = None) -> bool:
         current_equity=marked.value,
         starting_balances={p: start for p, (start, _c) in period_balances.items()},
         current_balances={p: current for p, (_s, current) in period_balances.items()},
+        marked_by_key=marked.marked_by_key,
     )
     logger.info(
         "[EQUITY] Snapshot: equity=%.2f cash=%.2f marked=%.2f positions=%d "

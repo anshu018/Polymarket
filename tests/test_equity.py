@@ -656,3 +656,68 @@ async def test_supervisor_reraises_cancellation(equity_db, monkeypatch: pytest.M
         await equity.run_equity_snapshot_supervisor()
 
     assert ticks["n"] == 2
+
+
+# ── Cluster marks (Step 6, D-B22): the snapshot retains Σ marked value per key ──
+
+@pytest.mark.anyio
+async def test_marked_by_key_sums_per_event_cluster(equity_db) -> None:
+    """Rows sharing an event_key are one cluster: their marks sum under it."""
+    state, price_holder, _ = equity_db
+    state["open_positions"].append(make_position(market_id="mkt_a"))
+    state["open_positions"].append(make_position(market_id="mkt_b"))
+    state["open_positions"][0]["event_key"] = "fed|ecb"
+    state["open_positions"][1]["event_key"] = "fed|ecb"
+    state["open_positions"].append(make_position(market_id="mkt_c"))
+    price_holder["price"] = 0.60
+
+    marked = await equity.mark_to_market_value(NOW)
+
+    # $100 @ 0.50 → 200 shares → 200 × 0.60 = 120 per row.
+    assert marked.marked_by_key["fed|ecb"] == pytest.approx(240.0)
+    assert marked.marked_by_key["mkt_c"] == pytest.approx(120.0)
+
+
+@pytest.mark.anyio
+async def test_null_event_key_clusters_by_market_id(equity_db) -> None:
+    """A row without an event_key is its own singleton keyed by market_id;
+    two tranches on one market sum into that market's cluster."""
+    state, price_holder, _ = equity_db
+    state["open_positions"].append(make_position(market_id="mkt1"))
+    state["open_positions"].append(make_position(market_id="mkt1"))
+    price_holder["price"] = 0.60
+
+    marked = await equity.mark_to_market_value(NOW)
+
+    assert marked.marked_by_key == {"mkt1": pytest.approx(240.0)}
+
+
+@pytest.mark.anyio
+async def test_fallback_rows_count_into_their_cluster_at_cost(equity_db) -> None:
+    """A price-fetch failure values the row at cost — the cluster mark picks
+    up that same conservative value, never a fabricated gain."""
+    state, price_holder, _ = equity_db
+    state["open_positions"].append(make_position(market_id="mkt_x"))
+    state["open_positions"][0]["event_key"] = "fed|ecb"
+    price_holder["fail"] = True
+
+    marked = await equity.mark_to_market_value(NOW)
+
+    assert marked.fallback_positions == 1
+    assert marked.marked_by_key == {"fed|ecb": pytest.approx(100.0)}
+
+
+@pytest.mark.anyio
+async def test_snapshot_carries_marked_by_key(equity_db) -> None:
+    """The cached EquityGate retains the per-cluster marks (the exposure gate
+    reads them instead of re-marking the book on the entry path)."""
+    state, price_holder, _ = equity_db
+    state["open_positions"].append(make_position(market_id="mkt1"))
+    state["open_positions"][0]["event_key"] = "fed|ecb"
+    price_holder["price"] = 0.60
+
+    await equity.take_equity_snapshot_once(NOW)
+
+    gate = equity.get_cached_snapshot()
+    assert gate is not None
+    assert gate.marked_by_key["fed|ecb"] == pytest.approx(120.0)
