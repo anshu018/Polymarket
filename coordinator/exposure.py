@@ -68,12 +68,15 @@ async def fetch_portfolio_exposure(
     portfolio denominator arrives warm from the Step 1 equity cache, so the
     read count is identical to the pre-Step-6 fetchers."""
     async def _read() -> list[dict[str, Any]]:
+        # to_thread: supabase-py execute() is blocking HTTP — asyncio.timeout
+        # can only cancel an awaitable, never a direct call (the strict
+        # pattern lease/recon use; the loose direct-call pattern is a
+        # recorded repo-wide noticed issue).
         client = await get_client()
-        res = (
-            client.table("open_positions")
-            .select("position_size_usdc,category,event_key")
-            .execute()
+        builder = client.table("open_positions").select(
+            "position_size_usdc,category,event_key"
         )
+        res = await asyncio.to_thread(builder.execute)
         return res.data or []
 
     try:
