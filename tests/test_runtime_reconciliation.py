@@ -193,9 +193,16 @@ def recon_db():
     async def fake_get_client():
         return client
 
+    async def not_resolved(market_id: str, direction: str):
+        """Default resolution answer so tests that don't script resolutions
+        never touch the live Gamma API (a fake mkt-* id 404s/timeout for
+        real — incidental, slow, and network-dependent)."""
+        return MarketResolution(ResolutionStatus.NOT_RESOLVED, None, None)
+
     with patch("execution.runtime_reconciliation.get_client", fake_get_client), \
          patch("coordinator.lease.get_client", fake_get_client), \
-         patch("execution.paper_fills.get_client", fake_get_client):
+         patch("execution.paper_fills.get_client", fake_get_client), \
+         patch("execution.runtime_reconciliation.fetch_market_resolution", not_resolved):
         yield client, db_state
 
 
@@ -339,10 +346,14 @@ async def test_lease_conflict_skips_the_close_and_retries_next_tick(recon_db, si
     script.results["mkt-held"] = MarketResolution(ResolutionStatus.RESOLVED, 1.0, 1.0)
     row = _position_row(market_id="mkt-held")
     db["open_positions"].append(row)
-    # Another live process holds the market lease.
+    # Another live process holds the market lease. Seeded against the REAL
+    # clock on purpose: coordinator.lease's claim SQL compares expiry against
+    # now() (the lease_mock mirrors that), not the test's frozen NOW — a
+    # frozen-NOW seed ages into "expired" as real time passes (the Step 6
+    # baseline found exactly that time bomb).
     db["market_leases"].append({
         "market_id": "mkt-held", "owner": "other-process",
-        "lease_until": _iso(NOW + timedelta(hours=1)),
+        "lease_until": _iso(datetime.now(timezone.utc) + timedelta(hours=1)),
     })
 
     with patch("execution.runtime_reconciliation.fetch_market_resolution", script):
@@ -387,7 +398,7 @@ async def test_stuck_pending_matching_resting_maker_is_skipped(recon_db, silent_
     log = _pending_log(id=row["idempotency_uuid"])  # 30 min old — stuck
     db["idempotency_log"].append(log)
 
-    await rr.run_reconciliation_once(now=NOW)
+    await rr.run_reconciliation_once()
 
     assert db["idempotency_log"][0]["status"] == "pending"  # legitimate rest
     assert rr.get_recon_counters()["recon:pending_resting_skipped"] == 1
@@ -401,7 +412,7 @@ async def test_stuck_pending_matching_filled_position_is_confirmed(recon_db, sil
     log = _pending_log(id=row["idempotency_uuid"])
     db["idempotency_log"].append(log)
 
-    await rr.run_reconciliation_once(now=NOW)
+    await rr.run_reconciliation_once()
 
     assert db["idempotency_log"][0]["status"] == "confirmed"  # the entry happened (D-B14)
     assert rr.get_recon_counters()["recon:pending_confirmed"] == 1
@@ -411,10 +422,15 @@ async def test_stuck_pending_matching_filled_position_is_confirmed(recon_db, sil
 async def test_stuck_pending_without_match_marked_failed_with_warning(recon_db, silent_alerts):
     client, db = recon_db
     stuck = _pending_log()                                  # 30 min old, no position
-    fresh = _pending_log(created_at=_iso(NOW - timedelta(minutes=1)))  # too young
+    # Both ages are REAL-clock based and the tick runs on the real clock:
+    # the pending age is compared against the tick's `now`, so freezing the
+    # tick while seeding real-now ages is a time bomb (found at the Step 6
+    # baseline: the frozen NOW aged past the wall clock and the "stuck" row
+    # read as two days in the future).
+    fresh = _pending_log(created_at=_iso(datetime.now(timezone.utc) - timedelta(minutes=1)))
     db["idempotency_log"].extend([stuck, fresh])
 
-    await rr.run_reconciliation_once(now=NOW)
+    await rr.run_reconciliation_once()
 
     logs = {r["id"]: r for r in db["idempotency_log"]}
     assert logs[stuck["id"]]["status"] == "failed"

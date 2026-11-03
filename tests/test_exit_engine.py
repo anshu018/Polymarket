@@ -438,10 +438,13 @@ class TestRunExitEngineOnce:
         row = _position_row()
         exit_env.db["open_positions"].append(row)
         exit_env.books[row["market_id"]] = _book(depth=2500.0)
-        # Another live owner holds the market lease.
+        # Another live owner holds the market lease. Seeded against the REAL
+        # clock: coordinator.lease's claim SQL compares expiry against now()
+        # (lease_mock mirrors that), not the frozen NOW - a frozen seed ages
+        # into "expired" as real time passes (Step 6 baseline time bomb).
         exit_env.db["market_leases"].append({
             "market_id": row["market_id"], "owner": "other-instance",
-            "lease_until": _iso(NOW + timedelta(seconds=30)),
+            "lease_until": _iso(datetime.now(timezone.utc) + timedelta(seconds=30)),
         })
 
         await ee.run_exit_engine_once(now=NOW)
