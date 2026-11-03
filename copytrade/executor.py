@@ -39,6 +39,7 @@ import aiohttp
 
 import config
 from coordinator import equity
+from coordinator import exposure
 from coordinator import lease
 from monitoring import health_score
 from memory.supabase_client import get_client
@@ -159,6 +160,7 @@ async def _log_open_position(
     fill_price: Optional[float] = None,
     fill_type: Optional[str] = None,
     decision_price: Optional[float] = None,
+    event_key: Optional[str] = None,
 ) -> None:
     """Write the new Class A position to open_positions. Non-blocking on failure.
 
@@ -193,6 +195,7 @@ async def _log_open_position(
             "opened_at": datetime.now(timezone.utc).isoformat(),
             "last_checked_at": datetime.now(timezone.utc).isoformat(),
             "thesis_id": f"{market_id}:{strategy}:{market_id}",
+            "event_key": event_key,
             "p_model_at_entry": None,             # estimate-free path — no model exists
             "market_price_at_entry": decision_price if decision_price is not None else entry_price,
             "net_edge_at_entry": None,            # no cost model runs on this path
@@ -207,36 +210,6 @@ async def _log_open_position(
         logger.info("[COPY_EXECUTOR] Position logged to open_positions: %s", market_id)
     except Exception as e:
         logger.error("[COPY_EXECUTOR] Failed to write position to open_positions: %s", e)
-
-
-async def _fetch_exposure() -> tuple[float, float]:
-    """Fetch category and correlated exposures. Fail closed on timeout."""
-    async def _q():
-        client = await get_client()
-        res = client.table("open_positions").select("position_size_usdc").execute()
-        return res.data or []
-
-    try:
-        rows = await asyncio.wait_for(_q(), timeout=config.SUPABASE_TIMEOUT_SECONDS)
-        portfolio = config.PAPER_TRADING_PORTFOLIO_USDC
-        total = sum(float(r.get("position_size_usdc", 0)) for r in rows)
-        # For copy_edge category — count all copy_edge positions
-        copy_edge_total = sum(
-            float(r.get("position_size_usdc", 0))
-            for r in rows
-        )
-        return copy_edge_total / portfolio, total / portfolio
-    except asyncio.TimeoutError:
-        logger.critical("[COPY_EXECUTOR] open_positions read timed out — halting Class A.")
-        asyncio.create_task(
-            alert_supabase_degradation("open_positions", "HALTING copy trade — DB timeout")
-        )
-        raise RuntimeError("Class A halted: exposure check timeout")
-    except Exception as e:
-        logger.critical("[COPY_EXECUTOR] Exposure check failed: %s — halting", e)
-        raise RuntimeError("Class A halted: exposure check failure") from e
-
-
 # ── Class A executor ──────────────────────────────────────────────────────────
 
 async def _execute_class_a(signal: dict) -> None:
@@ -372,18 +345,26 @@ async def _execute_class_a(signal: dict) -> None:
     )
 
     # ── Risk Gate 3: Portfolio exposure ───────────────────────────────────────
-    cat_exp, corr_exp = await _fetch_exposure()
+    # One shared read (coordinator/exposure.py, D-B21); the proposed copy
+    # trade's cluster key is its market_id (the documented third fallback —
+    # no headline exists to hash). The correlated gate below is therefore
+    # cluster-scoped: same-market copies share a budget, unrelated markets
+    # do not block each other.
+    exposure_snapshot = await exposure.fetch_portfolio_exposure("copy_edge", market_id)
     proposed_pct = final_size / portfolio_value
 
-    if risk_engine.check_category_exposure(cat_exp, proposed_pct) == "BLOCK":
+    if risk_engine.check_category_exposure(exposure_snapshot.category_pct, proposed_pct) == "BLOCK":
         # R5 (List-B Step 5) is PIPELINE-ONLY by construction: the swap margin
         # compares the incoming signal's MEASURED net edge, which the
         # estimate-free Class A path does not have (and one is never
         # fabricated — D-B09). The signal drops exactly as before.
         logger.warning("[COPY_EXECUTOR][CLASS_A][DROP:category_exposure] market=%s", market_id[:12])
         return
-    if risk_engine.check_correlation_exposure(corr_exp + proposed_pct) == "BLOCK":
-        logger.warning("[COPY_EXECUTOR][CLASS_A][DROP:correlated_exposure] market=%s", market_id[:12])
+    if risk_engine.check_correlation_exposure(exposure_snapshot.cluster_pct + proposed_pct) == "BLOCK":
+        logger.warning(
+            "[COPY_EXECUTOR][CLASS_A][DROP:correlated_exposure] market=%s cluster_pct=%.4f proposed=%.4f",
+            market_id[:12], exposure_snapshot.cluster_pct, proposed_pct,
+        )
         return
 
     # ── Risk Gate 4: Per-market tranche gate & concurrency lock ───────────────
@@ -565,6 +546,7 @@ async def _execute_class_a(signal: dict) -> None:
             fill_price=fill_price,
             fill_type=fill_type,
             decision_price=decision_price,
+            event_key=market_id,  # third fallback: no headline exists to hash
         )
 
         # Log to copytrade_log for trust score tracking and priority audit trail

@@ -26,6 +26,7 @@ import pytest
 import config
 from coordinator.pipeline import run_pipeline, get_drop_counters, _drop_counters
 from coordinator import equity
+from coordinator.exposure import ExposureSnapshot
 
 
 @pytest.fixture(autouse=True)
@@ -229,6 +230,7 @@ def mock_db():
     with patch("memory.supabase_client.get_client", fake_get_client), \
          patch("coordinator.pipeline.get_client", fake_get_client), \
          patch("coordinator.lease.get_client", fake_get_client), \
+         patch("coordinator.exposure.get_client", fake_get_client), \
          patch("execution.exit_engine.get_client", fake_get_client), \
          patch("copytrade.executor.get_client", fake_get_client), \
          patch("llm.contract_parser.get_client", fake_get_client):
@@ -744,7 +746,7 @@ async def test_class_a_first_entry_10_dollars_permitted(mock_db):
         return BookSnapshot(best_bid=0.48, best_ask=0.49, depth_usd=5000.0)
 
     with patch("coordinator.equity.get_entry_gate", lambda now=None: _flat_equity_gate(10_000.0)), \
-         patch("copytrade.executor._fetch_exposure", AsyncMock(return_value=(0.0, 0.0))), \
+         patch("coordinator.exposure.fetch_portfolio_exposure", AsyncMock(return_value=ExposureSnapshot(category_pct=0.0, cluster_pct=0.0, open_value_usdc=0.0))), \
          patch("copytrade.executor.get_market_book", fake_class_a_book), \
          patch("copytrade.executor.get_trust_score", return_value=0.85), \
          patch("copytrade.executor.get_wallet_state", return_value="ACTIVE"), \
@@ -785,7 +787,7 @@ async def test_class_a_no_fill_when_ask_runs_past_the_limit(mock_db):
         return BookSnapshot(best_bid=0.53, best_ask=0.55, depth_usd=5000.0)  # ask > limit
 
     with patch("coordinator.equity.get_entry_gate", lambda now=None: _flat_equity_gate(10_000.0)), \
-         patch("copytrade.executor._fetch_exposure", AsyncMock(return_value=(0.0, 0.0))), \
+         patch("coordinator.exposure.fetch_portfolio_exposure", AsyncMock(return_value=ExposureSnapshot(category_pct=0.0, cluster_pct=0.0, open_value_usdc=0.0))), \
          patch("copytrade.executor.get_market_book", fake_runaway_book), \
          patch("copytrade.executor.get_trust_score", return_value=0.85), \
          patch("copytrade.executor.get_wallet_state", return_value="ACTIVE"), \
@@ -818,7 +820,7 @@ async def test_class_a_book_unavailable_fails_closed(mock_db):
         return None
 
     with patch("coordinator.equity.get_entry_gate", lambda now=None: _flat_equity_gate(10_000.0)), \
-         patch("copytrade.executor._fetch_exposure", AsyncMock(return_value=(0.0, 0.0))), \
+         patch("coordinator.exposure.fetch_portfolio_exposure", AsyncMock(return_value=ExposureSnapshot(category_pct=0.0, cluster_pct=0.0, open_value_usdc=0.0))), \
          patch("copytrade.executor.get_market_book", fake_dead_book), \
          patch("copytrade.executor.get_trust_score", return_value=0.85), \
          patch("copytrade.executor.get_wallet_state", return_value="ACTIVE"), \
@@ -896,7 +898,7 @@ async def test_all_four_paths_hit_the_gate(mock_db):
         "market_volume_usd": 50000.0,
     }
     with patch("coordinator.equity.get_entry_gate", lambda now=None: _flat_equity_gate(10_000.0)), \
-         patch("copytrade.executor._fetch_exposure", AsyncMock(return_value=(0.0, 0.0))), \
+         patch("coordinator.exposure.fetch_portfolio_exposure", AsyncMock(return_value=ExposureSnapshot(category_pct=0.0, cluster_pct=0.0, open_value_usdc=0.0))), \
          patch("copytrade.executor.get_trust_score", return_value=0.85), \
          patch("copytrade.executor.get_wallet_state", return_value="ACTIVE"), \
          patch("copytrade.executor.compute_state_multiplier", return_value=1.0):
@@ -1172,7 +1174,7 @@ async def test_class_a_defensive_mode_halves_size(mock_db):
         return BookSnapshot(best_bid=0.48, best_ask=0.49, depth_usd=5000.0)
 
     with patch("coordinator.equity.get_entry_gate", lambda now=None: _flat_equity_gate(10_000.0)), \
-         patch("copytrade.executor._fetch_exposure", AsyncMock(return_value=(0.0, 0.0))), \
+         patch("coordinator.exposure.fetch_portfolio_exposure", AsyncMock(return_value=ExposureSnapshot(category_pct=0.0, cluster_pct=0.0, open_value_usdc=0.0))), \
          patch("copytrade.executor.get_market_book", fake_class_a_book), \
          patch("copytrade.executor.get_trust_score", return_value=0.85), \
          patch("copytrade.executor.get_wallet_state", return_value="ACTIVE"), \
@@ -1197,7 +1199,7 @@ def class_a_lease_patches() -> list:
     level (the shared equity/health/DB fixtures stay untouched)."""
     return [
         patch("coordinator.equity.get_entry_gate", lambda now=None: _flat_equity_gate_for_lease(10_000.0)),
-        patch("copytrade.executor._fetch_exposure", AsyncMock(return_value=(0.0, 0.0))),
+        patch("coordinator.exposure.fetch_portfolio_exposure", AsyncMock(return_value=ExposureSnapshot(category_pct=0.0, cluster_pct=0.0, open_value_usdc=0.0))),
         patch("copytrade.executor.get_market_book",
               AsyncMock(return_value=BookSnapshot(best_bid=0.48, best_ask=0.49, depth_usd=5000.0))),
         patch("copytrade.executor.get_trust_score", return_value=0.85),

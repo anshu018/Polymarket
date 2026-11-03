@@ -38,6 +38,7 @@ from monitoring.telegram_alerts import (
 )
 from coordinator.market_state import load_market_state, get_market_lock
 from coordinator import equity
+from coordinator import exposure
 from coordinator import lease
 from execution import exit_engine
 from monitoring import health_score
@@ -242,57 +243,6 @@ async def fetch_category_defaults(category: str) -> dict[str, Any]:
         "confidence": 0.75,
         "edge": 0.07
     }
-
-
-async def fetch_open_positions_exposure(category: str) -> Tuple[float, float, float]:
-    """
-    Fetch category and correlated exposures from Supabase under a 2-second timeout (RULE 5).
-    If database read times out or fails: HALT trading (Fail Closed).
-    
-    Returns:
-        tuple[category_exposure_pct, correlated_exposure_pct, open_pos_value]
-    """
-    async def _fetch() -> list[dict[str, Any]]:
-        client = await get_client()
-        res = (
-            client.table("open_positions")
-            .select("position_size_usdc,category")
-            .execute()
-        )
-        return res.data or []
-
-    try:
-        rows = await asyncio.wait_for(_fetch(), timeout=config.SUPABASE_TIMEOUT_SECONDS)
-        
-        # Calculate total portfolio value dynamically
-        total_portfolio = await get_live_portfolio_value()
-        cat_total = 0.0
-        corr_total = 0.0
-        
-        for r in rows:
-            size = float(r.get("position_size_usdc") or 0.0)
-            r_cat = r.get("category")
-            
-            if r_cat == category:
-                cat_total += size
-            # Correlated exposure (all open positions in the portfolio contribute to common shocks)
-            corr_total += size
-            
-        return (cat_total / total_portfolio), (corr_total / total_portfolio), corr_total
-
-    except asyncio.TimeoutError as e:
-        logger.critical(
-            f"[PIPELINE] Supabase open_positions read timed out! Halting new trades (RULE 5)."
-        )
-        asyncio.create_task(
-            alert_supabase_degradation("open_positions", "HALTING new trades - database timeout")
-        )
-        raise RuntimeError("Trading halted due to open_positions read timeout") from e
-    except Exception as e:
-        logger.critical(f"[PIPELINE] open_positions exposure check failed: {e}. Halting.")
-        raise RuntimeError("Trading halted due to exposure check failure") from e
-
-
 async def check_pre_order_idempotency(uuid_str: str) -> Optional[dict[str, Any]]:
     """
     Check idempotency_log for existing UUID under a 2-second timeout (RULE 5).
@@ -372,8 +322,6 @@ async def confirm_idempotency_log(uuid_str: str, order_id: str) -> None:
         logger.info(f"[PIPELINE] Idempotency record confirmed: {uuid_str}")
     except Exception as e:
         logger.error(f"[PIPELINE] Failed to confirm idempotency record {uuid_str} in database: {e}")
-
-
 async def log_to_open_positions(
     market_id: str,
     market_question: str,
@@ -387,6 +335,7 @@ async def log_to_open_positions(
     category: str,
     idempotency_uuid: str,
     thesis_id: Optional[str] = None,
+    event_key: Optional[str] = None,
     p_model_at_entry: Optional[float] = None,
     market_price_at_entry: Optional[float] = None,
     net_edge_at_entry: Optional[float] = None,
@@ -412,6 +361,11 @@ async def log_to_open_positions(
     'taker_fallback' (NULL = unfilled), resting_price is the level a maker
     order rests at (the monitor's persisted fill-detection key). decision_price
     is market_price_at_entry — no separate column.
+
+    The Step 6 (B6) event_key kwarg carries the event-cluster key the
+    correlated-exposure gate groups on (data/novelty.compute_event_key) —
+    the same value thesis_id's third segment already encodes, persisted
+    standalone so the gate never re-parses thesis strings.
     """
     async def _write() -> None:
         client = await get_client()
@@ -430,6 +384,7 @@ async def log_to_open_positions(
             "opened_at": datetime.now(timezone.utc).isoformat(),
             "last_checked_at": datetime.now(timezone.utc).isoformat(),
             "thesis_id": thesis_id,
+            "event_key": event_key,
             "p_model_at_entry": p_model_at_entry,
             "market_price_at_entry": market_price_at_entry,
             "net_edge_at_entry": net_edge_at_entry,
@@ -1239,9 +1194,15 @@ async def _run_pipeline_impl(
         return {"status": "blocked", "reason": "strategy_retired"}
 
     # D. Portfolio exposure gates
-    # Fetch exposure under 2s timeout (Rule 5 handles halting on failure)
-    cat_exp, corr_exp, open_pos_value = await fetch_open_positions_exposure(category)
-    
+    # The proposed trade's event-cluster key (Step 6, D-B23): computed ONCE
+    # here — entities/headline_hash are already bound — and reused for the
+    # entry write below; the cluster gate and the ledger row can never use
+    # different keys.
+    event_key = novelty.compute_event_key(entities, headline_hash)
+    # One shared read (coordinator/exposure.py, D-B21) under 2s timeout
+    # (Rule 5 handles halting on failure)
+    exposure_snapshot = await exposure.fetch_portfolio_exposure(category, event_key)
+
     # Calculate net odds b: we risk market_price to win (1.0 - market_price)
     m_price = max(min(market_price, 0.99), 0.01)
     net_odds = (1.0 - m_price) / m_price
@@ -1344,7 +1305,7 @@ async def _run_pipeline_impl(
     
     proposed_pct = final_trade_size / portfolio_value
 
-    if risk_engine.check_category_exposure(cat_exp, proposed_pct) == "BLOCK":
+    if risk_engine.check_category_exposure(exposure_snapshot.category_pct, proposed_pct) == "BLOCK":
         # R5 exit-weakest-for-stronger (List-B Step 5 — B5): the ONE rule that
         # runs on the ENTRY path. Strictly bounded: ONE swap attempt per
         # signal, never recursive — the victim must independently hit a
@@ -1356,7 +1317,7 @@ async def _run_pipeline_impl(
             category=category,
             portfolio_value=portfolio_value,
             proposed_pct=proposed_pct,
-            category_exposure_pct=cat_exp,
+            category_exposure_pct=exposure_snapshot.category_pct,
             incoming_net_edge=breakdown.net_edge,
             incoming_market_id=market_id,
             incoming_direction=decision_direction,
@@ -1366,8 +1327,8 @@ async def _run_pipeline_impl(
                 "[PIPELINE][R5] swapped out %s (%s) — re-checking the cap once",
                 str(swap.victim_market_id)[:16], swap.reason,
             )
-            cat_exp, corr_exp, open_pos_value = await fetch_open_positions_exposure(category)
-        if risk_engine.check_category_exposure(cat_exp, proposed_pct) == "BLOCK":
+            exposure_snapshot = await exposure.fetch_portfolio_exposure(category, event_key)
+        if risk_engine.check_category_exposure(exposure_snapshot.category_pct, proposed_pct) == "BLOCK":
             logger.warning(
                 f"[PIPELINE] Risk check: category exposure would exceed 30%% cap | conf={clamped_conf:.4f} size=${final_trade_size:.2f}. Blocking."
             )
@@ -1376,9 +1337,15 @@ async def _run_pipeline_impl(
             logger.info(f"[PIPELINE][DROP:risk_gate:max_category_exposure] market_id={market_id}")
             return {"status": "blocked", "reason": "portfolio_capacity_full"}
 
-    if risk_engine.check_correlation_exposure(corr_exp + proposed_pct) == "BLOCK":
+    # Correlated exposure, cluster-scoped (Step 6, D-B23): the proposed trade
+    # joins the cluster of ITS event key — the gate sees that cluster's
+    # marked exposure plus the proposed trade, once. Uncorrelated clusters
+    # do not block each other; check_correlation_exposure itself is
+    # untouched (the pure gate was always correct — it was fed the wrong
+    # number, E-B6).
+    if risk_engine.check_correlation_exposure(exposure_snapshot.cluster_pct + proposed_pct) == "BLOCK":
         logger.warning(
-            f"[PIPELINE] Risk check: correlated exposure would exceed 20%% cap | conf={clamped_conf:.4f} size=${final_trade_size:.2f}. Blocking."
+            f"[PIPELINE] Risk check: event-cluster exposure would exceed 20%% cap | cluster={event_key[:24]} cluster_pct={exposure_snapshot.cluster_pct:.4f} proposed={proposed_pct:.4f}"
         )
         _increment_drop("risk_gate:max_correlated_exposure")
         _increment_drop("risk_gate:portfolio_capacity")
@@ -1387,7 +1354,7 @@ async def _run_pipeline_impl(
 
     # Cash reserve gate
     if config.PAPER_TRADING:
-        available_cash = max(0.0, portfolio_value - open_pos_value)
+        available_cash = max(0.0, portfolio_value - exposure_snapshot.open_value_usdc)
     else:
         try:
             from execution.polymarket_auth import get_polymarket_client
@@ -1397,7 +1364,7 @@ async def _run_pipeline_impl(
             available_cash = float(usdc_res.get("balance", "0")) / 1000000.0
         except Exception as e:
             logger.error(f"[PORTFOLIO] Failed to fetch live USDC balance: {e}")
-            available_cash = max(0.0, portfolio_value - open_pos_value)
+            available_cash = max(0.0, portfolio_value - exposure_snapshot.open_value_usdc)
 
     if risk_engine.check_cash_reserve(final_trade_size, available_cash, portfolio_value) == "BLOCK":
         logger.warning(f"[PIPELINE] Risk check: cash reserve violation. Blocking.")
@@ -1662,10 +1629,7 @@ async def _run_pipeline_impl(
         # used as reference, the signed net edge, the modeled all-in cost for
         # the final size, and the maker/taker rule outcome. The close path
         # (startup reconciliation) passes these through to closed_trades.
-        thesis_id = (
-            f"{market_id}:{strategy_for_check}:"
-            f"{novelty.compute_event_key(entities, headline_hash)}"
-        )
+        thesis_id = f"{market_id}:{strategy_for_check}:{event_key}"
         await log_to_open_positions(
             market_id=market_id,
             market_question=market_question,
@@ -1679,6 +1643,7 @@ async def _run_pipeline_impl(
             category=category,
             idempotency_uuid=order_uuid,
             thesis_id=thesis_id,
+            event_key=event_key,
             p_model_at_entry=estimated_probability,
             market_price_at_entry=book.mid,
             net_edge_at_entry=breakdown.net_edge,

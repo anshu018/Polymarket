@@ -235,6 +235,7 @@ def mock_supabase_client(db_state: dict[str, list[dict[str, Any]]]) -> Generator
         with patch("coordinator.pipeline.get_client", fake_get_client), \
              patch("coordinator.equity.get_client", fake_get_client), \
              patch("coordinator.lease.get_client", fake_get_client), \
+             patch("coordinator.exposure.get_client", fake_get_client), \
              patch("execution.exit_engine.get_client", fake_get_client), \
              patch("llm.contract_parser.get_client", fake_get_client), \
              patch("llm.trade_decision.get_client", fake_get_client), \

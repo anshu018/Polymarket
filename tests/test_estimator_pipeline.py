@@ -152,6 +152,7 @@ def mock_db():
     with patch("memory.supabase_client.get_client", fake_get_client), \
          patch("coordinator.pipeline.get_client", fake_get_client), \
          patch("coordinator.lease.get_client", fake_get_client), \
+         patch("coordinator.exposure.get_client", fake_get_client), \
          patch("execution.exit_engine.get_client", fake_get_client), \
          patch("llm.contract_parser.get_client", fake_get_client), \
          patch("strategies.estimator.get_client", fake_get_client), \
