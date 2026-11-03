@@ -30,7 +30,8 @@ SQL_MIGRATIONS = [
             market_price_at_entry DECIMAL(10,4),
             net_edge_at_entry DECIMAL(10,4),
             costs_paid_usdc DECIMAL(10,4),
-            order_type TEXT
+            order_type TEXT,
+            event_key TEXT
         );
         -- List A.md Step 3 (A7): attribution columns for databases created
         -- before Step 3. Canonical DDL lives in
@@ -53,6 +54,19 @@ SQL_MIGRATIONS = [
         CREATE INDEX IF NOT EXISTS idx_open_positions_unfilled_maker
             ON open_positions (opened_at)
             WHERE order_type = 'maker' AND fill_price IS NULL;
+        -- List-B.md Step 6 (B6): the event-cluster key (data/novelty
+        -- .compute_event_key — the same grouping novelty already computes).
+        -- The correlated-exposure gate groups open positions by this key;
+        -- NULL stays legal (singleton cluster keyed by market_id). Backfill:
+        -- the event key rides in thesis_id's third segment
+        -- ("{market_id}:{strategy}:{event_key}") since List A Step 3; rows
+        -- without one cluster alone by market_id. Idempotent: only NULL rows
+        -- are backfilled. Canonical DDL lives in
+        -- scratch/migration_event_key.sql — keep the two in sync.
+        ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS event_key TEXT;
+        UPDATE open_positions
+        SET event_key = COALESCE(NULLIF(split_part(thesis_id, ':', 3), ''), market_id)
+        WHERE event_key IS NULL;
         """
     },
     {
